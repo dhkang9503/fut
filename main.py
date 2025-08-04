@@ -172,6 +172,8 @@ def place_order(symbol, side, size, stop_loss, take_profit):
         print(f"[Order Error] {e}")
         send_telegram(f"[오류] 주문 실패: {e}")
 
+send_telegram("✅ 자동매매 봇 시작됨.")
+
 # === 메인 루프 ===
 open_positions = {}
 
