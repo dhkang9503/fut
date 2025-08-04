@@ -3,7 +3,7 @@
 import os
 import requests
 import time
-import datetime
+from datetime import datetime, timezone
 import hmac
 import hashlib
 import base64
