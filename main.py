@@ -96,12 +96,13 @@ def has_open_position(symbol):
 def get_candles(symbol, bar, limit=100):
     url = f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
     res = requests.get(url)
-    df = pd.DataFrame(res.json()["data"], columns=[
-        "ts", "o", "h", "l", "c", "vol", "volCcy", "volCcyQuote", "confirm", "sma", "ema"])
+    df = pd.DataFrame(res.json()["data"])
+    df.columns = ["ts", "o", "h", "l", "c", "vol", "volCcy", "volCcyQuote", "confirm"]
     df = df.iloc[::-1]
     df[["o", "h", "l", "c"]] = df[["o", "h", "l", "c"]].astype(float)
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     return df
+
 
 def calculate_ema(df, period):
     return df['c'].ewm(span=period, adjust=False).mean()
