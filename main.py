@@ -23,14 +23,16 @@ LEVERAGE = 3
 RISK_PER_TRADE = 0.01
 TARGET_COINS = 3
 
-bot = telegram.Bot(token=TELEGRAM_TOKEN)
+# bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
 # === Telegram ===
 def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": f"[OKX] {message}"}
     try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"[OKX] {message}")
+        requests.post(url, data=payload)
     except Exception as e:
-        print(f"[Telegram Error] {e}")
+        print("텔레그램 전송 실패:", e)
 
 # === OKX API ===
 def get_timestamp():
