@@ -36,7 +36,6 @@ def send_telegram(message):
 
 # === OKX API ===
 def get_timestamp():
-    def get_timestamp():
     return datetime.now(timezone.utc).isoformat("T", "milliseconds").replace("+00:00", "Z")
     # return datetime.datetime.utcnow().isoformat("T", "milliseconds") + "Z"
 
