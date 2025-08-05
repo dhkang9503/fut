@@ -1,7 +1,9 @@
+# ✅ OKX 자동매매 봇 전체 코드 (시장가 진입 + 체결가 기준 TP/SL 설정)
+
 import os
 import requests
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import hmac
 import hashlib
 import base64
@@ -19,6 +21,15 @@ TELEGRAM_CHAT_ID = os.getenv("OKX_TELEGRAM_CHAT_ID")
 LEVERAGE = 3
 RISK_PER_TRADE = 0.01
 TARGET_COINS = 3
+SLIPPAGE = 0.002  # 지정가 주문 시 슬리피지 비율
+
+# === 상태 저장 ===
+open_positions = {}
+min_sizes = {}
+daily_start_balance = None
+daily_loss_limit_triggered = False
+loss_limit = 0.05
+report_sent = False
 
 # === Telegram ===
 def send_telegram(message):
@@ -29,7 +40,7 @@ def send_telegram(message):
     except Exception as e:
         print("텔레그램 전송 실패:", e)
 
-# === 숫자 유동 포맷 ===
+# === 포맷 함수 ===
 def format_price(val):
     if val >= 100:
         return f"{val:,.2f}"
@@ -69,6 +80,19 @@ def send_request(method, path, body=None):
     else:
         res = requests.post(url, headers=headers, data=json.dumps(body))
     return res.json()
+
+# === 최소 수량 로드 ===
+def load_min_sizes():
+    url = f"{BASE_URL}/api/v5/public/instruments?instType=SWAP"
+    res = requests.get(url).json()
+    mapping = {}
+    for item in res.get("data", []):
+        symbol = item["instId"]
+        try:
+            mapping[symbol] = float(item["minSz"])
+        except:
+            continue
+    return mapping
 
 # === 계좌/포지션 ===
 def get_balance():
@@ -150,175 +174,118 @@ def generate_signal(symbol):
     else:
         return None, None, None
 
-def place_order(symbol, side, size, stop_loss, take_profit):
-    try:
-        direction = "buy" if side == "long" else "sell"
+# === 진입 및 TP/SL ===
+def place_order(symbol, side, size):
+    direction = "buy" if side == "long" else "sell"
+    order = {
+        "instId": symbol,
+        "tdMode": "isolated",
+        "side": direction,
+        "ordType": "market",
+        "sz": str(round(size, 3))
+    }
+    res = send_request("POST", "/api/v5/trade/order", order)
 
-        order = {
-            "instId": symbol,
-            "tdMode": "isolated",
-            "side": direction,
-            "ordType": "market",
-            "sz": str(round(size, 3))
-        }
-        res = send_request("POST", "/api/v5/trade/order", order)
+    if res.get("code") != "0":
+        reason = res.get("msg", "Unknown error")
+        send_telegram(f"❌ 주문 실패 (시장가 진입)\n━━━━━━━━━━━━━━━\n종목: {symbol}\n방향: {side.upper()}\n수량: {format_price(size)}\n사유: {reason}")
+        return None
 
-        if res.get("code") != "0":
-            reason = res.get("msg", "Unknown error")
-            send_telegram(
-                f"""❌ 주문 실패 (시장가 진입)
-━━━━━━━━━━━━━━━
-종목: {symbol}
-방향: {side.upper()}
-수량: {format_price(size)}
-사유: {reason}"""
-            )
-            return
+    time.sleep(1)
+    entry_price = get_position_price(symbol)
+    if entry_price is None:
+        send_telegram(f"❗️ 진입가 조회 실패: {symbol}")
+        return None
 
-        algo_order = {
-            "instId": symbol,
-            "tdMode": "isolated",
-            "side": "sell" if side == "long" else "buy",
-            "ordType": "oco",
-            "sz": str(round(size, 3)),
-            "tpTriggerPx": str(round(take_profit, 9)),
-            "tpOrdPx": "-1",
-            "slTriggerPx": str(round(stop_loss, 9)),
-            "slOrdPx": "-1"
-        }
-        res2 = send_request("POST", "/api/v5/trade/order-algo", algo_order)
+    tp = entry_price * (1 + 0.025) if side == "long" else entry_price * (1 - 0.025)
+    sl = entry_price * (1 - 0.015) if side == "long" else entry_price * (1 + 0.015)
 
-        if res2.get("code") != "0":
-            reason = res2.get("msg", "Unknown error")
-            send_telegram(
-                f"""⚠️ OCO 주문 실패
-━━━━━━━━━━━━━━━
-종목: {symbol}
-방향: {side.upper()}
-TP: {format_price(take_profit)} / SL: {format_price(stop_loss)}
-사유: {reason}"""
-            )
-            return
+    algo_order = {
+        "instId": symbol,
+        "tdMode": "isolated",
+        "side": "sell" if side == "long" else "buy",
+        "ordType": "oco",
+        "sz": str(round(size, 3)),
+        "tpTriggerPx": str(round(tp, 9)),
+        "tpOrdPx": "-1",
+        "slTriggerPx": str(round(sl, 9)),
+        "slOrdPx": "-1"
+    }
+    send_request("POST", "/api/v5/trade/order-algo", algo_order)
 
-        send_telegram(
-            f"""📥 포지션 진입 ({side.upper()})
-━━━━━━━━━━━━━━━
-종목: {symbol}
-진입가: {format_price(price)}
-수량: {format_price(size)}
-익절가 (TP): {format_price(take_profit)}
-손절가 (SL): {format_price(stop_loss)}"""
-        )
+    send_telegram(f"📥 포지션 진입 ({side.upper()})\n━━━━━━━━━━━━━━━\n종목: {symbol}\n진입가: {format_price(entry_price)}\n수량: {format_price(size)}\n익절가 (TP): {format_price(tp)}\n손절가 (SL): {format_price(sl)}")
 
-    except Exception as e:
-        send_telegram(
-            f"""❗️ 예외 발생 (주문 시)
-━━━━━━━━━━━━━━━
-종목: {symbol}
-방향: {side.upper()}
-에러: {str(e)}"""
-        )
-
-# === 초기화 ===
-send_telegram("✅ OKX 자동매매 봇이 시작되었습니다.")
-open_positions = {}
-daily_start_balance = get_balance()
-current_day = datetime.now().date()
-trading_paused = False
-daily_loss_limit_percent = 5
+    return entry_price
 
 # === 메인 루프 ===
-while True:
-    try:
-        now = datetime.now().date()
+if __name__ == "__main__":
+    send_telegram("✅ 자동매매 봇 시작됨.")
+    min_sizes = load_min_sizes()
+    daily_start_balance = get_balance()
+    last_date = datetime.now().date()
 
-        # 자정이면 리포트 + 초기화
-        if now != current_day:
-            daily_end_balance = get_balance()
-            profit = daily_end_balance - daily_start_balance
-            percent = (profit / daily_start_balance) * 100
-            icon = "✅" if profit >= 0 else "❌"
-            send_telegram(
-                f"""{icon} 하루 거래 요약 리포트
-━━━━━━━━━━━━━━━
-🗓 날짜: {current_day}
-시작 잔고: {format_price(daily_start_balance)} USDT
-종료 잔고: {format_price(daily_end_balance)} USDT
-수익금: {format_price(profit)} USDT
-수익률: {percent:.6f}%"""
-            )
-            current_day = now
-            trading_paused = False
-            daily_start_balance = daily_end_balance
-            send_telegram("🔄 새로운 하루가 시작되어 거래가 재개됩니다.")
+    while True:
+        try:
+            now = datetime.now()
+            if now.date() != last_date:
+                # 자정 이후 초기화
+                daily_start_balance = get_balance()
+                daily_loss_limit_triggered = False
+                report_sent = False
+                last_date = now.date()
 
-        if trading_paused:
-            time.sleep(60)
-            continue
-
-        top_symbols = get_top_symbols()
-
-        for sym in list(open_positions):
-            if not has_open_position(sym):
-                entry_price = open_positions[sym]['entry_price']
-                size = open_positions[sym]['size']
-                direction = open_positions[sym]['direction'].upper()
-                last_price = get_candles(sym, "1m", 1)['c'].iloc[-1]
-                pnl = (last_price - entry_price) if direction == 'LONG' else (entry_price - last_price)
-                profit = pnl * size
-                percent = (pnl / entry_price) * LEVERAGE * 100
-                status = "익절" if profit > 0 else "손절"
-                current_balance = get_balance()
-
-                send_telegram(
-                    f"""📤 포지션 종료 ({status})
-━━━━━━━━━━━━━━━
-종목: {sym}
-방향: {direction}
-진입가: {format_price(entry_price)}
-종료가: {format_price(last_price)}
-수익금: {format_price(profit)} USDT
-수익률: {percent:.6f}% (레버리지 {LEVERAGE}x)
-잔고: {format_price(current_balance)} USDT"""
-                )
-                del open_positions[sym]
-
-                daily_loss = ((daily_start_balance - current_balance) / daily_start_balance) * 100
-                if daily_loss >= daily_loss_limit_percent:
-                    if not trading_paused:
-                        trading_paused = True
-                        send_telegram(
-                            f"""⛔️ 당일 손실 한도 초과로 거래 정지
-━━━━━━━━━━━━━━━
-손실률: {daily_loss:.2f}%
-기준 한도: {daily_loss_limit_percent:.2f}%
-오늘은 더 이상 거래하지 않습니다."""
-                        )
-
-        for symbol in top_symbols:
-            if has_open_position(symbol) or symbol in open_positions:
+            if daily_loss_limit_triggered:
+                time.sleep(60)
                 continue
 
-            if trading_paused:
-                break
+            current_balance = get_balance()
+            if (current_balance - daily_start_balance) / daily_start_balance <= -loss_limit:
+                daily_loss_limit_triggered = True
+                send_telegram("⛔️ 손실 한도 초과로 당일 거래 정지됨.")
+                continue
 
-            signal, price, atr = generate_signal(symbol)
-            if signal:
+            top_symbols = get_top_symbols()
+
+            for sym in list(open_positions):
+                if not has_open_position(sym):
+                    entry_price = open_positions[sym]['entry_price']
+                    size = open_positions[sym]['size']
+                    direction = open_positions[sym]['direction']
+                    last_price = get_candles(sym, "1m", 1)['c'].iloc[-1]
+                    pnl = (last_price - entry_price) if direction == 'long' else (entry_price - last_price)
+                    profit = pnl * size
+                    percent = (pnl / entry_price) * 100 * LEVERAGE
+                    status = "익절" if profit > 0 else "손절"
+                    emoji = "✅" if profit > 0 else "❌"
+                    send_telegram(
+                        f"{emoji} 포지션 종료 ({direction.upper()})\n━━━━━━━━━━━━━━━\n종목: {sym}\n진입가: {format_price(entry_price)}\n종료가: {format_price(last_price)}\n수익금: {format_price(profit)} USDT ({percent:.2f}%)\n현재 잔고: {format_price(current_balance)} USDT"
+                    )
+                    del open_positions[sym]
+
+            for symbol in top_symbols:
+                if has_open_position(symbol):
+                    continue
+                signal, price, atr = generate_signal(symbol)
+                if not signal:
+                    continue
                 capital = get_balance()
                 stop_loss_distance = 1.5 * atr
-                position_size = (capital * RISK_PER_TRADE) / stop_loss_distance
-                take_profit_price = price + 2.5 * atr if signal == "long" else price - 2.5 * atr
-                stop_loss_price = price - 1.5 * atr if signal == "long" else price + 1.5 * atr
-                place_order(symbol, signal, position_size, stop_loss_price, take_profit_price)
-                open_positions[symbol] = {
-                    "entry_price": price,
-                    "direction": signal,
-                    "size": position_size
-                }
+                size = (capital * RISK_PER_TRADE) / stop_loss_distance
+                if symbol in min_sizes and size < min_sizes[symbol]:
+                    send_telegram(f"⚠️ 최소 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {min_sizes[symbol]})")
+                    continue
+                entry = place_order(symbol, signal, size)
+                if entry:
+                    open_positions[symbol] = {"entry_price": entry, "direction": signal, "size": size}
 
-        time.sleep(300)
+            if not report_sent and now.hour == 23 and now.minute >= 55:
+                profit = current_balance - daily_start_balance
+                percent = (profit / daily_start_balance) * 100
+                emoji = "✅" if profit >= 0 else "❌"
+                send_telegram(f"{emoji} 오늘의 수익률 요약\n━━━━━━━━━━━━━━━\n수익금: {format_price(profit)} USDT\n수익률: {percent:.2f}%")
+                report_sent = True
 
-    except Exception as e:
-        print(f"[ERROR] {e}")
-        send_telegram(f"[오류 발생] {e}")
-        time.sleep(60)
+            time.sleep(300)
+        except Exception as e:
+            send_telegram(f"[오류 발생]\n{e}")
+            time.sleep(60)
