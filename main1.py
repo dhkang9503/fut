@@ -29,6 +29,19 @@ def send_telegram(message):
     except Exception as e:
         print("텔레그램 전송 실패:", e)
 
+# === 숫자 유동 포맷 ===
+def format_price(val):
+    if val >= 100:
+        return f"{val:,.2f}"
+    elif val >= 1:
+        return f"{val:,.4f}"
+    elif val >= 0.01:
+        return f"{val:,.6f}"
+    elif val >= 0.0001:
+        return f"{val:,.8f}"
+    else:
+        return f"{val:,.10f}"
+
 # === OKX API ===
 def get_timestamp():
     return datetime.now(timezone.utc).isoformat("T", "milliseconds").replace("+00:00", "Z")
@@ -57,7 +70,7 @@ def send_request(method, path, body=None):
         res = requests.post(url, headers=headers, data=json.dumps(body))
     return res.json()
 
-# === 계좌 및 종목 ===
+# === 계좌/포지션 ===
 def get_balance():
     res = send_request("GET", "/api/v5/account/balance", {})
     for asset in res.get("data", [])[0].get("details", []):
@@ -71,8 +84,7 @@ def get_top_symbols(limit=TARGET_COINS):
     df = pd.DataFrame(res["data"])
     df = df[~df["instId"].str.contains("BTC|ETH")]
     df["vol"] = df["volCcy24h"].astype(float)
-    top_symbols = df.sort_values("vol", ascending=False).head(limit)["instId"].tolist()
-    return top_symbols
+    return df.sort_values("vol", ascending=False).head(limit)["instId"].tolist()
 
 def has_open_position(symbol):
     res = send_request("GET", "/api/v5/account/positions", {"instType": "SWAP"})
@@ -158,6 +170,7 @@ def place_order(symbol, side, size, stop_loss, take_profit):
 ━━━━━━━━━━━━━━━
 종목: {symbol}
 방향: {side.upper()}
+수량: {format_price(size)}
 사유: {reason}"""
             )
             return
@@ -182,7 +195,7 @@ def place_order(symbol, side, size, stop_loss, take_profit):
 ━━━━━━━━━━━━━━━
 종목: {symbol}
 방향: {side.upper()}
-TP: {take_profit:.9f} / SL: {stop_loss:.9f}
+TP: {format_price(take_profit)} / SL: {format_price(stop_loss)}
 사유: {reason}"""
             )
             return
@@ -191,10 +204,10 @@ TP: {take_profit:.9f} / SL: {stop_loss:.9f}
             f"""📥 포지션 진입 ({side.upper()})
 ━━━━━━━━━━━━━━━
 종목: {symbol}
-진입가: {price:.9f}
-수량: {size:,.9f}
-익절가 (TP): {take_profit:.9f}
-손절가 (SL): {stop_loss:.9f}"""
+진입가: {format_price(price)}
+수량: {format_price(size)}
+익절가 (TP): {format_price(take_profit)}
+손절가 (SL): {format_price(stop_loss)}"""
         )
 
     except Exception as e:
@@ -229,10 +242,10 @@ while True:
                 f"""{icon} 하루 거래 요약 리포트
 ━━━━━━━━━━━━━━━
 🗓 날짜: {current_day}
-시작 잔고: {daily_start_balance:.9f} USDT
-종료 잔고: {daily_end_balance:.9f} USDT
-수익금: {profit:.9f} USDT
-수익률: {percent:.9f}%"""
+시작 잔고: {format_price(daily_start_balance)} USDT
+종료 잔고: {format_price(daily_end_balance)} USDT
+수익금: {format_price(profit)} USDT
+수익률: {percent:.6f}%"""
             )
             current_day = now
             trading_paused = False
@@ -249,26 +262,27 @@ while True:
             if not has_open_position(sym):
                 entry_price = open_positions[sym]['entry_price']
                 size = open_positions[sym]['size']
-                direction = open_positions[sym]['direction']
+                direction = open_positions[sym]['direction'].upper()
                 last_price = get_candles(sym, "1m", 1)['c'].iloc[-1]
-                pnl = (last_price - entry_price) if direction == 'long' else (entry_price - last_price)
+                pnl = (last_price - entry_price) if direction == 'LONG' else (entry_price - last_price)
                 profit = pnl * size
-                percent = (pnl / entry_price) * 100
+                percent = (pnl / entry_price) * LEVERAGE * 100
                 status = "익절" if profit > 0 else "손절"
                 current_balance = get_balance()
+
                 send_telegram(
                     f"""📤 포지션 종료 ({status})
 ━━━━━━━━━━━━━━━
 종목: {sym}
-진입가: {entry_price:.9f}
-종료가: {last_price:.9f}
-수익금: {profit:.9f} USDT
-수익률: {percent:.9f}%
-잔고: {current_balance:.9f} USDT"""
+방향: {direction}
+진입가: {format_price(entry_price)}
+종료가: {format_price(last_price)}
+수익금: {format_price(profit)} USDT
+수익률: {percent:.6f}% (레버리지 {LEVERAGE}x)
+잔고: {format_price(current_balance)} USDT"""
                 )
                 del open_positions[sym]
 
-                # 손실 한도 확인
                 daily_loss = ((daily_start_balance - current_balance) / daily_start_balance) * 100
                 if daily_loss >= daily_loss_limit_percent:
                     if not trading_paused:
