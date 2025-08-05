@@ -185,6 +185,7 @@ def place_order(symbol, side, size):
         "sz": str(round(size, 3))
     }
     res = send_request("POST", "/api/v5/trade/order", order)
+    print(json.dumps(res, indent=4))
 
     if res.get("code") != "0":
         reason = res.get("msg", "Unknown error")
