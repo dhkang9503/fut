@@ -359,15 +359,9 @@ if __name__ == "__main__":
                 capital = get_balance()
                 stop_loss_distance = 1.5 * atr
 
-                # ✅ 진입 수량 = 자산 * 리스크 / 손절폭
-                raw_size = (capital * RISK_PER_TRADE) / stop_loss_distance
-
-                # ✅ lot size 반영된 실제 주문 수량
-                size = adjust_size_to_lot(raw_size, lot_size)
-
-                # ✅ 수량이 너무 작거나 0이면 스킵
-                if size < lot_size:
-                    send_telegram(f"⚠️ 최소 주문 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {lot_size})")
+                size = (capital * RISK_PER_TRADE) / price
+                if symbol in min_sizes and size < min_sizes[symbol]:
+                    send_telegram(f"⚠️ 최소 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {min_sizes[symbol]})")
                     continue
 
                 entry = place_order(symbol, signal, size)
