@@ -189,38 +189,46 @@ def adjust_size_to_lot(size, lot_size):
 
 # === 진입 및 TP/SL ===
 def place_order(symbol, side, size):
-    # lot size 및 max size 조회
     lot_size = get_lot_size(symbol)
     if lot_size is None:
         return
 
-    # 수량 보정
     size = adjust_size_to_lot(size, lot_size)
-
-    # 유효 수량 체크
     if size < lot_size:
         send_telegram(f"❌ 주문 실패: 수량이 lot size ({lot_size}) 보다 작음 → {size}")
         return
 
     direction = "buy" if side == "long" else "sell"
 
-    # 시장가 주문 실행
+    # ✅ 레버리지 설정
+    set_leverage(symbol, LEVERAGE, mode="isolated", pos_side=side)
+
+    # ✅ 현재가 기준 슬리피지 감안한 지정가 계산
+    entry_price = get_candles(symbol, "1m", 1)["c"].iloc[-1]
+    limit_price = entry_price * (1 + SLIPPAGE) if side == "long" else entry_price * (1 - SLIPPAGE)
+    limit_price = round(limit_price, 6)
+
     order = {
         "instId": symbol,
         "tdMode": "isolated",
         "side": direction,
-        "ordType": "market",
-        "posSide": side,  # ✅ 시장가 주문에도 명시적으로 넣어줌 (권장)
-        "sz": str(size)
+        "ordType": "limit",
+        "posSide": side,
+        "px": str(limit_price),     # ✅ 지정가
+        "sz": str(size),
+        "tgtCcy": "base_ccy",       # 단위 기준 (옵션)
+        "clOrdId": f"entry_{int(time.time())}",  # 선택 사항
+        "reduceOnly": False,
+        "timeInForce": "ioc"        # ✅ 즉시체결 or 취소
     }
+
     print(json.dumps(order, indent=4))
     res = send_request("POST", "/api/v5/trade/order", order)
     print(json.dumps(res, indent=4))
 
     if res.get("code") != "0":
-        reason = res.get("data", {})[0].get("sMsg", "Unknown error")
-        send_telegram(f"❌ 주문 실패 (시장가 진입)\n━━━━━━━━━━━━━━━\n종목: {symbol}\n방향: {side.upper()}\n수량: {format_price(size)}\n사유: {reason}")
-        # send_telegram(traceback.format_exc())
+        reason = res.get("data", [{}])[0].get("sMsg", "Unknown error")
+        send_telegram(f"❌ 주문 실패 (지정가 진입)\n━━━━━━━━━━━━━━━\n종목: {symbol}\n방향: {side.upper()}\n수량: {format_price(size)}\n가격: {format_price(limit_price)}\n사유: {reason}")
         return None
 
     time.sleep(1)
@@ -232,12 +240,11 @@ def place_order(symbol, side, size):
     tp = entry_price * (1 + 0.025) if side == "long" else entry_price * (1 - 0.025)
     sl = entry_price * (1 - 0.015) if side == "long" else entry_price * (1 + 0.015)
 
-    # TP/SL 알고리즘 주문 (OCO)
     algo_order = {
         "instId": symbol,
         "tdMode": "isolated",
         "side": "sell" if side == "long" else "buy",
-        "posSide": side,  # ✅ 필수 항목
+        "posSide": side,
         "ordType": "oco",
         "sz": str(round(size, 3)),
         "tpTriggerPx": str(round(tp, 9)),
@@ -252,9 +259,10 @@ def place_order(symbol, side, size):
     return entry_price
 
 
+
 # === 메인 루프 ===
 if __name__ == "__main__":
-    send_telegram(f"✅ 자동매매 봇 시작됨, 잔고: {get_balance()} USDT")
+    send_telegram(f"✅ 자동매매 봇 시작됨, 잔고: {format_price(get_balance())} USDT")
     min_sizes = load_min_sizes()
     daily_start_balance = get_balance()
     last_date = datetime.now().date()
