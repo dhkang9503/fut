@@ -187,10 +187,29 @@ def get_lot_size(symbol):
 def adjust_size_to_lot(size, lot_size):
     return math.floor(size / lot_size) * lot_size
 
+def set_leverage(symbol, leverage, mode="isolated", pos_side="long"):
+    body = {
+        "instId": symbol,
+        "lever": str(leverage),
+        "mgnMode": mode,
+        "posSide": pos_side
+    }
+    res = send_request("POST", "/api/v5/account/set-leverage", body)
+
+    if res.get("code") != "0":
+        reason = res.get("msg", "Unknown")
+        send_telegram(f"⚠️ 레버리지 설정 실패: {symbol} ({pos_side})\n사유: {reason}")
+    else:
+        print(f"✅ 레버리지 설정 완료: {symbol} [{pos_side}] → {leverage}x")
+
+    return res
+
 # === 진입 및 TP/SL ===
 def place_order(symbol, side, size):
+    # === 1. 거래 필수 정보 로딩 ===
     lot_size = get_lot_size(symbol)
     if lot_size is None:
+        send_telegram(f"❌ 주문 실패: lot size 조회 실패 - {symbol}")
         return
 
     size = adjust_size_to_lot(size, lot_size)
@@ -200,26 +219,38 @@ def place_order(symbol, side, size):
 
     direction = "buy" if side == "long" else "sell"
 
-    # ✅ 레버리지 설정
-    # set_leverage(symbol, LEVERAGE, mode="isolated", pos_side=side)
+    # === 2. 레버리지 설정 ===
+    set_leverage(symbol, LEVERAGE, mode="isolated", pos_side=side)
 
-    # ✅ 현재가 기준 슬리피지 감안한 지정가 계산
-    entry_price = get_candles(symbol, "1m", 1)["c"].iloc[-1]
+    # === 3. 슬리피지 고려한 지정가 계산 ===
+    candles = get_candles(symbol, "1m", 1)
+    if candles.empty:
+        send_telegram(f"❌ 진입 실패: 캔들 데이터 없음 - {symbol}")
+        return
+
+    entry_price = candles['c'].iloc[-1]
+    if entry_price <= 0:
+        send_telegram(f"❌ 진입 실패: 현재가 0 이하 - {entry_price}")
+        return
+
     limit_price = entry_price * (1 + SLIPPAGE) if side == "long" else entry_price * (1 - SLIPPAGE)
-    limit_price = round(limit_price, 6)
 
+    if limit_price <= 0:
+        send_telegram(f"❌ 지정가 주문 실패: 가격이 0 이하 - {limit_price}")
+        return
+
+    limit_price_str = format_price(limit_price)  # ✅ 지수 표기 방지
+
+    # === 4. 지정가 주문 (IOC) ===
     order = {
         "instId": symbol,
         "tdMode": "isolated",
         "side": direction,
         "ordType": "limit",
         "posSide": side,
-        "px": str(limit_price),     # ✅ 지정가
+        "px": limit_price_str,
         "sz": str(size),
-        "tgtCcy": "base_ccy",       # 단위 기준 (옵션)
-        # "clOrdId": f"entry_{int(time.time())}",  # 선택 사항
-        # "reduceOnly": False,
-        # "timeInForce": "ioc"        # ✅ 즉시체결 or 취소
+        "timeInForce": "ioc"
     }
 
     print(json.dumps(order, indent=4))
@@ -228,15 +259,17 @@ def place_order(symbol, side, size):
 
     if res.get("code") != "0":
         reason = res.get("data", [{}])[0].get("sMsg", "Unknown error")
-        send_telegram(f"❌ 주문 실패 (지정가 진입)\n━━━━━━━━━━━━━━━\n종목: {symbol}\n방향: {side.upper()}\n수량: {format_price(size)}\n가격: {format_price(limit_price)}\n사유: {reason}")
+        send_telegram(f"❌ 주문 실패 (지정가 진입)\n━━━━━━━━━━━━━━━\n종목: {symbol}\n방향: {side.upper()}\n수량: {format_price(size)}\n가격: {limit_price_str}\n사유: {reason}")
         return None
 
+    # === 5. 진입가 조회 ===
     time.sleep(1)
     entry_price = get_position_price(symbol)
     if entry_price is None:
         send_telegram(f"❗️ 진입가 조회 실패: {symbol}")
         return None
 
+    # === 6. TP/SL 계산 및 OCO 주문 ===
     tp = entry_price * (1 + 0.025) if side == "long" else entry_price * (1 - 0.025)
     sl = entry_price * (1 - 0.015) if side == "long" else entry_price * (1 + 0.015)
 
@@ -254,12 +287,17 @@ def place_order(symbol, side, size):
     }
     send_request("POST", "/api/v5/trade/order-algo", algo_order)
 
-    send_telegram(f"📥 포지션 진입 ({side.upper()})\n━━━━━━━━━━━━━━━\n종목: {symbol}\n진입가: {format_price(entry_price)}\n수량: {format_price(size)}\n익절가 (TP): {format_price(tp)}\n손절가 (SL): {format_price(sl)}")
+    send_telegram(
+        f"📥 포지션 진입 ({side.upper()})\n━━━━━━━━━━━━━━━\n"
+        f"종목: {symbol}\n"
+        f"진입가: {format_price(entry_price)}\n"
+        f"수량: {format_price(size)}\n"
+        f"익절가 (TP): {format_price(tp)}\n"
+        f"손절가 (SL): {format_price(sl)}"
+    )
 
     return entry_price
-
-
-
+    
 # === 메인 루프 ===
 if __name__ == "__main__":
     send_telegram(f"✅ 자동매매 봇 시작됨, 잔고: {format_price(get_balance())} USDT")
