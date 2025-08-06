@@ -217,9 +217,9 @@ def place_order(symbol, side, size):
         "px": str(limit_price),     # ✅ 지정가
         "sz": str(size),
         "tgtCcy": "base_ccy",       # 단위 기준 (옵션)
-        "clOrdId": f"entry_{int(time.time())}",  # 선택 사항
-        "reduceOnly": False,
-        "timeInForce": "ioc"        # ✅ 즉시체결 or 취소
+        # "clOrdId": f"entry_{int(time.time())}",  # 선택 사항
+        # "reduceOnly": False,
+        # "timeInForce": "ioc"        # ✅ 즉시체결 or 취소
     }
 
     print(json.dumps(order, indent=4))
