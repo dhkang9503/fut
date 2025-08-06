@@ -299,38 +299,57 @@ def get_max_market_size(symbol):
         except:
             pass
     return None
-
-def place_order(symbol, side, size, atr):
-    # === 1. 거래 필수 정보 로딩 ===
+    
+def get_max_market_size(symbol):
+    res = send_request("GET", "/api/v5/public/instruments", {"instType": "SWAP", "instId": symbol})
+    if res.get("code") == "0":
+        try:
+            return float(res["data"][0]["maxMktSz"])
+        except:
+            pass
+    return None
+        
+def place_order(symbol, side, atr):
     lot_size = get_lot_size(symbol)
-    capital = get_balance()
+    max_market_size = get_max_market_size(symbol)
+    balance = get_balance()
 
-    if lot_size is None:
-        send_telegram(f"❌ 주문 실패: lot size 조회 실패 - {symbol}")
+    if lot_size is None or balance == 0:
+        send_telegram(f"❌ 주문 실패: lot size 조회 실패 또는 잔고 부족 - {symbol}")
         return
 
-    # ✅ 손절폭 기반 주문 수량 계산
-    stop_loss_distance = 1.5 * atr
-    raw_size = (capital * RISK_PER_TRADE) / stop_loss_distance
-    size = adjust_size_to_lot(raw_size, lot_size)
+    # === 현재가 가져오기 ===
+    candles = get_candles(symbol, "1m", 1)
+    if candles.empty:
+        send_telegram(f"❌ 진입 실패: 캔들 데이터 없음 - {symbol}")
+        return
+    price = candles['c'].iloc[-1]
 
+    # === 최대 수량 계산: 레버리지 포함 자본 기준 ===
+    max_trade_value = balance * LEVERAGE
+    raw_size = max_trade_value / price
+
+    # === maxMktSz 제한 적용 ===
+    if max_market_size is not None:
+        raw_size = min(raw_size, max_market_size)
+
+    # === lotSz 반영 ===
+    size = adjust_size_to_lot(raw_size, lot_size)
     if size < lot_size:
         send_telegram(f"⚠️ 최소 주문 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {lot_size})")
         return
 
-    # 최대 수량 제한 확인
-    max_market_size = get_max_market_size(symbol)
-    if max_market_size is not None and size > max_market_size:
-        send_telegram(f"⚠️ 시장가 최대 수량 초과로 조정됨: {symbol} → {format_price(size)} → {format_price(max_market_size)}")
-        size = max_market_size
-        size = adjust_size_to_lot(size, lot_size)
+    # === 증거금 부족 사전 확인 ===
+    estimated_cost = price * size / LEVERAGE
+    if estimated_cost > balance:
+        send_telegram(f"⚠️ 증거금 부족으로 주문 스킵됨\n━━━━━━━━━━━━━━━\n종목: {symbol}\n필요 증거금: {format_price(estimated_cost)} > 잔고: {format_price(balance)}")
+        return
 
-    direction = "buy" if side == "long" else "sell"
-
-    # === 2. 레버리지 설정 ===
+    # === 레버리지 설정 ===
     set_leverage(symbol, LEVERAGE, mode="isolated", pos_side=side)
 
-    # === 3. 시장가 주문 ===
+    # === 시장가 주문 전송 ===
+    direction = "buy" if side == "long" else "sell"
     order = {
         "instId": symbol,
         "tdMode": "isolated",
@@ -349,14 +368,14 @@ def place_order(symbol, side, size, atr):
         send_telegram(f"❌ 주문 실패 (시장가 진입)\n━━━━━━━━━━━━━━━\n종목: {symbol}\n방향: {side.upper()}\n수량: {format_price(size)}\n사유: {reason}")
         return None
 
-    # === 4. 진입가 조회 ===
+    # === 진입가 조회 ===
     time.sleep(1)
     entry_price = get_position_price(symbol)
     if entry_price is None:
         send_telegram(f"❗️ 진입가 조회 실패: {symbol}")
         return None
 
-    # === 5. TP/SL 계산 및 OCO 주문 ===
+    # === TP/SL 설정 ===
     tp = entry_price * (1 + 0.025) if side == "long" else entry_price * (1 - 0.025)
     sl = entry_price * (1 - 0.015) if side == "long" else entry_price * (1 + 0.015)
 
@@ -384,7 +403,6 @@ def place_order(symbol, side, size, atr):
     )
 
     return entry_price
-
     
 # === 메인 루프 ===
 if __name__ == "__main__":
@@ -445,7 +463,7 @@ if __name__ == "__main__":
                     send_telegram(f"⚠️ 최소 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {min_sizes[symbol]})")
                     continue
 
-                entry = place_order(symbol, signal, size, atr)
+                entry = place_order(symbol, signal, atr)
                 if entry:
                     open_positions[symbol] = {"entry_price": entry, "direction": signal, "size": size}
 
