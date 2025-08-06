@@ -183,14 +183,6 @@ def get_lot_size(symbol):
         send_telegram(f"❌ {symbol} lot size 조회 실패: {res.get('msg')}")
         return None
         
-def get_max_size(symbol):
-    res = send_request("GET", "/api/v5/public/instruments", {"instType": "SWAP", "instId": symbol})
-    if res.get("code") == "0":
-        return float(res["data"][0]["maxSz"])
-    else:
-        send_telegram(f"❌ {symbol} max size 조회 실패: {res.get('msg')}")
-        return None
-
 def adjust_size_to_lot(size, lot_size):
     return math.floor(size / lot_size) * lot_size
 
@@ -198,20 +190,14 @@ def adjust_size_to_lot(size, lot_size):
 def place_order(symbol, side, size):
     # lot size 및 max size 조회
     lot_size = get_lot_size(symbol)
-    max_size = get_max_size(symbol)
-    if lot_size is None or max_size is None:
+    if lot_size is None:
         return
 
     # 수량 보정
     size = adjust_size_to_lot(size, lot_size)
 
-    # 최대 수량 초과 시 보정
-    if size > max_size:
-        send_telegram(f"⚠️ 최대 수량 초과로 보정됨: {symbol} ({format_price(size)} → {format_price(max_size)})")
-        size = adjust_size_to_lot(max_size, lot_size)
-
     # 유효 수량 체크
-    if size <= 0:
+    if size < lot_size:
         send_telegram(f"❌ 주문 실패: 수량이 lot size ({lot_size}) 보다 작음 → {size}")
         return
 
