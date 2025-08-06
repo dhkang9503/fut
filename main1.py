@@ -185,7 +185,14 @@ def get_lot_size(symbol):
         return None
         
 def adjust_size_to_lot(size, lot_size):
-    return math.floor(size / lot_size) * lot_size
+    """
+    lot size의 배수로 수량을 내림하고 정밀도 반영하여 반올림 처리
+    """
+    if lot_size == 0:
+        return 0
+    precision = max(-int(math.floor(math.log10(lot_size))), 0)
+    adjusted = math.floor(size / lot_size) * lot_size
+    return round(adjusted, precision)
 
 def set_leverage(symbol, leverage, mode="isolated", pos_side="long"):
     body = {
@@ -351,10 +358,18 @@ if __name__ == "__main__":
                     continue
                 capital = get_balance()
                 stop_loss_distance = 1.5 * atr
-                size = (capital * RISK_PER_TRADE) / price
-                if symbol in min_sizes and size < min_sizes[symbol]:
-                    send_telegram(f"⚠️ 최소 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {min_sizes[symbol]})")
+
+                # ✅ 진입 수량 = 자산 * 리스크 / 손절폭
+                raw_size = (capital * RISK_PER_TRADE) / stop_loss_distance
+
+                # ✅ lot size 반영된 실제 주문 수량
+                size = adjust_size_to_lot(raw_size, lot_size)
+
+                # ✅ 수량이 너무 작거나 0이면 스킵
+                if size < lot_size:
+                    send_telegram(f"⚠️ 최소 주문 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {lot_size})")
                     continue
+
                 entry = place_order(symbol, signal, size)
                 if entry:
                     open_positions[symbol] = {"entry_price": entry, "direction": signal, "size": size}
