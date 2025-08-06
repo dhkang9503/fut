@@ -290,7 +290,16 @@ def place_order(symbol, side, size):
     if entry_price is None:
         send_telegram(f"❗️ 진입가 조회 실패: {symbol}")
         return None
-        
+
+def get_max_market_size(symbol):
+    res = send_request("GET", "/api/v5/public/instruments", {"instType": "SWAP", "instId": symbol})
+    if res.get("code") == "0":
+        try:
+            return float(res["data"][0]["maxMktSz"])
+        except:
+            pass
+    return None
+
 def place_order(symbol, side, size, atr):
     # === 1. 거래 필수 정보 로딩 ===
     lot_size = get_lot_size(symbol)
@@ -308,6 +317,13 @@ def place_order(symbol, side, size, atr):
     if size < lot_size:
         send_telegram(f"⚠️ 최소 주문 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {lot_size})")
         return
+
+    # 최대 수량 제한 확인
+    max_market_size = get_max_market_size(symbol)
+    if max_market_size is not None and size > max_market_size:
+        send_telegram(f"⚠️ 시장가 최대 수량 초과로 조정됨: {symbol} → {format_price(size)} → {format_price(max_market_size)}")
+        size = max_market_size
+        size = adjust_size_to_lot(size, lot_size)
 
     direction = "buy" if side == "long" else "sell"
 
