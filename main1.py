@@ -201,7 +201,7 @@ def place_order(symbol, side, size):
     direction = "buy" if side == "long" else "sell"
 
     # ✅ 레버리지 설정
-    set_leverage(symbol, LEVERAGE, mode="isolated", pos_side=side)
+    # set_leverage(symbol, LEVERAGE, mode="isolated", pos_side=side)
 
     # ✅ 현재가 기준 슬리피지 감안한 지정가 계산
     entry_price = get_candles(symbol, "1m", 1)["c"].iloc[-1]
