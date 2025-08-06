@@ -212,11 +212,12 @@ def place_order(symbol, side, size):
         "posSide": side,  # ✅ 시장가 주문에도 명시적으로 넣어줌 (권장)
         "sz": str(size)
     }
+    print(json.dumps(order, indent=4))
     res = send_request("POST", "/api/v5/trade/order", order)
     print(json.dumps(res, indent=4))
 
     if res.get("code") != "0":
-        reason = res.get("sMsg", "Unknown error")
+        reason = res.get("data", {}).get("sMsg", "Unknown error")
         send_telegram(f"❌ 주문 실패 (시장가 진입)\n━━━━━━━━━━━━━━━\n종목: {symbol}\n방향: {side.upper()}\n수량: {format_price(size)}\n사유: {reason}")
         return None
 
