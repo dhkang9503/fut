@@ -8,6 +8,7 @@ import hmac
 import hashlib
 import base64
 import json
+import math
 import pandas as pd
 import numpy as np
 
@@ -174,15 +175,36 @@ def generate_signal(symbol):
     else:
         return None, None, None
 
+def get_lot_size(symbol):
+    res = send_request("GET", "/api/v5/public/instruments", {"instType": "SWAP", "instId": symbol})
+    if res.get("code") == "0":
+        return float(res["data"][0]["lotSz"])
+    else:
+        send_telegram(f"❌ {symbol} lot size 조회 실패: {res.get('msg')}")
+        return None
+
+def adjust_size_to_lot(size, lot_size):
+    return math.floor(size / lot_size) * lot_size
+
 # === 진입 및 TP/SL ===
 def place_order(symbol, side, size):
+    # lot size 조회 및 보정
+    lot_size = get_lot_size(symbol)
+    if lot_size is None:
+        return
+        
+    size = adjust_size_to_lot(size, lot_size)
+    if size <= 0:
+        send_telegram(f"❌ 주문 실패: 수량이 lot size ({lot_size}) 보다 작음 → {size}")
+        return
+        
     direction = "buy" if side == "long" else "sell"
     order = {
         "instId": symbol,
         "tdMode": "isolated",
         "side": direction,
         "ordType": "market",
-        "sz": str(round(size, 3))
+        "sz": str(size)
     }
     res = send_request("POST", "/api/v5/trade/order", order)
     print(json.dumps(res, indent=4))
