@@ -290,8 +290,57 @@ def place_order(symbol, side, size):
     if entry_price is None:
         send_telegram(f"❗️ 진입가 조회 실패: {symbol}")
         return None
+        
+def place_order(symbol, side, size, atr):
+    # === 1. 거래 필수 정보 로딩 ===
+    lot_size = get_lot_size(symbol)
+    capital = get_balance()
 
-    # === 6. TP/SL 계산 및 OCO 주문 ===
+    if lot_size is None:
+        send_telegram(f"❌ 주문 실패: lot size 조회 실패 - {symbol}")
+        return
+
+    # ✅ 손절폭 기반 주문 수량 계산
+    stop_loss_distance = 1.5 * atr
+    raw_size = (capital * RISK_PER_TRADE) / stop_loss_distance
+    size = adjust_size_to_lot(raw_size, lot_size)
+
+    if size < lot_size:
+        send_telegram(f"⚠️ 최소 주문 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {lot_size})")
+        return
+
+    direction = "buy" if side == "long" else "sell"
+
+    # === 2. 레버리지 설정 ===
+    set_leverage(symbol, LEVERAGE, mode="isolated", pos_side=side)
+
+    # === 3. 시장가 주문 ===
+    order = {
+        "instId": symbol,
+        "tdMode": "isolated",
+        "side": direction,
+        "ordType": "market",
+        "posSide": side,
+        "sz": str(size)
+    }
+
+    print(json.dumps(order, indent=4))
+    res = send_request("POST", "/api/v5/trade/order", order)
+    print(json.dumps(res, indent=4))
+
+    if res.get("code") != "0":
+        reason = res.get("data", [{}])[0].get("sMsg", "Unknown error")
+        send_telegram(f"❌ 주문 실패 (시장가 진입)\n━━━━━━━━━━━━━━━\n종목: {symbol}\n방향: {side.upper()}\n수량: {format_price(size)}\n사유: {reason}")
+        return None
+
+    # === 4. 진입가 조회 ===
+    time.sleep(1)
+    entry_price = get_position_price(symbol)
+    if entry_price is None:
+        send_telegram(f"❗️ 진입가 조회 실패: {symbol}")
+        return None
+
+    # === 5. TP/SL 계산 및 OCO 주문 ===
     tp = entry_price * (1 + 0.025) if side == "long" else entry_price * (1 - 0.025)
     sl = entry_price * (1 - 0.015) if side == "long" else entry_price * (1 + 0.015)
 
@@ -319,6 +368,7 @@ def place_order(symbol, side, size):
     )
 
     return entry_price
+
     
 # === 메인 루프 ===
 if __name__ == "__main__":
@@ -379,7 +429,7 @@ if __name__ == "__main__":
                     send_telegram(f"⚠️ 최소 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {min_sizes[symbol]})")
                     continue
 
-                entry = place_order(symbol, signal, size)
+                entry = place_order(symbol, signal, size, atr)
                 if entry:
                     open_positions[symbol] = {"entry_price": entry, "direction": signal, "size": size}
 
