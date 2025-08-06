@@ -220,7 +220,7 @@ def place_order(symbol, side, size):
     if res.get("code") != "0":
         reason = res.get("data", {})[0].get("sMsg", "Unknown error")
         send_telegram(f"❌ 주문 실패 (시장가 진입)\n━━━━━━━━━━━━━━━\n종목: {symbol}\n방향: {side.upper()}\n수량: {format_price(size)}\n사유: {reason}")
-        send_telegram(traceback.format_exc())
+        # send_telegram(traceback.format_exc())
         return None
 
     time.sleep(1)
@@ -254,7 +254,7 @@ def place_order(symbol, side, size):
 
 # === 메인 루프 ===
 if __name__ == "__main__":
-    send_telegram("✅ 자동매매 봇 시작됨.")
+    send_telegram(f"✅ 자동매매 봇 시작됨, 잔고: {get_balance()} USDT")
     min_sizes = load_min_sizes()
     daily_start_balance = get_balance()
     last_date = datetime.now().date()
