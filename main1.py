@@ -107,7 +107,7 @@ def get_top_symbols(limit=TARGET_COINS):
     url = f"{BASE_URL}/api/v5/market/tickers?instType=SWAP"
     res = requests.get(url).json()
     df = pd.DataFrame(res["data"])
-    df = df[~df["instId"].str.contains("BTC|ETH")]
+    # df = df[~df["instId"].str.contains("BTC|ETH")]
     df["vol"] = df["volCcy24h"].astype(float)
     return df.sort_values("vol", ascending=False).head(limit)["instId"].tolist()
 
