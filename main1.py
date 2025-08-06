@@ -201,7 +201,8 @@ def place_order(symbol, side, size):
         send_telegram(f"❌ 주문 실패: 수량이 lot size ({lot_size}) 보다 작음 → {size}")
         return
 
-    direction = "buy" if side == "long" else "sell"
+    # direction = "buy" if side == "long" else "sell"
+    direction = "buy"
 
     # 시장가 주문 실행
     order = {
@@ -234,7 +235,7 @@ def place_order(symbol, side, size):
     algo_order = {
         "instId": symbol,
         "tdMode": "isolated",
-        "side": "sell" if side == "long" else "buy",
+        "side": "sell",   # if side == "long" else "buy",
         "posSide": side,  # ✅ 필수 항목
         "ordType": "oco",
         "sz": str(round(size, 3)),
