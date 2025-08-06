@@ -217,7 +217,7 @@ def place_order(symbol, side, size):
     print(json.dumps(res, indent=4))
 
     if res.get("code") != "0":
-        reason = res.get("data", {}).get("sMsg", "Unknown error")
+        reason = res.get("data", {})[0].get("sMsg", "Unknown error")
         send_telegram(f"❌ 주문 실패 (시장가 진입)\n━━━━━━━━━━━━━━━\n종목: {symbol}\n방향: {side.upper()}\n수량: {format_price(size)}\n사유: {reason}")
         return None
 
