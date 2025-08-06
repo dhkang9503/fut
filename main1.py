@@ -21,7 +21,7 @@ BASE_URL = "https://www.okx.com"
 TELEGRAM_TOKEN = os.getenv("OKX_TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("OKX_TELEGRAM_CHAT_ID")
 LEVERAGE = 3
-RISK_PER_TRADE = 0.01
+RISK_PER_TRADE = 0.005
 TARGET_COINS = 3
 SLIPPAGE = 0.002  # 지정가 주문 시 슬리피지 비율
 
