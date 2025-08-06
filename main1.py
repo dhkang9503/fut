@@ -201,8 +201,7 @@ def place_order(symbol, side, size):
         send_telegram(f"❌ 주문 실패: 수량이 lot size ({lot_size}) 보다 작음 → {size}")
         return
 
-    # direction = "buy" if side == "long" else "sell"
-    direction = "buy"
+    direction = "buy" if side == "long" else "sell"
 
     # 시장가 주문 실행
     order = {
@@ -235,7 +234,7 @@ def place_order(symbol, side, size):
     algo_order = {
         "instId": symbol,
         "tdMode": "isolated",
-        "side": "sell",   # if side == "long" else "buy",
+        "side": "sell" if side == "long" else "buy",
         "posSide": side,  # ✅ 필수 항목
         "ordType": "oco",
         "sz": str(round(size, 3)),
@@ -304,7 +303,7 @@ if __name__ == "__main__":
                     continue
                 capital = get_balance()
                 stop_loss_distance = 1.5 * atr
-                size = (capital * RISK_PER_TRADE) / stop_loss_distance
+                size = (capital * RISK_PER_TRADE) / price
                 if symbol in min_sizes and size < min_sizes[symbol]:
                     send_telegram(f"⚠️ 최소 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {min_sizes[symbol]})")
                     continue
