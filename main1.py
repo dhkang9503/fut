@@ -216,18 +216,6 @@ def place_order(symbol, side, size):
     # === 1. 거래 필수 정보 로딩 ===
     lot_size = get_lot_size(symbol)
     capital = get_balance()
-    stop_loss_distance = 1.5 * atr
-
-    # ✅ 진입 수량 = 자산 * 리스크 / 손절폭
-    raw_size = (capital * RISK_PER_TRADE) / stop_loss_distance
-
-    # ✅ lot size 반영된 실제 주문 수량
-    size = adjust_size_to_lot(raw_size, lot_size)
-
-    # ✅ 수량이 너무 작거나 0이면 스킵
-    if size < lot_size:
-        send_telegram(f"⚠️ 최소 주문 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {lot_size})")
-        return
 
     if lot_size is None:
         send_telegram(f"❌ 주문 실패: lot size 조회 실패 - {symbol}")
@@ -261,6 +249,19 @@ def place_order(symbol, side, size):
         return
 
     limit_price_str = format_price(limit_price)  # ✅ 지수 표기 방지
+
+    stop_loss_distance = 1.5 * atr
+
+    # ✅ 진입 수량 = 자산 * 리스크 / 손절폭
+    raw_size = (capital * RISK_PER_TRADE) / float(limit_price_str)
+
+    # ✅ lot size 반영된 실제 주문 수량
+    size = adjust_size_to_lot(raw_size, lot_size)
+
+    # ✅ 수량이 너무 작거나 0이면 스킵
+    if size < lot_size:
+        send_telegram(f"⚠️ 최소 주문 수량 미달로 스킵됨: {symbol} ({format_price(size)} < {lot_size})")
+        return
 
     # === 4. 지정가 주문 (IOC) ===
     order = {
