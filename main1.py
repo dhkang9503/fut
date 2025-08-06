@@ -182,28 +182,48 @@ def get_lot_size(symbol):
     else:
         send_telegram(f"❌ {symbol} lot size 조회 실패: {res.get('msg')}")
         return None
+        
+def get_max_size(symbol):
+    res = send_request("GET", "/api/v5/public/instruments", {"instType": "SWAP", "instId": symbol})
+    if res.get("code") == "0":
+        return float(res["data"][0]["maxSz"])
+    else:
+        send_telegram(f"❌ {symbol} max size 조회 실패: {res.get('msg')}")
+        return None
 
 def adjust_size_to_lot(size, lot_size):
     return math.floor(size / lot_size) * lot_size
 
 # === 진입 및 TP/SL ===
 def place_order(symbol, side, size):
-    # lot size 조회 및 보정
+    # lot size 및 max size 조회
     lot_size = get_lot_size(symbol)
-    if lot_size is None:
+    max_size = get_max_size(symbol)
+    if lot_size is None or max_size is None:
         return
-        
+
+    # 수량 보정
     size = adjust_size_to_lot(size, lot_size)
+
+    # 최대 수량 초과 시 보정
+    if size > max_size:
+        send_telegram(f"⚠️ 최대 수량 초과로 보정됨: {symbol} ({format_price(size)} → {format_price(max_size)})")
+        size = adjust_size_to_lot(max_size, lot_size)
+
+    # 유효 수량 체크
     if size <= 0:
         send_telegram(f"❌ 주문 실패: 수량이 lot size ({lot_size}) 보다 작음 → {size}")
         return
-        
+
     direction = "buy" if side == "long" else "sell"
+
+    # 시장가 주문 실행
     order = {
         "instId": symbol,
         "tdMode": "isolated",
         "side": direction,
         "ordType": "market",
+        "posSide": side,  # ✅ 시장가 주문에도 명시적으로 넣어줌 (권장)
         "sz": str(size)
     }
     res = send_request("POST", "/api/v5/trade/order", order)
@@ -223,10 +243,12 @@ def place_order(symbol, side, size):
     tp = entry_price * (1 + 0.025) if side == "long" else entry_price * (1 - 0.025)
     sl = entry_price * (1 - 0.015) if side == "long" else entry_price * (1 + 0.015)
 
+    # TP/SL 알고리즘 주문 (OCO)
     algo_order = {
         "instId": symbol,
         "tdMode": "isolated",
         "side": "sell" if side == "long" else "buy",
+        "posSide": side,  # ✅ 필수 항목
         "ordType": "oco",
         "sz": str(round(size, 3)),
         "tpTriggerPx": str(round(tp, 9)),
@@ -239,6 +261,7 @@ def place_order(symbol, side, size):
     send_telegram(f"📥 포지션 진입 ({side.upper()})\n━━━━━━━━━━━━━━━\n종목: {symbol}\n진입가: {format_price(entry_price)}\n수량: {format_price(size)}\n익절가 (TP): {format_price(tp)}\n손절가 (SL): {format_price(sl)}")
 
     return entry_price
+
 
 # === 메인 루프 ===
 if __name__ == "__main__":
