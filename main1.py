@@ -26,7 +26,7 @@ TELEGRAM_CHAT_ID = os.getenv("OKX_TELEGRAM_CHAT_ID")
 LEVERAGE = 3
 RISK_PER_TRADE = 0.005      # 계좌 대비 0.5% 리스크
 TARGET_COINS = 3
-SLIPPAGE = 0.002            # (미사용) 지정가 주문 시 슬리피지 비율, 현재는 시장가 사용
+SLIPPAGE = 0.002            # (미사용) 지정가 슬리피지 비율, 현재는 시장가 사용
 DAILY_LOSS_LIMIT = 0.05     # 일간 손실 한도(5%)
 LOOP_SLEEP_SEC = 300        # 루프 슬립(초)
 HTTP_TIMEOUT = 10
@@ -54,6 +54,7 @@ def send_telegram(message: str):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
         requests.post(url, data=payload, timeout=HTTP_TIMEOUT)
+        print("[텔레그램 전송] ", message)
     except Exception as e:
         print("텔레그램 전송 실패:", e)
 
@@ -213,7 +214,7 @@ def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
     loss = (-delta.clip(upper=0)).rolling(window=period).mean().replace(0, np.nan)
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(method="bfill").fillna(50)
+    return rsi.bfill().fillna(50)
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high_low = df["h"] - df["l"]
@@ -221,7 +222,7 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     low_close = np.abs(df["l"] - df["c"].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     atr = tr.rolling(period).mean()
-    return atr.fillna(method="bfill")
+    return atr.bfill()
 
 def generate_signal(symbol: str):
     df_4h = get_candles(symbol, "4H", 300)

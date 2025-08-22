@@ -1,0 +1,32 @@
+name: Run OKX Trading Bot
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    env:
+      OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+      OKX_API_SECRET: ${{ secrets.OKX_API_SECRET }}
+      OKX_API_PASSPHRASE: ${{ secrets.OKX_API_PASSPHRASE }}
+      OKX_TELEGRAM_TOKEN: ${{ secrets.OKX_TELEGRAM_TOKEN }}
+      OKX_TELEGRAM_CHAT_ID: ${{ secrets.OKX_TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t fut-bot .
+
+      - name: Run bot container
+        run: |
+          docker run --rm \
+            -e OKX_API_KEY \
+            -e OKX_API_SECRET \
+            -e OKX_API_PASSPHRASE \
+            -e OKX_TELEGRAM_TOKEN \
+            -e OKX_TELEGRAM_CHAT_ID \
+            fut-bot
