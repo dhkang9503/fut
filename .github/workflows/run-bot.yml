@@ -39,7 +39,7 @@ jobs:
           script: |
             cd ~/fut-bot
             docker build -t fut-bot .
-            docker run --rm \
+            docker run --name fut-bot\
               -e OKX_API_KEY=${{ secrets.OKX_API_KEY }} \
               -e OKX_API_SECRET=${{ secrets.OKX_API_SECRET }} \
               -e OKX_API_PASSPHRASE=${{ secrets.OKX_API_PASSPHRASE }} \
