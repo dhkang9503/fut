@@ -1,6 +1,9 @@
 name: Run OKX Trading Bot
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -18,15 +21,28 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: docker build -t fut-bot .
+      - name: Copy files to remote server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "."
+          target: "~/fut-bot"
 
-      - name: Run bot container
-        run: |
-          docker run --rm \
-            -e OKX_API_KEY \
-            -e OKX_API_SECRET \
-            -e OKX_API_PASSPHRASE \
-            -e OKX_TELEGRAM_TOKEN \
-            -e OKX_TELEGRAM_CHAT_ID \
-            fut-bot
+      - name: Run bot container on remote server via SSH
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd ~/fut-bot
+            docker build -t fut-bot .
+            docker run --rm \
+              -e OKX_API_KEY=${{ secrets.OKX_API_KEY }} \
+              -e OKX_API_SECRET=${{ secrets.OKX_API_SECRET }} \
+              -e OKX_API_PASSPHRASE=${{ secrets.OKX_API_PASSPHRASE }} \
+              -e OKX_TELEGRAM_TOKEN=${{ secrets.OKX_TELEGRAM_TOKEN }} \
+              -e OKX_TELEGRAM_CHAT_ID=${{ secrets.OKX_TELEGRAM_CHAT_ID }} \
+              fut-bot
