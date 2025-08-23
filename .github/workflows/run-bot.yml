@@ -47,4 +47,4 @@ jobs:
               -e OKX_API_PASSPHRASE=${{ secrets.OKX_API_PASSPHRASE }} \
               -e OKX_TELEGRAM_TOKEN=${{ secrets.OKX_TELEGRAM_TOKEN }} \
               -e OKX_TELEGRAM_CHAT_ID=${{ secrets.OKX_TELEGRAM_CHAT_ID }} \
-              fut-bot &
+              fut-bot
