@@ -38,6 +38,8 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           script: |
             cd ~/fut-bot
+            docker stop fut-bot
+            docker rm fut-bot
             docker build -t fut-bot .
             docker run --name fut-bot\
               -e OKX_API_KEY=${{ secrets.OKX_API_KEY }} \
