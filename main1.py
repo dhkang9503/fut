@@ -73,10 +73,6 @@ def format_price(val: float) -> str:
 # OKX 시간/서명/요청
 # =========================
 def get_timestamp() -> str:
-    """
-    OKX 서버 시각을 ISO8601(UTC, ms) 문자열로 반환.
-    예: '2025-08-19T12:34:56.789Z'
-    """
     r = requests.get(f"{BASE_URL}/api/v5/public/time", timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     ts_ms = int(r.json()["data"][0]["ts"])
@@ -85,20 +81,15 @@ def get_timestamp() -> str:
 
 def sign_request(method: str, path: str, body: dict | None, params: dict | None):
     timestamp = get_timestamp()
-
-    # requestPath(+query) 규격 반영
     request_path = path
     if method.upper() == "GET" and params:
         qs = urlencode(params, doseq=True)
         if qs:
             request_path = f"{path}?{qs}"
-
     body_str = json.dumps(body) if (body and method.upper() != "GET") else ""
     message = f"{timestamp}{method.upper()}{request_path}{body_str}"
-
     mac = hmac.new(API_SECRET.encode("utf-8"), msg=message.encode("utf-8"), digestmod=hashlib.sha256)
     sign = base64.b64encode(mac.digest()).decode()
-
     return {
         "OK-ACCESS-KEY": API_KEY,
         "OK-ACCESS-SIGN": sign,
@@ -136,8 +127,8 @@ def get_instrument_meta(symbol: str):
                 "tickSz": float(info["tickSz"]),
                 "minSz": float(info["minSz"]),
                 "settleCcy": info.get("settleCcy", ""),
-                "maxMktSz": float(info.get("maxMktSz") or 0),   # ✅ 최대 시장가 수량
-                "maxLmtSz": float(info.get("maxLmtSz") or 0),   # 참고: 최대 지정가 수량
+                "maxMktSz": float(info.get("maxMktSz") or 0),
+                "maxLmtSz": float(info.get("maxLmtSz") or 0),
             }
         except Exception:
             pass
@@ -185,6 +176,21 @@ def get_position_price(symbol: str) -> float | None:
             except Exception:
                 return None
     return None
+
+# ✅ 거래소가 계산한 현재 최대 매수/매도 가능 수량
+def get_max_tradable_size(symbol: str, side: str, price: float, td_mode: str = "isolated", ccy: str = "USDT") -> float:
+    params = {"instId": symbol, "tdMode": td_mode, "ccy": ccy, "px": str(price)}
+    res = send_request("GET", "/api/v5/account/max-size", params)
+    if res.get("code") != "0" or not res.get("data"):
+        return 0.0
+    info = res["data"][0]
+    try:
+        if side == "long":
+            return float(info.get("maxBuy") or info.get("maxSz") or 0.0)
+        else:
+            return float(info.get("maxSell") or info.get("maxSz") or 0.0)
+    except Exception:
+        return 0.0
 
 # =========================
 # 시세/지표
@@ -258,7 +264,6 @@ def get_top_symbols(limit: int = TARGET_COINS) -> list[str]:
     df = pd.DataFrame(res.get("data", []))
     if df.empty:
         return []
-    # 거래대금(USDT) 기준 정렬 + USDT 정산 종목만
     df["vol"] = pd.to_numeric(df.get("volCcy24h", 0), errors="coerce").fillna(0.0)
     if "settleCcy" in df.columns:
         df = df[df["settleCcy"] == "USDT"]
@@ -278,7 +283,7 @@ def set_leverage(symbol: str, leverage: int, mode: str = "isolated", pos_side: s
     return res
 
 # =========================
-# 주문 (51202 대응: 분할 시장가 + OCO 한 번)
+# 주문 (거래소 cap + 51202 대응 분할 + OCO 한 번)
 # =========================
 def place_order(symbol: str, side: str, atr: float):
     """
@@ -290,9 +295,9 @@ def place_order(symbol: str, side: str, atr: float):
         send_telegram(f"❌ 주문 실패: 종목 메타 조회 실패 - {symbol}")
         return None
 
-    lotSz   = float(meta["lotSz"])
-    tickSz  = float(meta["tickSz"])
-    minSz   = float(meta["minSz"])
+    lotSz    = float(meta["lotSz"])
+    tickSz   = float(meta["tickSz"])
+    minSz    = float(meta["minSz"])
     maxMktSz = float(meta.get("maxMktSz") or 0)
 
     balance = get_balance()
@@ -307,7 +312,6 @@ def place_order(symbol: str, side: str, atr: float):
     stop_loss_dist = 1.5 * float(atr)
     # 초저가/초저ATR 보호: 최소 손절폭 0.25% of price
     stop_loss_dist = max(stop_loss_dist, price * 0.0025)
-
     if stop_loss_dist <= 0:
         send_telegram(f"❌ ATR 기반 손절폭 계산 실패 - {symbol}")
         return None
@@ -315,24 +319,31 @@ def place_order(symbol: str, side: str, atr: float):
     raw_size = (balance * RISK_PER_TRADE) / stop_loss_dist
     target_size = adjust_size_to_lot(raw_size, lotSz)
 
+    # --- 거래소 산출 최대 가능 수량으로 추가 캡(버퍼 2%) ---
+    max_tradable = get_max_tradable_size(symbol, side, price, td_mode="isolated", ccy="USDT")
+    if max_tradable > 0:
+        cap_by_ex = adjust_size_to_lot(max_tradable * 0.98, lotSz)
+        if target_size > cap_by_ex:
+            print(f"[INFO] target_size {target_size} → exchange cap {cap_by_ex}")
+            target_size = cap_by_ex
+
     # 최소/lot 체크
     if target_size < max(minSz, lotSz):
         send_telegram(f"⚠️ 최소 주문 수량 미달: {symbol} ({format_price(target_size)} < {max(minSz, lotSz)})")
         return None
 
-    # 증거금(대략) 체크
+    # 증거금(보수적) 체크(수수료/오차 버퍼 2%)
     est_cost = price * target_size / LEVERAGE
-    if est_cost > balance:
+    if est_cost * 1.02 > balance:
         send_telegram(
-            "⚠️ 증거금 부족으로 주문 스킵됨\n"
-            f"━━━━━━━━━━━━━━━\n종목: {symbol}\n필요 증거금: {format_price(est_cost)} > 잔고: {format_price(balance)}"
+            "⚠️ 증거금 부족(보수적 계산)으로 주문 스킵\n"
+            f"━━━━━━━━━━━━━━━\n종목: {symbol}\n필요 증거금(예상+버퍼): {format_price(est_cost*1.02)} > 잔고: {format_price(balance)}"
         )
         return None
 
-    # 거래소 최대 시장가 수량 적용 (필요 시 분할 체결)
+    # 거래소 최대 시장가 수량 적용 (필요 시 분할)
     if maxMktSz <= 0:
         maxMktSz = target_size  # 제한 정보 없으면 분할 생략
-
     chunk_sz = min(target_size, maxMktSz)
     chunk_sz = adjust_size_to_lot(chunk_sz, lotSz)
     if chunk_sz < max(minSz, lotSz):
@@ -371,11 +382,9 @@ def place_order(symbol: str, side: str, atr: float):
         print("[ORDER RESPONSE]", json.dumps(res, ensure_ascii=False))
 
         if res.get("code") != "0":
-            # 51202: Market order amount exceeds the maximum amount
             s_code = (res.get("data") or [{}])[0].get("sCode")
             s_msg  = (res.get("data") or [{}])[0].get("sMsg", res.get("msg", "Unknown error"))
-            if s_code == "51202":
-                # 분할 크기를 더 줄여 재시도
+            if s_code == "51202":  # Market order amount exceeds the maximum amount
                 chunk_sz = adjust_size_to_lot(max(lotSz, chunk_sz / 2), lotSz)
                 print(f"[INFO] 51202 → chunk_sz 축소: {chunk_sz}")
                 if chunk_sz < max(minSz, lotSz):
@@ -454,6 +463,17 @@ def place_order(symbol: str, side: str, atr: float):
 # =========================
 # 메인 루프
 # =========================
+def get_top_symbols(limit: int = TARGET_COINS) -> list[str]:
+    url = f"{BASE_URL}/api/v5/market/tickers?instType=SWAP"
+    res = requests.get(url, timeout=HTTP_TIMEOUT).json()
+    df = pd.DataFrame(res.get("data", []))
+    if df.empty:
+        return []
+    df["vol"] = pd.to_numeric(df.get("volCcy24h", 0), errors="coerce").fillna(0.0)
+    if "settleCcy" in df.columns:
+        df = df[df["settleCcy"] == "USDT"]
+    return df.sort_values("vol", ascending=False).head(limit)["instId"].tolist()
+
 if __name__ == "__main__":
     try:
         start_balance = get_balance()
@@ -490,7 +510,6 @@ if __name__ == "__main__":
                         entry_price = info["entry_price"]
                         size = info["size"]
                         direction = info["direction"]
-                        # 종료가 근사: 최신 1m 종가
                         last_price_df = get_candles(sym, "1m", 1)
                         close_px = float(last_price_df["c"].iloc[-1]) if not last_price_df.empty else None
 
