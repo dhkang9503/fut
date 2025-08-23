@@ -52,6 +52,7 @@ report_sent = False
 # 유틸/텔레그램
 # =========================
 def send_telegram(message: str):
+    message = "[OKX bot] " + message
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[텔레그램 비활성]\n" + message)
         return
@@ -59,6 +60,7 @@ def send_telegram(message: str):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
         requests.post(url, data=payload, timeout=HTTP_TIMEOUT)
+        print(message)
     except Exception as e:
         print("텔레그램 전송 실패:", e)
 
