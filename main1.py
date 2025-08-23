@@ -191,17 +191,22 @@ def get_position_price(symbol: str) -> float | None:
     return None
 
 def get_max_tradable_size(symbol: str, side: str, price: float, td_mode: str = "isolated", ccy: str = "USDT") -> float:
-    """OKX가 산출한 현재 계정 상태 기준 최대 매수/매도 가능 수량"""
-    params = {"instId": symbol, "tdMode": td_mode, "ccy": ccy, "px": str(price)}
+    """
+    OKX가 산출한 현재 계정 상태 기준 최대 가능 수량.
+    side == 'long' -> buy 기준, 'short' -> sell 기준.
+    보수적으로 쓰기 위해 0이거나 실패하면 0.0 반환.
+    """
+    pos_side = "long" if side == "long" else "short"
+    params = {"instId": symbol, "tdMode": td_mode, "ccy": ccy, "px": str(price), "posSide": pos_side}
     res = send_request("GET", "/api/v5/account/max-size", params)
     if res.get("code") != "0" or not res.get("data"):
         return 0.0
     info = res["data"][0]
     try:
-        if side == "long":
-            return float(info.get("maxBuy") or info.get("maxSz") or 0.0)
-        else:
-            return float(info.get("maxSell") or info.get("maxSz") or 0.0)
+        val = info.get("maxBuy") if side == "long" else info.get("maxSell")
+        if val is None:
+            val = info.get("maxSz")
+        return float(val or 0.0)
     except Exception:
         return 0.0
 
@@ -308,8 +313,6 @@ def pick_risk_per_trade(price: float) -> float:
     return RISK_PER_TRADE_MICRO if is_micro_price(price) else RISK_PER_TRADE
 
 # =========================
-# 주문 (거래소 cap + 51202 분할 + OCO 한 번)
-# =========================
 def place_order(symbol: str, side: str, atr: float):
     """
     side: 'long' | 'short'
@@ -334,53 +337,60 @@ def place_order(symbol: str, side: str, atr: float):
     price = float(candles["c"].iloc[-1])
 
     # --- 리스크 기반 수량 ---
-    min_sl_pct = MICRO_MIN_SL_PCT if is_micro_price(price) else DEFAULT_MIN_SL_PCT
-    stop_loss_dist = 1.5 * float(atr)
-    stop_loss_dist = max(stop_loss_dist, price * min_sl_pct)   # 하한 적용
-
+    min_sl_pct   = MICRO_MIN_SL_PCT if is_micro_price(price) else DEFAULT_MIN_SL_PCT
+    stop_loss_dist = max(1.5 * float(atr), price * min_sl_pct)
     if stop_loss_dist <= 0:
         send_telegram(f"❌ ATR 기반 손절폭 계산 실패 - {symbol}")
         return None
 
     rpt = pick_risk_per_trade(price)
-    raw_size = (balance * rpt) / stop_loss_dist
+    raw_size    = (balance * rpt) / stop_loss_dist
     target_size = adjust_size_to_lot(raw_size, lotSz)
 
-    # --- 거래소 산출 최대 가능 수량으로 추가 캡(버퍼 2%) ---
+    # --- 거래소 산출 최대 가능 수량으로 보수 캡 (여유 10%) ---
     max_tradable = get_max_tradable_size(symbol, side, price, td_mode="isolated", ccy="USDT")
     if max_tradable > 0:
-        cap_by_ex = adjust_size_to_lot(max_tradable * 0.98, lotSz)
-        if target_size > cap_by_ex:
-            print(f"[INFO] target_size {target_size} → exchange cap {cap_by_ex}")
-            target_size = cap_by_ex
+        cap_by_ex = adjust_size_to_lot(max_tradable * 0.90, lotSz)   # 10% 버퍼
+        target_size = min(target_size, cap_by_ex)
+
+    # --- 종목 자체의 최대 '시장가' 수량으로 보수 캡 (여유 5%) ---
+    if maxMktSz > 0:
+        cap_by_mkt = adjust_size_to_lot(maxMktSz * 0.95, lotSz)      # 5% 버퍼
+        target_size = min(target_size, cap_by_mkt)
 
     # 최소/lot 체크
     if target_size < max(minSz, lotSz):
         send_telegram(f"⚠️ 최소 주문 수량 미달: {symbol} ({format_price(target_size)} < {max(minSz, lotSz)})")
         return None
 
-    # 증거금(보수적) 체크(수수료/오차 버퍼 2%)
+    # 증거금(보수적) 체크(수수료/오차 버퍼 3%)
     est_cost = price * target_size / LEVERAGE
-    if est_cost * 1.02 > balance:
+    if est_cost * 1.03 > balance:
         send_telegram(
-            "⚠️ 증거금 부족(보수적 계산)으로 주문 스킵\n"
-            f"━━━━━━━━━━━━━━━\n종목: {symbol}\n필요 증거금(예상+버퍼): {format_price(est_cost*1.02)} > 잔고: {format_price(balance)}"
+            "⚠️ 증거금 부족(보수 계산)으로 주문 스킵\n"
+            f"━━━━━━━━━━━━━━━\n종목: {symbol}\n필요 증거금(예상+버퍼): {format_price(est_cost*1.03)} > 잔고: {format_price(balance)}"
         )
         return None
 
-    # 거래소 최대 시장가 수량 적용 (필요 시 분할)
-    if maxMktSz <= 0:
-        maxMktSz = target_size  # 제한 정보 없으면 분할 생략
-    chunk_sz = min(target_size, maxMktSz)
+    # --- 분할 초기 크기 산정 ---
+    # 1) 거래소 시장가 최대치
+    # 2) 거래소 가용 수량 cap
+    # 3) 타겟 사이즈
+    chunk_sz = target_size
+    if maxMktSz > 0:
+        chunk_sz = min(chunk_sz, adjust_size_to_lot(maxMktSz * 0.95, lotSz))
+    if max_tradable > 0:
+        chunk_sz = min(chunk_sz, adjust_size_to_lot(max_tradable * 0.90, lotSz))
     chunk_sz = adjust_size_to_lot(chunk_sz, lotSz)
+
     if chunk_sz < max(minSz, lotSz):
-        send_telegram(f"⚠️ 거래소 최대치 반영 후 수량이 최소 미만: {symbol} ({format_price(chunk_sz)})")
+        send_telegram(f"⚠️ 거래소 한도 반영 후 분할 수량이 최소 미만: {symbol} ({format_price(chunk_sz)})")
         return None
 
     # 레버리지 설정
     set_leverage(symbol, LEVERAGE, mode="isolated", pos_side=side)
 
-    # --- 시장가 분할 체결 ---
+    # --- 시장가 분할 체결 (+ 적응형 축소) ---
     filled_any = False
     side_str = "buy" if side == "long" else "sell"
     remaining = target_size
@@ -388,7 +398,7 @@ def place_order(symbol: str, side: str, atr: float):
 
     while remaining >= max(minSz, lotSz) - 1e-12:
         safety_counter += 1
-        if safety_counter > 20:  # 과도 루프 방지
+        if safety_counter > 25:  # 과도 루프 방지
             break
 
         this_sz = min(remaining, chunk_sz)
@@ -409,29 +419,57 @@ def place_order(symbol: str, side: str, atr: float):
         print("[ORDER RESPONSE]", json.dumps(res, ensure_ascii=False))
 
         if res.get("code") != "0":
-            s_code = (res.get("data") or [{}])[0].get("sCode")
-            s_msg  = (res.get("data") or [{}])[0].get("sMsg", res.get("msg", "Unknown error"))
-            if s_code == "51202":  # Market order amount exceeds the maximum amount
-                chunk_sz = adjust_size_to_lot(max(lotSz, chunk_sz / 2), lotSz)
-                print(f"[INFO] 51202 → chunk_sz 축소: {chunk_sz}")
+            # 오류별 적응형 처리
+            d0    = (res.get("data") or [{}])[0]
+            s_code = d0.get("sCode")
+            s_msg  = d0.get("sMsg", res.get("msg", "Unknown error"))
+
+            # 51202: 주문당 최대치 초과 -> 분할 크기 추가 축소 후 재시도
+            if s_code == "51202" or "exceeds the maximum amount" in s_msg:
+                chunk_sz = adjust_size_to_lot(max(lotSz, chunk_sz * 0.6), lotSz)  # 40% 축소
+                print(f"[INFO] 51202/최대치 → chunk_sz 축소: {chunk_sz}")
                 if chunk_sz < max(minSz, lotSz):
                     send_telegram(
-                        "❌ 주문 실패: 거래소 최대 시장가 수량 제한으로 더 이상 분할 불가\n"
+                        "❌ 주문 실패: 시장가 최대치 제한으로 더 이상 분할 불가\n"
                         f"종목:{symbol} / 마지막 분할:{format_price(chunk_sz)}"
                     )
                     break
-                time.sleep(0.3)
+                time.sleep(0.35)
                 continue
-            else:
-                send_telegram(
-                    "❌ 주문 실패 (시장가 진입)\n"
-                    f"━━━━━━━━━━━━━━━\n종목: {symbol}\n방향: {side.upper()}\n수량: {format_price(this_sz)}\n사유: {s_msg}"
-                )
-                break
+
+            # 증거금 부족류 메시지 -> 남은/분할 크기 모두 축소 후 재시도
+            if "insufficient" in s_msg.lower() or "margin" in s_msg.lower():
+                # 거래소 최대 가용 수량을 다시 조회해 반영
+                max_tradable_now = get_max_tradable_size(symbol, side, price, td_mode="isolated", ccy="USDT")
+                if max_tradable_now > 0:
+                    # 즉시 가능한 크기의 80%로 재설정
+                    cap_now = adjust_size_to_lot(max_tradable_now * 0.80, lotSz)
+                    chunk_sz = min(chunk_sz, cap_now)
+                    remaining = min(remaining, cap_now)
+                    print(f"[INFO] margin 부족 → cap_now={cap_now}, chunk_sz={chunk_sz}, remaining={remaining}")
+
+                # 그래도 크면 추가 축소
+                chunk_sz = adjust_size_to_lot(max(lotSz, chunk_sz * 0.7), lotSz)
+                remaining = adjust_size_to_lot(max(lotSz, remaining * 0.85), lotSz)
+                if chunk_sz < max(minSz, lotSz) or remaining < max(minSz, lotSz):
+                    send_telegram(
+                        "❌ 주문 실패: 증거금 부족으로 더 이상 안전한 분할 불가\n"
+                        f"종목:{symbol} / 마지막 분할:{format_price(chunk_sz)} / 남은:{format_price(remaining)}"
+                    )
+                    break
+                time.sleep(0.35)
+                continue
+
+            # 그 외 오류: 중단
+            send_telegram(
+                "❌ 주문 실패 (시장가 진입)\n"
+                f"━━━━━━━━━━━━━━━\n종목: {symbol}\n방향: {side.upper()}\n수량: {format_price(this_sz)}\n사유: {s_msg}"
+            )
+            break
 
         filled_any = True
         remaining = max(0.0, remaining - this_sz)
-        time.sleep(0.15)  # 너무 빠른 연속 주문 방지
+        time.sleep(0.18)  # 너무 빠른 연속 주문 방지
 
     if not filled_any:
         return None
@@ -453,8 +491,8 @@ def place_order(symbol: str, side: str, atr: float):
             except:
                 pass
     if pos_sz is None or pos_sz <= 0:
-        pos_sz = target_size - remaining
-        pos_sz = adjust_size_to_lot(pos_sz, lotSz)
+        # 분할 체결 누계 추정
+        pos_sz = adjust_size_to_lot(target_size - remaining, lotSz)
 
     if pos_sz < max(minSz, lotSz):
         send_telegram(f"⚠️ 포지션 수량이 최소 미만으로 OCO 스킵: {symbol} ({format_price(pos_sz)})")
@@ -472,7 +510,7 @@ def place_order(symbol: str, side: str, atr: float):
         "side": "sell" if side == "long" else "buy",
         "posSide": side,
         "ordType": "oco",
-        "sz": str(pos_sz),             # 실제 포지션 수량
+        "sz": str(pos_sz),
         "tpTriggerPx": f"{tp}",
         "tpOrdPx": "-1",
         "slTriggerPx": f"{sl}",
@@ -486,6 +524,7 @@ def place_order(symbol: str, side: str, atr: float):
         f"수량: {format_price(pos_sz)}\n익절(TP): {format_price(tp)}\n손절(SL): {format_price(sl)}"
     )
     return {"entry_price": entry_price, "size": pos_sz}
+
 
 # =========================
 # 메인 루프
