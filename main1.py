@@ -24,11 +24,18 @@ TELEGRAM_TOKEN = os.getenv("OKX_TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("OKX_TELEGRAM_CHAT_ID")
 
 LEVERAGE = 3
-RISK_PER_TRADE = 0.005      # 계좌 대비 0.5% 리스크
+RISK_PER_TRADE = 0.005            # 일반 코인: 계좌 대비 0.5% 리스크
+RISK_PER_TRADE_MICRO = 0.002      # 마이크로코인: 계좌 대비 0.2% 리스크
+
 TARGET_COINS = 3
-DAILY_LOSS_LIMIT = 0.05     # 일간 손실 한도(5%)
-LOOP_SLEEP_SEC = 300        # 루프 슬립(초)
+DAILY_LOSS_LIMIT = 0.05           # 일간 손실 한도(5%)
+LOOP_SLEEP_SEC = 300              # 루프 슬립(초)
 HTTP_TIMEOUT = 10
+
+# 마이크로코인 판정/손절폭 하한(% of price)
+MICRO_PRICE_THRESHOLD = 0.01      # 이 가격 미만이면 마이크로로 간주 (USDT 기준)
+DEFAULT_MIN_SL_PCT = 0.0025       # 일반: 최소 손절폭 하한 0.25%
+MICRO_MIN_SL_PCT = 0.005          # 마이크로: 최소 손절폭 하한 0.5%
 
 # 로컬 기준시 (KST)
 KST = timezone(timedelta(hours=9))
@@ -46,7 +53,7 @@ report_sent = False
 # =========================
 def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[텔레그램 비활성] ", message)
+        print("[텔레그램 비활성]\n" + message)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
@@ -73,6 +80,7 @@ def format_price(val: float) -> str:
 # OKX 시간/서명/요청
 # =========================
 def get_timestamp() -> str:
+    """OKX 서버 시각(UTC, 밀리초) ISO8601 문자열"""
     r = requests.get(f"{BASE_URL}/api/v5/public/time", timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     ts_ms = int(r.json()["data"][0]["ts"])
@@ -81,15 +89,20 @@ def get_timestamp() -> str:
 
 def sign_request(method: str, path: str, body: dict | None, params: dict | None):
     timestamp = get_timestamp()
+
+    # requestPath(+query) 규격 반영
     request_path = path
     if method.upper() == "GET" and params:
         qs = urlencode(params, doseq=True)
         if qs:
             request_path = f"{path}?{qs}"
+
     body_str = json.dumps(body) if (body and method.upper() != "GET") else ""
     message = f"{timestamp}{method.upper()}{request_path}{body_str}"
+
     mac = hmac.new(API_SECRET.encode("utf-8"), msg=message.encode("utf-8"), digestmod=hashlib.sha256)
     sign = base64.b64encode(mac.digest()).decode()
+
     return {
         "OK-ACCESS-KEY": API_KEY,
         "OK-ACCESS-SIGN": sign,
@@ -127,8 +140,8 @@ def get_instrument_meta(symbol: str):
                 "tickSz": float(info["tickSz"]),
                 "minSz": float(info["minSz"]),
                 "settleCcy": info.get("settleCcy", ""),
-                "maxMktSz": float(info.get("maxMktSz") or 0),
-                "maxLmtSz": float(info.get("maxLmtSz") or 0),
+                "maxMktSz": float(info.get("maxMktSz") or 0),   # 최대 시장가 수량
+                "maxLmtSz": float(info.get("maxLmtSz") or 0),   # 최대 지정가 수량(참고)
             }
         except Exception:
             pass
@@ -148,7 +161,7 @@ def adjust_size_to_lot(size: float, lot_size: float) -> float:
     return round(adjusted, precision)
 
 # =========================
-# 계정/포지션
+# 계정/포지션/한도
 # =========================
 def get_balance() -> float:
     res = send_request("GET", "/api/v5/account/balance", {})
@@ -177,8 +190,8 @@ def get_position_price(symbol: str) -> float | None:
                 return None
     return None
 
-# ✅ 거래소가 계산한 현재 최대 매수/매도 가능 수량
 def get_max_tradable_size(symbol: str, side: str, price: float, td_mode: str = "isolated", ccy: str = "USDT") -> float:
+    """OKX가 산출한 현재 계정 상태 기준 최대 매수/매도 가능 수량"""
     params = {"instId": symbol, "tdMode": td_mode, "ccy": ccy, "px": str(price)}
     res = send_request("GET", "/api/v5/account/max-size", params)
     if res.get("code") != "0" or not res.get("data"):
@@ -283,7 +296,19 @@ def set_leverage(symbol: str, leverage: int, mode: str = "isolated", pos_side: s
     return res
 
 # =========================
-# 주문 (거래소 cap + 51202 대응 분할 + OCO 한 번)
+# 마이크로코인 보정
+# =========================
+def is_micro_price(price: float) -> bool:
+    try:
+        return float(price) < MICRO_PRICE_THRESHOLD
+    except Exception:
+        return False
+
+def pick_risk_per_trade(price: float) -> float:
+    return RISK_PER_TRADE_MICRO if is_micro_price(price) else RISK_PER_TRADE
+
+# =========================
+# 주문 (거래소 cap + 51202 분할 + OCO 한 번)
 # =========================
 def place_order(symbol: str, side: str, atr: float):
     """
@@ -309,14 +334,16 @@ def place_order(symbol: str, side: str, atr: float):
     price = float(candles["c"].iloc[-1])
 
     # --- 리스크 기반 수량 ---
+    min_sl_pct = MICRO_MIN_SL_PCT if is_micro_price(price) else DEFAULT_MIN_SL_PCT
     stop_loss_dist = 1.5 * float(atr)
-    # 초저가/초저ATR 보호: 최소 손절폭 0.25% of price
-    stop_loss_dist = max(stop_loss_dist, price * 0.0025)
+    stop_loss_dist = max(stop_loss_dist, price * min_sl_pct)   # 하한 적용
+
     if stop_loss_dist <= 0:
         send_telegram(f"❌ ATR 기반 손절폭 계산 실패 - {symbol}")
         return None
 
-    raw_size = (balance * RISK_PER_TRADE) / stop_loss_dist
+    rpt = pick_risk_per_trade(price)
+    raw_size = (balance * rpt) / stop_loss_dist
     target_size = adjust_size_to_lot(raw_size, lotSz)
 
     # --- 거래소 산출 최대 가능 수량으로 추가 캡(버퍼 2%) ---
@@ -463,17 +490,6 @@ def place_order(symbol: str, side: str, atr: float):
 # =========================
 # 메인 루프
 # =========================
-def get_top_symbols(limit: int = TARGET_COINS) -> list[str]:
-    url = f"{BASE_URL}/api/v5/market/tickers?instType=SWAP"
-    res = requests.get(url, timeout=HTTP_TIMEOUT).json()
-    df = pd.DataFrame(res.get("data", []))
-    if df.empty:
-        return []
-    df["vol"] = pd.to_numeric(df.get("volCcy24h", 0), errors="coerce").fillna(0.0)
-    if "settleCcy" in df.columns:
-        df = df[df["settleCcy"] == "USDT"]
-    return df.sort_values("vol", ascending=False).head(limit)["instId"].tolist()
-
 if __name__ == "__main__":
     try:
         start_balance = get_balance()
@@ -510,6 +526,7 @@ if __name__ == "__main__":
                         entry_price = info["entry_price"]
                         size = info["size"]
                         direction = info["direction"]
+                        # 종료가 근사: 최신 1m 종가
                         last_price_df = get_candles(sym, "1m", 1)
                         close_px = float(last_price_df["c"].iloc[-1]) if not last_price_df.empty else None
 
