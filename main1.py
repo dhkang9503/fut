@@ -26,7 +26,6 @@ TELEGRAM_CHAT_ID = os.getenv("OKX_TELEGRAM_CHAT_ID")
 LEVERAGE = 3
 RISK_PER_TRADE = 0.005      # 계좌 대비 0.5% 리스크
 TARGET_COINS = 3
-SLIPPAGE = 0.002            # (미사용) 지정가 슬리피지 비율, 현재는 시장가 사용
 DAILY_LOSS_LIMIT = 0.05     # 일간 손실 한도(5%)
 LOOP_SLEEP_SEC = 300        # 루프 슬립(초)
 HTTP_TIMEOUT = 10
@@ -38,7 +37,6 @@ KST = timezone(timedelta(hours=9))
 # 상태
 # =========================
 open_positions = {}         # { symbol: {entry_price, size, direction} }
-min_sizes = {}              # 심볼별 최소수량 캐시(선택)
 daily_start_balance = None
 daily_loss_limit_triggered = False
 report_sent = False
@@ -54,7 +52,6 @@ def send_telegram(message: str):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
         requests.post(url, data=payload, timeout=HTTP_TIMEOUT)
-        print("[텔레그램 전송] ", message)
     except Exception as e:
         print("텔레그램 전송 실패:", e)
 
@@ -139,6 +136,8 @@ def get_instrument_meta(symbol: str):
                 "tickSz": float(info["tickSz"]),
                 "minSz": float(info["minSz"]),
                 "settleCcy": info.get("settleCcy", ""),
+                "maxMktSz": float(info.get("maxMktSz") or 0),   # ✅ 최대 시장가 수량
+                "maxLmtSz": float(info.get("maxLmtSz") or 0),   # 참고: 최대 지정가 수량
             }
         except Exception:
             pass
@@ -279,7 +278,7 @@ def set_leverage(symbol: str, leverage: int, mode: str = "isolated", pos_side: s
     return res
 
 # =========================
-# 주문 (리스크 기반·시장가 + OCO)
+# 주문 (51202 대응: 분할 시장가 + OCO 한 번)
 # =========================
 def place_order(symbol: str, side: str, atr: float):
     """
@@ -291,57 +290,9 @@ def place_order(symbol: str, side: str, atr: float):
         send_telegram(f"❌ 주문 실패: 종목 메타 조회 실패 - {symbol}")
         return None
 
-    lotSz = float(meta["lotSz"])
-    tickSz = float(meta["tickSz"])
-    minSz = float(meta["minSz"])
-
-    balance = get_balance()
-    candles = get_candles(symbol, "1m", 1)
-    if candles.empty:
-        send_telegram(f"❌ 진입 실패: 캔들 데이터 없음 - {symbol}")
-        return None
-
-    price = float(candles["c"].iloc[-1])
-    stop_loss_dist = 1.5 * float(atr)
-    if stop_loss_dist <= 0:
-        send_telegram(f"❌ ATR 기반 손절폭 계산 실패 - {symbol}")
-        return None
-
-    # 리스크 기반 수량: 손실 ≈ size * stop_loss_dist ≒ balance * RPT
-    raw_size = (balance * RISK_PER_TRADE) / stop_loss_dist
-    size = adjust_size_to_lot(raw_size, lotSz)
-
-    # 최소/lot 체크
-    if size < max(minSz, lotSz):
-        send_telegram(f"⚠️ 최소 주문 수량 미달: {symbol} ({format_price(size)} < {max(minSz, lotSz)})")
-        return None
-
-    # 증거금(대략) 체크
-    estimated_cost = price * size / LEVERAGE
-    if estimated_cost > balance:
-        send_telegram(
-            "⚠️ 증거금 부족으로 주문 스킵됨\n"
-            f"━━━━━━━━━━━━━━━\n종목: {symbol}\n필요 증거금: {format_price(estimated_cost)} > 잔고: {format_price(balance)}"
-        )
-        return None
-
-    # 레버리지 설정 (롱/숏 분리 모드 가정)
-    set_leverage(symbol, LEVERAGE, mode="isolated", pos_side=side)
-
-    # 시장가 진입
-    direction = "buy" if side == "lodef place_order(symbol: str, side: str, atr: float):
-    """
-    side: 'long' | 'short'
-    atr : 최근 ATR(가격 단위)
-    """
-    meta = get_instrument_meta(symbol)
-    if not meta:
-        send_telegram(f"❌ 주문 실패: 종목 메타 조회 실패 - {symbol}")
-        return None
-
-    lotSz  = float(meta["lotSz"])
-    tickSz = float(meta["tickSz"])
-    minSz  = float(meta["minSz"])
+    lotSz   = float(meta["lotSz"])
+    tickSz  = float(meta["tickSz"])
+    minSz   = float(meta["minSz"])
     maxMktSz = float(meta.get("maxMktSz") or 0)
 
     balance = get_balance()
@@ -354,7 +305,7 @@ def place_order(symbol: str, side: str, atr: float):
 
     # --- 리스크 기반 수량 ---
     stop_loss_dist = 1.5 * float(atr)
-    # ✅ 초저가/초저ATR 종목 안전장치(최소 손절폭 = 0.25% of price)
+    # 초저가/초저ATR 보호: 최소 손절폭 0.25% of price
     stop_loss_dist = max(stop_loss_dist, price * 0.0025)
 
     if stop_loss_dist <= 0:
@@ -378,12 +329,10 @@ def place_order(symbol: str, side: str, atr: float):
         )
         return None
 
-    # ✅ 거래소 최대 시장가 수량 적용 (필요 시 분할 체결)
-    # maxMktSz가 0이면 거래소에서 제한치를 안 주는 케이스도 있어 보호적으로 큰 값으로 취급
+    # 거래소 최대 시장가 수량 적용 (필요 시 분할 체결)
     if maxMktSz <= 0:
-        maxMktSz = target_size  # 제한치 정보 없음 → 분할 없이 그대로
+        maxMktSz = target_size  # 제한 정보 없으면 분할 생략
 
-    # 분할 크기 계산
     chunk_sz = min(target_size, maxMktSz)
     chunk_sz = adjust_size_to_lot(chunk_sz, lotSz)
     if chunk_sz < max(minSz, lotSz):
@@ -401,7 +350,7 @@ def place_order(symbol: str, side: str, atr: float):
 
     while remaining >= max(minSz, lotSz) - 1e-12:
         safety_counter += 1
-        if safety_counter > 20:  # 안전 탈출(과도한 루프 방지)
+        if safety_counter > 20:  # 과도 루프 방지
             break
 
         this_sz = min(remaining, chunk_sz)
@@ -422,11 +371,11 @@ def place_order(symbol: str, side: str, atr: float):
         print("[ORDER RESPONSE]", json.dumps(res, ensure_ascii=False))
 
         if res.get("code") != "0":
-            # 51202 같은 오류면 남은 수량/분할 크기를 더 줄여 재시도
+            # 51202: Market order amount exceeds the maximum amount
             s_code = (res.get("data") or [{}])[0].get("sCode")
             s_msg  = (res.get("data") or [{}])[0].get("sMsg", res.get("msg", "Unknown error"))
-            if s_code == "51202":  # Market order amount exceeds the maximum amount
-                # 분할 크기를 절반으로 줄여 재도전
+            if s_code == "51202":
+                # 분할 크기를 더 줄여 재시도
                 chunk_sz = adjust_size_to_lot(max(lotSz, chunk_sz / 2), lotSz)
                 print(f"[INFO] 51202 → chunk_sz 축소: {chunk_sz}")
                 if chunk_sz < max(minSz, lotSz):
@@ -446,8 +395,7 @@ def place_order(symbol: str, side: str, atr: float):
 
         filled_any = True
         remaining = max(0.0, remaining - this_sz)
-        # 너무 빨리 여러 건 던지지 않도록 소폭 텀
-        time.sleep(0.15)
+        time.sleep(0.15)  # 너무 빠른 연속 주문 방지
 
     if not filled_any:
         return None
@@ -459,8 +407,7 @@ def place_order(symbol: str, side: str, atr: float):
         send_telegram(f"❗️ 진입가 조회 실패: {symbol}")
         return None
 
-    # --- 포지션 현재 수량 재조회 후 OCO 한 번만 건다 ---
-    # (포지션 API에서 사이즈 읽어오는 함수를 따로 두면 더 깔끔합니다)
+    # --- 포지션 현재 수량 재조회 후 OCO 한 번만 ---
     res_pos = send_request("GET", "/api/v5/account/positions", {"instType": "SWAP"})
     pos_sz = None
     for pos in res_pos.get("data", []):
@@ -469,7 +416,6 @@ def place_order(symbol: str, side: str, atr: float):
                 pos_sz = float(pos.get("pos") or 0)
             except:
                 pass
-    # pos_sz 없으면 방금 채운 this_sz들의 합으로 추정
     if pos_sz is None or pos_sz <= 0:
         pos_sz = target_size - remaining
         pos_sz = adjust_size_to_lot(pos_sz, lotSz)
@@ -490,7 +436,7 @@ def place_order(symbol: str, side: str, atr: float):
         "side": "sell" if side == "long" else "buy",
         "posSide": side,
         "ordType": "oco",
-        "sz": str(pos_sz),             # ✅ 실제 포지션 수량 기준으로 설정
+        "sz": str(pos_sz),             # 실제 포지션 수량
         "tpTriggerPx": f"{tp}",
         "tpOrdPx": "-1",
         "slTriggerPx": f"{sl}",
@@ -546,27 +492,27 @@ if __name__ == "__main__":
                         direction = info["direction"]
                         # 종료가 근사: 최신 1m 종가
                         last_price_df = get_candles(sym, "1m", 1)
-                        if last_price_df.empty:
-                            close_px = None
-                            profit = None
-                            pct = None
-                        else:
-                            close_px = float(last_price_df["c"].iloc[-1])
+                        close_px = float(last_price_df["c"].iloc[-1]) if not last_price_df.empty else None
+
+                        pnl = None
+                        profit = None
+                        pct = None
+                        if close_px is not None:
                             pnl = (close_px - entry_price) if direction == "long" else (entry_price - close_px)
                             profit = pnl * size
                             pct = (pnl / entry_price) * 100 * LEVERAGE
 
-                        status = "익절" if (profit or 0) > 0 else "손절"
-                        emoji = "✅" if (profit or 0) > 0 else "❌"
-                        send_telegram(
-                            f"{emoji} 포지션 종료 ({direction.upper()})\n"
-                            f"━━━━━━━━━━━━━━━\n종목: {sym}\n"
-                            f"진입가: {format_price(entry_price)}\n"
-                            f"종료가(근사): {format_price(close_px) if close_px else 'N/A'}\n"
-                            f"수익금(근사): {format_price(profit) if profit is not None else 'N/A'} USDT "
-                            f"({pct:.2f}%)" if pct is not None else ""
-                            f"\n현재 잔고: {format_price(current_balance)} USDT"
-                        )
+                        lines = [
+                            f"{'✅' if (profit or 0) > 0 else '❌'} 포지션 종료 ({direction.upper()})",
+                            "━━━━━━━━━━━━━━━",
+                            f"종목: {sym}",
+                            f"진입가: {format_price(entry_price)}",
+                            f"종료가(근사): {format_price(close_px) if close_px is not None else 'N/A'}",
+                            f"수익금(근사): {format_price(profit) if profit is not None else 'N/A'} USDT"
+                            + (f" ({pct:.2f}%)" if pct is not None else ""),
+                            f"현재 잔고: {format_price(current_balance)} USDT",
+                        ]
+                        send_telegram("\n".join(lines))
                         del open_positions[sym]
 
                 # 거래 대상 심볼
