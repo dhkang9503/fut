@@ -2,7 +2,7 @@
 BTC/ETH/SOL 모니터링용 시그널 알림 봇 (OKX Public API + Telegram)
 - 실제 주문 없음. 텔레그램으로 매매 제안만 전송
 - 전략: 4H 레짐(BB 20SMA+기울기) + 15m %B 필터 + 5m 밴드외→재진입 & CCI 역전
-- TP/SL: 진입가 기준 ±10% (요청사항)
+- TP/SL: ATR 기반 (기본 SL=ATR×2, TP=ATR×3). ATR 실패 시 폴백 ±10%
 - 레버리지 안내: 50x ~ 100x (요청사항)
 - 투자금 안내: 시드의 10% 사용 권장 (SEED_USDT 설정 시 금액/명목가 계산해서 표시)
 """
@@ -22,8 +22,8 @@ import numpy as np
 # =========================
 BASE_URL = "https://www.okx.com"
 HTTP_TIMEOUT = 10
-LOOP_SLEEP_SEC = 10              # 5분마다 체크
-COOLDOWN_MIN = 60                 # 동일 심볼/방향 알림 최소 간격(분)
+LOOP_SLEEP_SEC = 10              # 10초마다 체크
+COOLDOWN_MIN = 60                # 동일 심볼/방향 알림 최소 간격(분)
 
 # 텔레그램
 TELEGRAM_TOKEN = os.getenv("OKX_TELEGRAM_TOKEN")
@@ -41,6 +41,13 @@ try:
         SEED_USDT = None
 except Exception:
     SEED_USDT = None
+
+# === ATR 기반 TP/SL 설정 ===
+ATR_TF = os.getenv("ATR_TF", "4H")                 # ATR 계산 타임프레임(권장: 4H)
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "2.0"))  # SL = ATR × 2.0
+ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "3.0"))  # TP = ATR × 3.0
+TP_SL_FALLBACK_PCT = float(os.getenv("TP_SL_FALLBACK_PCT", "0.10"))  # ATR 실패 시 ±10%
 
 # 로컬 기준시 (KST)
 KST = timezone(timedelta(hours=9))
@@ -227,17 +234,48 @@ def generate_signal_bb_cci(symbol: str):
     return None, None, None
 
 # =========================
-# 알림 메시지 구성
+# 알림 메시지 구성 (ATR 기반 TP/SL)
 # =========================
 def build_alert(symbol: str, side: str, entry_price: float) -> str:
     tick = get_tick(symbol) or 0.0
 
-    if side == "long":
-        sl = entry_price * 0.90      # -10%
-        tp = entry_price * 1.10      # +10%
+    # --- ATR 계산 (설정된 타임프레임, 마감 봉 사용 권장) ---
+    use_fallback = False
+    atr_val = None
+    try:
+        df_atr = get_candles(symbol, ATR_TF, 300)
+        # 가능하면 확정봉만 사용(OKX 응답의 confirm: "1"=확정, "0"=진행중)
+        if "confirm" in df_atr.columns:
+            df_atr = df_atr[df_atr["confirm"].astype(str) == "1"].copy()
+        atr_series = calculate_atr(df_atr, ATR_PERIOD)
+        atr_val = float(atr_series.iloc[-1])
+        if not np.isfinite(atr_val) or atr_val <= 0:
+            use_fallback = True
+    except Exception:
+        use_fallback = True
+
+    # --- TP/SL 산출 ---
+    if not use_fallback:
+        sl_dist = ATR_SL_MULT * atr_val
+        tp_dist = ATR_TP_MULT * atr_val
+        if side == "long":
+            sl = entry_price - sl_dist
+            tp = entry_price + tp_dist
+        else:
+            sl = entry_price + sl_dist
+            tp = entry_price - tp_dist
+        rr = (tp_dist / sl_dist) if sl_dist > 0 else float("nan")
+        tp_sl_note = f"ATR({ATR_TF},{ATR_PERIOD})={format_price(atr_val)} / R:R≈{rr:.2f}"
+        tp_sl_label = f"ATR×{ATR_TP_MULT:g} / ATR×{ATR_SL_MULT:g}"
     else:
-        sl = entry_price * 1.10
-        tp = entry_price * 0.90
+        if side == "long":
+            sl = entry_price * (1 - TP_SL_FALLBACK_PCT)
+            tp = entry_price * (1 + TP_SL_FALLBACK_PCT)
+        else:
+            sl = entry_price * (1 + TP_SL_FALLBACK_PCT)
+            tp = entry_price * (1 - TP_SL_FALLBACK_PCT)
+        tp_sl_note = f"ATR 계산 실패 → 폴백(±{int(TP_SL_FALLBACK_PCT*100)}%)"
+        tp_sl_label = f"±{int(TP_SL_FALLBACK_PCT*100)}%"
 
     # 틱 사이즈 정렬(메시지용)
     sl = quantize_price(sl, tick)
@@ -261,8 +299,9 @@ def build_alert(symbol: str, side: str, entry_price: float) -> str:
         f"종목: {symbol}\n"
         f"방향: {side.upper()}\n"
         f"진입가(참고): {format_price(entry_q)} USDT\n"
-        f"손절가(SL): {format_price(sl)} USDT (-10%)\n"
-        f"익절가(TP): {format_price(tp)} USDT (+10%)\n"
+        f"손절가(SL): {format_price(sl)} USDT ({tp_sl_label} 기준)\n"
+        f"익절가(TP): {format_price(tp)} USDT ({tp_sl_label} 기준)\n"
+        f"{tp_sl_note}\n"
         f"권장 레버리지: {MIN_LEVERAGE}x ~ {MAX_LEVERAGE}x\n"
         f"{seed_line}"
     )
