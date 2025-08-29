@@ -22,7 +22,7 @@ import numpy as np
 # =========================
 BASE_URL = "https://www.okx.com"
 HTTP_TIMEOUT = 10
-LOOP_SLEEP_SEC = 300              # 5분마다 체크
+LOOP_SLEEP_SEC = 10              # 5분마다 체크
 COOLDOWN_MIN = 60                 # 동일 심볼/방향 알림 최소 간격(분)
 
 # 텔레그램
