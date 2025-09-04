@@ -1,355 +1,210 @@
-"""
-BTC/ETH/SOL 모니터링용 시그널 알림 봇 (OKX Public API + Telegram)
-- 실제 주문 없음. 텔레그램으로 매매 제안만 전송
-- 전략: 4H 레짐(BB 20SMA+기울기) + 15m %B 필터 + 5m 밴드외→재진입 & CCI 역전
-- TP/SL: ATR 기반 (기본 SL=ATR×2, TP=ATR×3). ATR 실패 시 폴백 ±10%
-- 레버리지 안내: 50x ~ 100x (요청사항)
-- 투자금 안내: 시드의 10% 사용 권장 (SEED_USDT 설정 시 금액/명목가 계산해서 표시)
-"""
-
-import os
-import time
-import json
-import math
-from datetime import datetime, timezone, timedelta
-
-import requests
+import os, time, requests, math
 import pandas as pd
-import numpy as np
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-# =========================
-# 환경 변수 / 상수
-# =========================
-BASE_URL = "https://www.okx.com"
-HTTP_TIMEOUT = 10
-LOOP_SLEEP_SEC = 10              # 10초마다 체크
-COOLDOWN_MIN = 60                # 동일 심볼/방향 알림 최소 간격(분)
-
-# 텔레그램
-TELEGRAM_TOKEN = os.getenv("OKX_TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("OKX_TELEGRAM_CHAT_ID")
-
-# 심볼 고정 (요청사항)
-WATCH_SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
-
-# 레버리지/시드 안내 (요청사항)
-MIN_LEVERAGE = 50
-MAX_LEVERAGE = 100
-try:
-    SEED_USDT = float(os.getenv("SEED_USDT") or "nan")
-    if not np.isfinite(SEED_USDT):
-        SEED_USDT = None
-except Exception:
-    SEED_USDT = None
-
-# === ATR 기반 TP/SL 설정 ===
-ATR_TF = os.getenv("ATR_TF", "4H")                 # ATR 계산 타임프레임(권장: 4H)
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "2.0"))  # SL = ATR × 2.0
-ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "3.0"))  # TP = ATR × 3.0
-TP_SL_FALLBACK_PCT = float(os.getenv("TP_SL_FALLBACK_PCT", "0.10"))  # ATR 실패 시 ±10%
-
-# 로컬 기준시 (KST)
-KST = timezone(timedelta(hours=9))
-
-# 내부 상태 (중복 알림 방지)
-last_alert_at = {}        # key: (symbol, side) -> datetime
-last_alert_bar = {}       # key: (symbol, side) -> pandas.Timestamp (5m 마지막 캔들 ts)
-
-# =========================
-# 유틸/텔레그램
-# =========================
-def send_telegram(message: str):
-    prefix = "[OKX signal] "
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(prefix + message)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": prefix + message}
+# ===== 텔레그램 =====
+TELEGRAM_TOKEN = os.environ.get("OKX_TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("OKX_TELEGRAM_CHAT_ID")
+def tg(text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
-        requests.post(url, data=payload, timeout=HTTP_TIMEOUT)
-        print(prefix + message)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+        )
     except Exception as e:
-        print("텔레그램 전송 실패:", e)
+        print("TG error:", e)
 
-def format_price(val: float) -> str:
-    if val is None or not np.isfinite(val):
-        return "N/A"
-    if val >= 100:
-        return f"{val:,.2f}"
-    elif val >= 1:
-        return f"{val:,.4f}"
-    elif val >= 0.01:
-        return f"{val:,.6f}"
-    elif val >= 0.0001:
-        return f"{val:,.8f}"
-    else:
-        return f"{val:,.10f}"
+# ===== 설정값 (필요시 조정) =====
+SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+INTERVAL = "1m"
+LIMIT = 180                 # 최근 180분 사용
+VOL_SMA_N = 20              # 거래량 기준선
+VOL_SPIKE_MULT = 3.5        # "거래량 터짐" 배수 기준
+SR_LOOKBACK = 60            # 지지/저항 탐색 분
+SR_TOL = 0.002              # 지지/저항 근접 허용(0.2%)
+WICK_RATIO_MIN = 0.45       # 윗/아랫꼬리 비율 최소
+STOP_PAD = 0.0015           # 무효화(손절) 버퍼 0.15%
+KST = ZoneInfo("Asia/Seoul")
 
-# =========================
-# OKX 퍼블릭 마켓
-# =========================
-def get_candles(symbol: str, bar: str, limit: int = 300) -> pd.DataFrame:
-    url = f"{BASE_URL}/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
-    r = requests.get(url, timeout=HTTP_TIMEOUT)
+# ===== 상태 =====
+state = {
+    "open_symbol": None,        # 포지션 보유 코인
+    "side": None,               # "long" or "short"
+    "entry_price": None,
+    "entry_time_utc": None,
+    "ref_low": None,            # 진입 근거 스윙저/스윙고
+    "ref_high": None
+}
+
+# ===== 데이터 수집 =====
+def fetch_klines(symbol, limit=LIMIT):
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": INTERVAL, "limit": limit}
+    r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
-    data = r.json().get("data", [])
-    if not data:
-        return pd.DataFrame()
-    df = pd.DataFrame(data)
-    df.columns = ["ts", "o", "h", "l", "c", "vol", "volCcy", "volCcyQuote", "confirm"]
-    df = df.iloc[::-1].reset_index(drop=True)
-    for col in ["o", "h", "l", "c"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["ts"] = pd.to_datetime(df["ts"].astype(np.int64), unit="ms", utc=True)
+    arr = r.json()
+    df = pd.DataFrame(arr, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","qav","n_trades","tbav","tbqv","ignore"
+    ])
+    for c in ["open","high","low","close","volume"]:
+        df[c] = df[c].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
     return df
 
-def get_instrument_meta(symbol: str):
-    """tickSz 등 메타 조회 (가격 라운딩용)"""
-    url = f"{BASE_URL}/api/v5/public/instruments?instType=SWAP&instId={symbol}"
-    try:
-        r = requests.get(url, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        data = r.json().get("data", [])
-        if not data:
-            return None
-        info = data[0]
-        return {
-            "tickSz": float(info.get("tickSz") or 0.0),
-            "lotSz": float(info.get("lotSz") or 0.0),
-            "minSz": float(info.get("minSz") or 0.0),
-        }
-    except Exception:
-        return None
+# ===== 시그널 로직 =====
+def near(x, ref, tol=SR_TOL):
+    return abs(x - ref) / ref <= tol
 
-_meta_cache = {}
-def get_tick(symbol: str) -> float:
-    meta = _meta_cache.get(symbol)
-    if not meta:
-        meta = get_instrument_meta(symbol)
-        if meta:
-            _meta_cache[symbol] = meta
-    return (meta or {}).get("tickSz", 0.0) if meta else 0.0
+def entry_signal(df):
+    """마감된 최신봉 기준으로 역추세 진입 시그널 계산"""
+    if len(df) < max(VOL_SMA_N+1, SR_LOOKBACK+5): return None
+    last = df.iloc[-1]
+    prevN = df.iloc[-(VOL_SMA_N+1):-1]
+    v_sma = prevN["volume"].mean()
+    if v_sma == 0: return None
+    v_mult = last["volume"] / v_sma
 
-def quantize_price(x: float, tick: float) -> float:
-    if tick <= 0 or not np.isfinite(x):
-        return x
-    precision = max(-int(math.floor(math.log10(tick))), 0)
-    return round(round(x / tick) * tick, precision)
+    high = last["high"]; low = last["low"]; open_ = last["open"]; close = last["close"]
+    rng = max(high - low, 1e-9)
+    upper_wick = high - max(open_, close)
+    lower_wick = min(open_, close) - low
+    up_ratio = upper_wick / rng
+    lo_ratio = lower_wick / rng
+    is_green = close >= open_
 
-# =========================
-# 지표
-# =========================
-def bollinger(df: pd.DataFrame, period: int = 20, mult: float = 2.0):
-    mid = df["c"].rolling(period).mean()
-    std = df["c"].rolling(period).std(ddof=0)
-    ub = mid + mult * std
-    lb = mid - mult * std
-    percB = (df["c"] - lb) / (ub - lb)
-    bandwidth = (ub - lb) / mid
-    return mid, ub, lb, percB, bandwidth
+    prior = df.iloc[-(SR_LOOKBACK+1):-1]
+    prior_high = prior["high"].max()
+    prior_low  = prior["low"].min()
 
-def cci(df: pd.DataFrame, period: int = 20, c: float = 0.015):
-    tp = (df["h"] + df["l"] + df["c"]) / 3.0
-    ma = tp.rolling(period).mean()
-    md = (tp - ma).abs().rolling(period).mean()
-    cci_series = (tp - ma) / (c * md)
-    return cci_series
-
-def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high_low = df["h"] - df["l"]
-    high_close = (df["h"] - df["c"].shift()).abs()
-    low_close = (df["l"] - df["c"].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.rolling(period).mean()
-    return atr.bfill()
-
-def slope(series: pd.Series, lookback: int = 5):
-    if len(series) < lookback + 1:
-        return 0.0
-    return float(series.iloc[-1] - series.iloc[-1 - lookback])
-
-# =========================
-# 시그널 (BB + CCI)
-# =========================
-def generate_signal_bb_cci(symbol: str):
-    """
-    반환: (side, entry_price, last_5m_ts) 또는 (None, None, None)
-    side: 'long' or 'short'
-    """
-    df_4h  = get_candles(symbol, "4H", 300)
-    df_15m = get_candles(symbol, "15m", 300)
-    df_5m  = get_candles(symbol, "5m", 300)
-
-    if df_4h.empty or df_15m.empty or df_5m.empty:
-        return None, None, None
-
-    # 4H 레짐
-    mid4, ub4, lb4, pB4, bw4 = bollinger(df_4h, 20, 2.0)
-    sma4 = mid4
-    up_regime   = (df_4h["c"].iloc[-1] > sma4.iloc[-1]) and (slope(sma4, 5) > 0)
-    down_regime = (df_4h["c"].iloc[-1] < sma4.iloc[-1]) and (slope(sma4, 5) < 0)
-    if not (up_regime or down_regime):
-        return None, None, None
-
-    # 15m 중기 확인
-    mid15, ub15, lb15, pB15, bw15 = bollinger(df_15m, 20, 2.0)
-    pB15_last = pB15.iloc[-1]
-    bw15_last = bw15.iloc[-1]
-    if not np.isfinite(pB15_last) or not np.isfinite(bw15_last):
-        return None, None, None
-    # 스퀴즈 회피: 너무 좁은 밴드면 패스
-    if bw15_last < 0.015:
-        return None, None, None
-
-    # 5m 실행 신호
-    mid5, ub5, lb5, pB5, bw5 = bollinger(df_5m, 20, 2.0)
-    cci5 = cci(df_5m, 20)
-    close = float(df_5m["c"].iloc[-1])
-    last_ts = df_5m["ts"].iloc[-1]  # 마지막 5m 캔들 타임스탬프(UTC)
-
-    # 최근 1~2봉 내 외밴드 터치 확인
-    last2_high = df_5m["h"].iloc[-2:].max()
-    last2_low  = df_5m["l"].iloc[-2:].min()
-    ub_now = float(ub5.iloc[-1])
-    lb_now = float(lb5.iloc[-1])
-
-    long_trigger = (
-        up_regime and
-        (0.20 <= float(pB15_last) <= 0.55) and
-        (last2_low <= lb_now) and (close > lb_now) and
-        (cci5.iloc[-2] < -100 and cci5.iloc[-1] > -100)
+    # SHORT: 거래량 피크 + 저항 근접 + 윗꼬리 두드러짐 + 양봉
+    short_ok = (
+        v_mult >= VOL_SPIKE_MULT and
+        (high >= prior_high or near(high, prior_high)) and
+        up_ratio >= WICK_RATIO_MIN and
+        is_green
     )
-    short_trigger = (
-        down_regime and
-        (0.45 <= float(pB15_last) <= 0.80) and
-        (last2_high >= ub_now) and (close < ub_now) and
-        (cci5.iloc[-2] > 100 and cci5.iloc[-1] < 100)
+    # LONG: 거래량 피크 + 지지 근접 + 아랫꼬리 두드러짐 + 음봉
+    long_ok = (
+        v_mult >= VOL_SPIKE_MULT and
+        (low <= prior_low or near(low, prior_low)) and
+        lo_ratio >= WICK_RATIO_MIN and
+        not is_green
     )
 
-    if long_trigger:
-        return "long", close, last_ts
-    if short_trigger:
-        return "short", close, last_ts
-    return None, None, None
+    if short_ok:
+        return {"side":"short","reason":f"vol x{v_mult:.1f}, near R({prior_high:.2f}), upper wick {up_ratio:.2f}",
+                "v_mult": v_mult, "prior_high": prior_high, "prior_low": prior_low}
+    if long_ok:
+        return {"side":"long","reason":f"vol x{v_mult:.1f}, near S({prior_low:.2f}), lower wick {lo_ratio:.2f}",
+                "v_mult": v_mult, "prior_high": prior_high, "prior_low": prior_low}
+    return None
 
-# =========================
-# 알림 메시지 구성 (ATR 기반 TP/SL)
-# =========================
-def build_alert(symbol: str, side: str, entry_price: float) -> str:
-    tick = get_tick(symbol) or 0.0
+def exit_signal(df, side):
+    """보유중일 때 청산: 해당 방향 수익 확정용 거래량 피크 봉"""
+    if len(df) < VOL_SMA_N+1: return None
+    last = df.iloc[-1]
+    prevN = df.iloc[-(VOL_SMA_N+1):-1]
+    v_sma = prevN["volume"].mean()
+    if v_sma == 0: return None
+    v_mult = last["volume"] / v_sma
 
-    # --- ATR 계산 (설정된 타임프레임, 마감 봉 사용 권장) ---
-    use_fallback = False
-    atr_val = None
-    try:
-        df_atr = get_candles(symbol, ATR_TF, 300)
-        # 가능하면 확정봉만 사용(OKX 응답의 confirm: "1"=확정, "0"=진행중)
-        if "confirm" in df_atr.columns:
-            df_atr = df_atr[df_atr["confirm"].astype(str) == "1"].copy()
-        atr_series = calculate_atr(df_atr, ATR_PERIOD)
-        atr_val = float(atr_series.iloc[-1])
-        if not np.isfinite(atr_val) or atr_val <= 0:
-            use_fallback = True
-    except Exception:
-        use_fallback = True
+    open_, close = last["open"], last["close"]
+    is_green = close >= open_
+    # 롱이면 대량거래 *상승* 봉에서 청산, 숏이면 대량거래 *하락* 봉에서 청산
+    if side == "long" and v_mult >= VOL_SPIKE_MULT and is_green:
+        return {"type":"tp","reason":f"vol x{v_mult:.1f} green spike"}
+    if side == "short" and v_mult >= VOL_SPIKE_MULT and not is_green:
+        return {"type":"tp","reason":f"vol x{v_mult:.1f} red spike"}
+    return None
 
-    # --- TP/SL 산출 ---
-    if not use_fallback:
-        sl_dist = ATR_SL_MULT * atr_val
-        tp_dist = ATR_TP_MULT * atr_val
-        if side == "long":
-            sl = entry_price - sl_dist
-            tp = entry_price + tp_dist
-        else:
-            sl = entry_price + sl_dist
-            tp = entry_price - tp_dist
-        rr = (tp_dist / sl_dist) if sl_dist > 0 else float("nan")
-        tp_sl_note = f"ATR({ATR_TF},{ATR_PERIOD})={format_price(atr_val)} / R:R≈{rr:.2f}"
-        tp_sl_label = f"ATR×{ATR_TP_MULT:g} / ATR×{ATR_SL_MULT:g}"
-    else:
-        if side == "long":
-            sl = entry_price * (1 - TP_SL_FALLBACK_PCT)
-            tp = entry_price * (1 + TP_SL_FALLBACK_PCT)
-        else:
-            sl = entry_price * (1 + TP_SL_FALLBACK_PCT)
-            tp = entry_price * (1 - TP_SL_FALLBACK_PCT)
-        tp_sl_note = f"ATR 계산 실패 → 폴백(±{int(TP_SL_FALLBACK_PCT*100)}%)"
-        tp_sl_label = f"±{int(TP_SL_FALLBACK_PCT*100)}%"
+def stop_out(df, side, ref_low, ref_high):
+    """무효화(손절): 롱은 스윙저 하회, 숏은 스윙고 상회"""
+    last = df.iloc[-1]
+    px = last["close"]
+    if side == "long":
+        stop = ref_low * (1 - STOP_PAD)
+        if px < stop: return {"type":"sl","reason":f"lost swing low {ref_low:.2f}"}
+    if side == "short":
+        stop = ref_high * (1 + STOP_PAD)
+        if px > stop: return {"type":"sl","reason":f"broke swing high {ref_high:.2f}"}
+    return None
 
-    # 틱 사이즈 정렬(메시지용)
-    sl = quantize_price(sl, tick)
-    tp = quantize_price(tp, tick)
-    entry_q = quantize_price(entry_price, tick)
+def fmt_price(symbol, p):
+    return f"{p:,.2f}" if symbol.endswith("USDT") else f"{p}"
 
-    # 시드 금액 기반 안내(선택)
-    seed_line = "권장 투자금: 시드의 10%"
-    if SEED_USDT is not None and SEED_USDT > 0:
-        margin = SEED_USDT * 0.10
-        notional_min = margin * MIN_LEVERAGE
-        notional_max = margin * MAX_LEVERAGE
-        seed_line = (
-            f"권장 투자금: 시드의 10% ≈ {format_price(margin)} USDT\n"
-            f"예상 포지션 명목가: {format_price(notional_min)} ~ {format_price(notional_max)} USDT"
-        )
+def now_kst():
+    return datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-    msg = (
-        f"📊 매매 신호 발생\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"종목: {symbol}\n"
-        f"방향: {side.upper()}\n"
-        f"진입가(참고): {format_price(entry_q)} USDT\n"
-        f"손절가(SL): {format_price(sl)} USDT ({tp_sl_label} 기준)\n"
-        f"익절가(TP): {format_price(tp)} USDT ({tp_sl_label} 기준)\n"
-        f"{tp_sl_note}\n"
-        f"권장 레버리지: {MIN_LEVERAGE}x ~ {MAX_LEVERAGE}x\n"
-        f"{seed_line}"
-    )
-    return msg
+# ===== 메인 루프 =====
+def main():
+    print("running scanner...")
+    while True:
+        # ---- 다음 분 00초까지 대기 (정각 동기화) ----
+        now = datetime.now(timezone.utc)
+        next_min = (now.replace(second=0, microsecond=0) + timedelta(minutes=1))
+        time.sleep(max((next_min - now).total_seconds(), 0.0))
 
-# =========================
-# 메인 루프
-# =========================
+        try:
+            # 데이터 수집
+            dfs = {sym: fetch_klines(sym) for sym in SYMBOLS}
+
+            # 포지션 없으면: 두 코인 신호 중 가장 강한(spike 배수 큰) 한 개만 채택
+            if state["open_symbol"] is None:
+                cands = []
+                for sym in SYMBOLS:
+                    sig = entry_signal(dfs[sym])
+                    if sig:
+                        last = dfs[sym].iloc[-1]
+                        cands.append((sig["v_mult"], sym, sig, last))
+                if cands:
+                    cands.sort(reverse=True, key=lambda x: x[0])  # 가장 강한 신호
+                    _, sym, sig, last = cands[0]
+                    side = sig["side"]; px = last["close"]
+                    state.update({
+                        "open_symbol": sym,
+                        "side": side,
+                        "entry_price": px,
+                        "entry_time_utc": last["close_time"].to_pydatetime(),
+                        "ref_low": sig["prior_low"],
+                        "ref_high": sig["prior_high"]
+                    })
+                    kst_time = now_kst()
+                    tg(f"*[ENTRY]* {sym} {side.upper()} @ {fmt_price(sym, px)}\n"
+                       f"{kst_time}\n"
+                       f"reason: {sig['reason']}")
+                    print("ENTRY:", sym, side, px, sig["reason"])
+
+            # 포지션 있으면: 청산(TP/SL) 감시
+            else:
+                sym = state["open_symbol"]
+                df = dfs.get(sym)
+                if df is None: continue
+                # 우선 손절 체크
+                so = stop_out(df, state["side"], state["ref_low"], state["ref_high"])
+                if so:
+                    px = df.iloc[-1]["close"]
+                    tg(f"*[EXIT-SL]* {sym} {state['side'].upper()} @ {fmt_price(sym, px)}\n"
+                       f"{now_kst()}\nreason: {so['reason']}")
+                    print("EXIT-SL:", sym, px, so["reason"])
+                    state.update({"open_symbol":None,"side":None,"entry_price":None,
+                                  "entry_time_utc":None,"ref_low":None,"ref_high":None})
+                    continue
+                # 이익실현 체크
+                ex = exit_signal(df, state["side"])
+                if ex:
+                    px = df.iloc[-1]["close"]
+                    tg(f"*[[EXIT-TP]]* {sym} {state['side'].upper()} @ {fmt_price(sym, px)}\n"
+                       f"{now_kst()}\nreason: {ex['reason']}")
+                    print("EXIT-TP:", sym, px, ex["reason"])
+                    state.update({"open_symbol":None,"side":None,"entry_price":None,
+                                  "entry_time_utc":None,"ref_low":None,"ref_high":None})
+
+        except Exception as e:
+            print("loop error:", e)
+
 if __name__ == "__main__":
-    send_telegram("✅ 시그널 알림 봇 시작됨 (BTC/ETH/SOL, 주문 없음)")
-    try:
-        while True:
-            try:
-                now = datetime.now(KST)
-                for symbol in WATCH_SYMBOLS:
-                    side, price, last5_ts = generate_signal_bb_cci(symbol)
-                    if not side:
-                        continue
-
-                    key = (symbol, side)
-                    # 같은 5m 봉에서 중복 알림 방지
-                    prev_bar = last_alert_bar.get(key)
-                    if prev_bar is not None and pd.Timestamp(last5_ts) == prev_bar:
-                        continue
-
-                    # 쿨다운(분) 체크
-                    prev_time = last_alert_at.get(key)
-                    if prev_time is not None:
-                        minutes = (now - prev_time).total_seconds() / 60.0
-                        if minutes < COOLDOWN_MIN:
-                            continue
-
-                    # 알림 전송
-                    msg = build_alert(symbol, side, price)
-                    send_telegram(msg)
-
-                    # 상태 업데이트
-                    last_alert_at[key] = now
-                    last_alert_bar[key] = pd.Timestamp(last5_ts)
-
-                time.sleep(LOOP_SLEEP_SEC)
-
-            except Exception as loop_err:
-                send_telegram(f"[루프 오류] {loop_err}")
-                time.sleep(60)
-
-    except KeyboardInterrupt:
-        send_telegram("🛑 수동 종료됨")
-    except Exception as e:
-        send_telegram(f"[치명 오류] {e}")
-        raise
+    main()
