@@ -2,6 +2,8 @@ import os, time, requests, math
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+import io
+import matplotlib.pyplot as plt
 
 # ===== 텔레그램 =====
 TELEGRAM_TOKEN = os.environ.get("OKX_TELEGRAM_TOKEN")
@@ -15,6 +17,71 @@ def tg(text):
         )
     except Exception as e:
         print("TG error:", e)
+
+GREEN = "#4DD2E6"  # 양봉
+RED   = "#FC495C"  # 음봉
+
+def fetch_range_1m(symbol, start_utc, end_utc):
+    """start_utc~end_utc 구간 1분봉 재조회"""
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    params = {
+        "symbol": symbol, "interval": "1m",
+        "startTime": int(start_utc.timestamp() * 1000),
+        "endTime":   int(end_utc.timestamp()   * 1000)
+    }
+    r = requests.get(url, params=params, timeout=10); r.raise_for_status()
+    df = pd.DataFrame(r.json(), columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","qav","n_trades","tbav","tbqv","ignore"
+    ])
+    for c in ["open","high","low","close","volume"]:
+        df[c] = df[c].astype(float)
+    df["open_time"]  = pd.to_datetime(df["open_time"],  unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    return df[["open_time","open","high","low","close","volume"]]
+
+def make_chart_png(df, symbol, entry_time_utc, exit_time_utc, entry_px, exit_px):
+    """검정 배경 + 지정 색상 캔들, 진입/청산 마커 포함 PNG bytes 반환"""
+    fig, (ax1, ax2) = plt.subplots(2,1, figsize=(10,6), sharex=True)
+    # 배경
+    for ax in (ax1, ax2):
+        ax.set_facecolor("black")
+        ax.tick_params(colors="white")
+        ax.grid(True, alpha=0.2, color="white")
+    fig.patch.set_facecolor("black")
+
+    # 캔들
+    for _, r in df.iterrows():
+        color = GREEN if r["close"] >= r["open"] else RED
+        ax1.plot([r["open_time"], r["open_time"]], [r["low"], r["high"]], color=color, linewidth=1)
+        body_low  = min(r["open"], r["close"])
+        body_high = max(r["open"], r["close"])
+        ax1.add_patch(plt.Rectangle((r["open_time"], body_low),
+                                    pd.Timedelta(minutes=0.8),
+                                    body_high - body_low,
+                                    color=color, alpha=0.9, linewidth=0))
+
+    # 진입/청산 마커
+    ax1.scatter(entry_time_utc, entry_px, s=80, marker="^", color=GREEN, edgecolors="white", linewidths=0.5, zorder=5, label="Entry")
+    ax1.scatter(exit_time_utc,  exit_px,  s=80, marker="v", color=RED,   edgecolors="white", linewidths=0.5, zorder=5, label="Exit")
+    ax1.legend(facecolor="black", edgecolor="white", labelcolor="white")
+
+    # 거래량
+    ax2.bar(df["open_time"], df["volume"], width=0.8/1440, align="center", alpha=0.8, color="white")
+    ax1.set_title(f"{symbol} 1m  (Entry~Exit view)", color="white")
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=160, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+def tg_photo(png_bytes, caption=""):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    files = {"photo": ("chart.png", png_bytes, "image/png")}
+    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
+    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=15)
 
 # ===== 설정값 (필요시 조정) =====
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]
@@ -189,6 +256,12 @@ def main():
                     px = df.iloc[-1]["close"]
                     tg(f"*[EXIT-SL]* {sym} {state['side'].upper()} @ {fmt_price(sym, px)}\n"
                        f"{now_kst()}\nreason: {so['reason']}")
+                    start_utc = state["entry_time_utc"] - timedelta(minutes=10)
+                    end_utc   = df.iloc[-1]["close_time"].to_pydatetime() + timedelta(minutes=1)
+                    cut = fetch_range_1m(sym, start_utc, end_utc)
+                    png = make_chart_png(cut, sym, state["entry_time_utc"], df.iloc[-1]["close_time"].to_pydatetime(),
+                        state["entry_price"], px)
+                    tg_photo(png, caption=f"{sym} EXIT-SL chart")
                     print("EXIT-SL:", sym, px, so["reason"])
                     state.update({"open_symbol":None,"side":None,"entry_price":None,
                                   "entry_time_utc":None,"ref_low":None,"ref_high":None})
@@ -199,6 +272,12 @@ def main():
                     px = df.iloc[-1]["close"]
                     tg(f"*[[EXIT-TP]]* {sym} {state['side'].upper()} @ {fmt_price(sym, px)}\n"
                        f"{now_kst()}\nreason: {ex['reason']}")
+                    start_utc = state["entry_time_utc"] - timedelta(minutes=10)
+                    end_utc   = df.iloc[-1]["close_time"].to_pydatetime() + timedelta(minutes=1)
+                    cut = fetch_range_1m(sym, start_utc, end_utc)
+                    png = make_chart_png(cut, sym, state["entry_time_utc"], df.iloc[-1]["close_time"].to_pydatetime(),
+                        state["entry_price"], px)
+                    tg_photo(png, caption=f"{sym} EXIT-TP chart")
                     print("EXIT-TP:", sym, px, ex["reason"])
                     state.update({"open_symbol":None,"side":None,"entry_price":None,
                                   "entry_time_utc":None,"ref_low":None,"ref_high":None})
