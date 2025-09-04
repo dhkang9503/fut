@@ -141,7 +141,7 @@ def now_kst():
 
 # ===== 메인 루프 =====
 def main():
-    print("running scanner...")
+    tg("running scanner...")
     while True:
         # ---- 다음 분 00초까지 대기 (정각 동기화) ----
         now = datetime.now(timezone.utc)
