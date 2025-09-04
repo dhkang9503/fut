@@ -283,7 +283,7 @@ def main():
                                   "entry_time_utc":None,"ref_low":None,"ref_high":None})
 
         except Exception as e:
-            print("loop error:", e)
+            tg(f"loop error: {e}")
 
 if __name__ == "__main__":
     main()
