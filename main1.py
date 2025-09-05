@@ -1,4 +1,5 @@
-import os, time, requests, math, io
+import os, time, io, math, requests
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -6,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # =========================
-# 환경/텔레그램
+# 환경 / 텔레그램
 # =========================
 TELEGRAM_TOKEN = os.environ.get("OKX_TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("OKX_TELEGRAM_CHAT_ID")
@@ -36,30 +37,48 @@ def tg_photo(png_bytes, caption=""):
 # =========================
 # 설정값
 # =========================
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]  # 동시 진입 금지(한 번에 1종목만)
+SYMBOLS = ["BTCUSDT", "ETHUSDT"]   # 동시 진입 금지(항상 1개만 보유)
 INTERVAL = "1m"
-LIMIT = 180                   # 최근 180분 사용
+LIMIT = 180                        # 최근 180분 사용
 
-# 엔트리 로직(방장 성향)
-VOL_SMA_N = 20                # 거래량 기준선
-VOL_SPIKE_MULT = 3.5          # "거래량 터짐" 배수 기준
-SR_LOOKBACK = 60              # 지지/저항 탐색 분
-SR_TOL = 0.002                # 지지/저항 근접 허용(±0.2%)
-WICK_RATIO_MIN = 0.45         # 윗/아랫꼬리 비율 최소
-STOP_PAD = 0.0015             # 스윙 고/저 무효화 버퍼(±0.15%)
+# --- 엔트리(방장 성향 기본값)
+VOL_SMA_N = 20                     # 거래량 기준선 길이
+VOL_SPIKE_MULT = 3.5               # "거래량 터짐" 배수 기준
+SR_TOL = 0.002                     # 지지/저항 근접 허용(±0.2%)
+WICK_RATIO_MIN = 0.45              # 윗/아랫꼬리 비율 최소
 
-# 단타형 청산
-PARTIAL_TP_R_MULT = 1.0       # 1R 수익 도달 시 부분 익절
-PARTIAL_TP_FALLBACK_PCT = 0.003  # R 계산 불가 시 +0.3%에서 부분 익절
-MOVE_SL_TO_BE = True          # 부분 익절 후 본전 방어 활성화
-BE_PAD = 0.0                  # 본전 방어 여유(0이면 정확히 본전)
+# --- SR/STOP(기본/보수 모드 값: 아래 Adaptive에서 자동 전환)
+SR_LOOKBACK_BASE = 60              # 기본: 60분 SR
+SR_LOOKBACK_CONS = 180             # 보수: 180분 SR
+STOP_PAD_BASE = 0.0015             # 기본: ±0.15%
+STOP_PAD_CONS = 0.0030             # 보수: ±0.30%
 
-# 시각화 색
+# --- 단타형 청산
+PARTIAL_TP_R_MULT = 1.0            # 1R 수익 도달시 부분 익절
+PARTIAL_TP_FALLBACK_PCT = 0.003    # R 미계산 시 +0.3%에서 부분 익절
+MOVE_SL_TO_BE = True               # 부분 익절 후 본전 방어
+BE_PAD = 0.0                       # 본전 방어 여유(0이면 정확히 본전)
+
+# --- Adaptive(자동 보수화)
+EMA_FAST = 20
+EMA_SLOW = 50
+ATR_N = 14
+STRONG_TREND_SLOPE = 0.0006        # 분당 기울기 임계치(0.06%)
+HIGH_ATR_PCT = 0.004               # ATR/price >= 0.4%면 고변동
+CONSEC_VOL_SPIKES = 2              # 연속 스파이크 N개면 돌파 성격
+SL_COOLDOWN_MIN = 5                # 손절 직후 N분 진입 금지
+RECLAIM_CONFIRM = True             # 보수 모드에서 재전유 확인
+
+# --- 시각화
 GREEN = "#4DD2E6"  # 양봉
 RED   = "#FC495C"  # 음봉
+KST   = ZoneInfo("Asia/Seoul")
 
-# 시간대
-KST = ZoneInfo("Asia/Seoul")
+# =========================
+# 전역(Adaptive 동적 적용을 위해 변경될 값)
+# =========================
+SR_LOOKBACK = SR_LOOKBACK_BASE
+STOP_PAD    = STOP_PAD_BASE
 
 # =========================
 # 상태
@@ -69,17 +88,20 @@ state = {
     "side": None,                 # "long" or "short"
     "entry_price": None,
     "entry_time_utc": None,
-    "ref_low": None,              # 진입 근거 스윙저/스윙고
+    "ref_low": None,
     "ref_high": None,
 
-    # 단타형 청산용
-    "risk_R": None,               # 진입 시 계산한 1R(%) – 없으면 None
-    "ptp_done": False,            # 부분 익절 완료 여부
-    "be_active": False            # 본전 방어 활성화 여부
+    # 단타형
+    "risk_R": None,
+    "ptp_done": False,
+    "be_active": False,
+
+    # 쿨다운
+    "last_sl_time": None
 }
 
 # =========================
-# 도우미
+# 유틸
 # =========================
 def now_kst():
     return datetime.now(timezone.utc).astimezone(KST).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -91,7 +113,7 @@ def near(x, ref, tol=SR_TOL):
     return abs(x - ref) / ref <= tol
 
 # =========================
-# 데이터 수집
+# 데이터 수집/지표
 # =========================
 def fetch_klines(symbol, limit=LIMIT):
     url = "https://fapi.binance.com/fapi/v1/klines"
@@ -109,8 +131,18 @@ def fetch_klines(symbol, limit=LIMIT):
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
     return df
 
+def add_indicators(df):
+    df = df.copy()
+    df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    tr1 = (df["high"] - df["low"]).abs()
+    tr2 = (df["high"] - df["close"].shift(1)).abs()
+    tr3 = (df["low"]  - df["close"].shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(span=ATR_N, adjust=False).mean()
+    return df
+
 def fetch_range_1m(symbol, start_utc, end_utc):
-    """start_utc~end_utc 구간 1분봉 재조회"""
     url = "https://fapi.binance.com/fapi/v1/klines"
     params = {
         "symbol": symbol, "interval": "1m",
@@ -129,17 +161,60 @@ def fetch_range_1m(symbol, start_utc, end_utc):
     return df[["open_time","open","high","low","close","volume","close_time"]]
 
 # =========================
+# Adaptive 판단
+# =========================
+def slope_per_min(series):
+    n = min(len(series), EMA_FAST)
+    if n < 3: return 0.0
+    y = series.tail(n).values
+    x = np.arange(n)
+    k = ((x - x.mean()) * (y - y.mean())).sum() / ((x - x.mean())**2).sum()
+    return 0.0 if y.mean() == 0 else k / y.mean()  # 비율/분
+
+def conservative_mode(df):
+    """강한 추세/고변동/연속 스파이크 → 보수 모드 True"""
+    last = df.iloc[-1]
+    s = slope_per_min(df["ema_fast"])
+    strong_trend = (abs(s) >= STRONG_TREND_SLOPE) and \
+                   ((last["ema_fast"] > last["ema_slow"]) or (last["ema_fast"] < last["ema_slow"]))
+    high_vol = (last["atr"] / last["close"]) >= HIGH_ATR_PCT
+
+    v_sma = df["volume"].rolling(VOL_SMA_N).mean().shift(1)
+    spikes = (df["volume"] > (v_sma * VOL_SPIKE_MULT)).astype(int)
+    consec = int(spikes.tail(CONSEC_VOL_SPIKES).sum() >= CONSEC_VOL_SPIKES)
+
+    return bool(strong_trend or high_vol or consec)
+
+def can_enter(sym_df):
+    """손절 직후 쿨다운"""
+    if state["last_sl_time"] is not None:
+        if sym_df.iloc[-1]["close_time"].to_pydatetime() < state["last_sl_time"] + timedelta(minutes=SL_COOLDOWN_MIN):
+            return False
+    return True
+
+def reclaim_confirm(df, side, level):
+    """보수 모드에서만 사용: 레벨 재전유 확인"""
+    if len(df) < 3: return False
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    if side == "long":
+        # 지지선 위 종가 + 직전 고점 돌파(근사 허용)
+        return (last["close"] > level) and (last["high"] >= max(prev["high"] * 0.999, prev["high"]))
+    else:
+        # 저항선 아래 종가 + 직전 저점 이탈(근사 허용)
+        return (last["close"] < level) and (last["low"]  <= min(prev["low"]  * 1.001, prev["low"]))
+
+# =========================
 # 시그널 로직
 # =========================
 def entry_signal(df):
-    """마감된 최신봉 기준으로 역추세 진입 시그널 계산"""
+    """마감된 최신봉 기준 역추세 진입 신호"""
     if len(df) < max(VOL_SMA_N+1, SR_LOOKBACK+5):
         return None
     last = df.iloc[-1]
     prevN = df.iloc[-(VOL_SMA_N+1):-1]
     v_sma = prevN["volume"].mean()
-    if v_sma == 0:
-        return None
+    if v_sma == 0: return None
     v_mult = last["volume"] / v_sma
 
     high = last["high"]; low = last["low"]; open_ = last["open"]; close = last["close"]
@@ -154,20 +229,12 @@ def entry_signal(df):
     prior_high = prior["high"].max()
     prior_low  = prior["low"].min()
 
-    # SHORT: 거래량 피크 + 저항 근접 + 윗꼬리 두드러짐 + 양봉
-    short_ok = (
-        v_mult >= VOL_SPIKE_MULT and
-        (high >= prior_high or near(high, prior_high)) and
-        up_ratio >= WICK_RATIO_MIN and
-        is_green
-    )
-    # LONG: 거래량 피크 + 지지 근접 + 아랫꼬리 두드러짐 + 음봉
-    long_ok = (
-        v_mult >= VOL_SPIKE_MULT and
-        (low <= prior_low or near(low, prior_low)) and
-        lo_ratio >= WICK_RATIO_MIN and
-        not is_green
-    )
+    # SHORT: 거래량 피크 + 저항 근접 + 윗꼬리 + 양봉
+    short_ok = (v_mult >= VOL_SPIKE_MULT) and ((high >= prior_high) or near(high, prior_high)) \
+               and (up_ratio >= WICK_RATIO_MIN) and is_green
+    # LONG: 거래량 피크 + 지지 근접 + 아랫꼬리 + 음봉
+    long_ok  = (v_mult >= VOL_SPIKE_MULT) and ((low  <= prior_low)  or near(low, prior_low)) \
+               and (lo_ratio >= WICK_RATIO_MIN) and (not is_green)
 
     if short_ok:
         return {"side":"short","reason":f"vol x{v_mult:.1f}, near R({prior_high:.2f}), upper wick {up_ratio:.2f}",
@@ -178,91 +245,58 @@ def entry_signal(df):
     return None
 
 def compute_risk_R(entry_px, side, ref_low, ref_high):
-    """
-    진입가와 스윙 고/저 기반 손절선으로 1R(%) 계산. 불능(음수/0)이면 None.
-    """
+    """진입가 vs 스윙 고/저 기반 1R(%) 계산; 불능이면 None"""
     if side == "long":
         stop = ref_low * (1 - STOP_PAD)
         R = (entry_px - stop) / entry_px
-    else:  # short
+    else:
         stop = ref_high * (1 + STOP_PAD)
         R = (stop - entry_px) / entry_px
     return R if R and R > 0 else None
 
 def pnl_pct(side, entry_px, cur_px):
-    """현재 PnL 퍼센트(진입가 기준)를 +면 이익, -면 손실로 반환"""
     p = (cur_px - entry_px) / entry_px
     return p if side == "long" else -p
 
 def partial_tp_needed(side, entry_px, cur_px, risk_R):
-    """
-    부분 익절 조건:
-      - risk_R 있으면 PnL >= PARTIAL_TP_R_MULT * risk_R
-      - 없으면 PnL >= PARTIAL_TP_FALLBACK_PCT
-    """
     p = pnl_pct(side, entry_px, cur_px)
-    if risk_R and p >= PARTIAL_TP_R_MULT * risk_R:
-        return True
-    if (not risk_R) and p >= PARTIAL_TP_FALLBACK_PCT:
-        return True
+    if risk_R and p >= PARTIAL_TP_R_MULT * risk_R: return True
+    if (not risk_R) and p >= PARTIAL_TP_FALLBACK_PCT: return True
     return False
 
 def dynamic_stop_price_for_be(entry_px, side):
-    """본전 방어용 스탑 가격 산출"""
-    if side == "long":
-        return entry_px * (1 - BE_PAD)
-    else:
-        return entry_px * (1 + BE_PAD)
+    return entry_px * (1 - BE_PAD) if side == "long" else entry_px * (1 + BE_PAD)
 
 def stop_out(df, side, ref_low, ref_high, entry_px=None, be_active=False):
-    """
-    무효화(손절) 로직:
-      1) be_active면 '본전 방어' 우선
-      2) 아니면 스윙 고/저 기반 무효화
-    """
+    """본전 방어 우선 → 스윙 무효화"""
     last = df.iloc[-1]
     px = last["close"]
-
-    # 본전 방어
     if be_active and entry_px is not None:
         be_stop = dynamic_stop_price_for_be(entry_px, side)
         if (side == "long" and px < be_stop) or (side == "short" and px > be_stop):
             return {"type":"sl", "reason": f"breakeven stop {be_stop:.2f}"}
-
-    # 기본 무효화
     if side == "long":
         stop = ref_low * (1 - STOP_PAD)
-        if px < stop:
-            return {"type":"sl","reason":f"lost swing low {ref_low:.2f}"}
+        if px < stop: return {"type":"sl","reason":f"lost swing low {ref_low:.2f}"}
     else:
         stop = ref_high * (1 + STOP_PAD)
-        if px > stop:
-            return {"type":"sl","reason":f"broke swing high {ref_high:.2f}"}
+        if px > stop: return {"type":"sl","reason":f"broke swing high {ref_high:.2f}"}
     return None
 
 def exit_signal(df, side, ptp_done=False):
-    """
-    TP 로직:
-      - 기본: 기존과 동일(거래량 x 배수 + 방향색 일치)
-      - 부분 익절 이후(ptp_done=True): 색깔 무시, v_spike만으로 청산
-    """
-    if len(df) < VOL_SMA_N+1:
-        return None
+    """TP: 기본은 방향색+볼륨, 부분익절 이후는 색 무시하고 볼륨만"""
+    if len(df) < VOL_SMA_N+1: return None
     last = df.iloc[-1]
     prevN = df.iloc[-(VOL_SMA_N+1):-1]
     v_sma = prevN["volume"].mean()
-    if v_sma == 0:
-        return None
+    if v_sma == 0: return None
     v_mult = last["volume"] / v_sma
-
     open_, close = last["open"], last["close"]
     is_green = close >= open_
-
     if ptp_done:
         if v_mult >= VOL_SPIKE_MULT:
-            return {"type":"tp", "reason": f"vol x{v_mult:.1f} spike (post-PTP)"}
+            return {"type":"tp","reason":f"vol x{v_mult:.1f} spike (post-PTP)"}
         return None
-
     if side == "long" and v_mult >= VOL_SPIKE_MULT and is_green:
         return {"type":"tp","reason":f"vol x{v_mult:.1f} green spike"}
     if side == "short" and v_mult >= VOL_SPIKE_MULT and not is_green:
@@ -270,7 +304,7 @@ def exit_signal(df, side, ptp_done=False):
     return None
 
 # =========================
-# 차트 생성 (KST, 거래량 색상=캔들 색상)
+# 차트(KST, 거래량=캔들 색)
 # =========================
 def make_chart_png(df, symbol, entry_time_utc, exit_time_utc, entry_px, exit_px):
     """
@@ -289,14 +323,12 @@ def make_chart_png(df, symbol, entry_time_utc, exit_time_utc, entry_px, exit_px)
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
 
-    # 배경/그리드/축색
     for ax in (ax1, ax2):
         ax.set_facecolor("black")
         ax.tick_params(colors="white")
         ax.grid(True, alpha=0.2, color="white")
     fig.patch.set_facecolor("black")
 
-    # 캔들
     w = 0.8 / 1440.0  # 0.8분 폭(일 단위 눈금)
     for xi, o, h, l, c, col in zip(x, df["open"], df["high"], df["low"], df["close"], colors):
         ax1.plot([xi, xi], [l, h], color=col, linewidth=1)
@@ -304,17 +336,14 @@ def make_chart_png(df, symbol, entry_time_utc, exit_time_utc, entry_px, exit_px)
         ax1.add_patch(plt.Rectangle((xi, body_low), w, body_high - body_low,
                                     color=col, alpha=0.9, linewidth=0))
 
-    # 거래량 (캔들과 동일 색)
     ax2.bar(x, df["volume"], width=w, align="center", alpha=0.9, color=colors)
 
-    # 진입/청산 마커
     ax1.scatter(mdates.date2num(entry_kst), entry_px, s=80, marker="^",
                 color=GREEN, edgecolors="white", linewidths=0.5, zorder=5, label="Entry")
     ax1.scatter(mdates.date2num(exit_kst),  exit_px,  s=80, marker="v",
                 color=RED,   edgecolors="white", linewidths=0.5, zorder=5, label="Exit")
     ax1.legend(facecolor="black", edgecolor="white", labelcolor="white")
 
-    # 축/포맷
     ax1.set_title(f"{symbol} 1m (KST)", color="white")
     ax1.xaxis_date(); ax2.xaxis_date()
     formatter = mdates.DateFormatter('%H:%M', tz=KST)
@@ -332,6 +361,8 @@ def make_chart_png(df, symbol, entry_time_utc, exit_time_utc, entry_px, exit_px)
 # =========================
 def main():
     tg("running scanner...")
+    global SR_LOOKBACK, STOP_PAD
+
     while True:
         # 다음 분 00초까지 대기(정각 동기화)
         now = datetime.now(timezone.utc)
@@ -339,20 +370,40 @@ def main():
         time.sleep(max((next_min - now).total_seconds(), 0.0))
 
         try:
-            # 데이터 수집
-            dfs = {sym: fetch_klines(sym) for sym in SYMBOLS}
+            # 데이터 수집 + 지표
+            dfs = {sym: add_indicators(fetch_klines(sym)) for sym in SYMBOLS}
 
-            # 포지션 없으면: 두 코인 중 가장 강한 신호(거래량 배수 큰 것) 1개만 진입
+            # 포지션 없으면: 두 코인 중 가장 강한 신호만 진입
             if state["open_symbol"] is None:
                 candidates = []
                 for sym in SYMBOLS:
-                    sig = entry_signal(dfs[sym])
+                    df = dfs[sym]
+                    if not can_enter(df):
+                        continue
+
+                    # Adaptive: 보수 모드 여부에 따라 파라미터 주입
+                    cons = conservative_mode(df)
+                    SR_LOOKBACK = SR_LOOKBACK_CONS if cons else SR_LOOKBACK_BASE
+                    STOP_PAD    = STOP_PAD_CONS    if cons else STOP_PAD_BASE
+
+                    sig = entry_signal(df)
                     if sig:
-                        last = dfs[sym].iloc[-1]
-                        candidates.append((sig["v_mult"], sym, sig, last))
+                        # 보수 모드면 재전유 확인
+                        if cons and RECLAIM_CONFIRM:
+                            level = sig["prior_low"] if sig["side"] == "long" else sig["prior_high"]
+                            if not reclaim_confirm(df, sig["side"], level):
+                                continue  # 확인 실패 → 스킵
+                        last = df.iloc[-1]
+                        candidates.append((sig["v_mult"], sym, sig, last, cons))
+
                 if candidates:
                     candidates.sort(reverse=True, key=lambda x: x[0])
-                    _, sym, sig, last = candidates[0]
+                    _, sym, sig, last, cons = candidates[0]
+
+                    # 진입 시점의 파라미터로 R 계산(고정)
+                    SR_LOOKBACK = SR_LOOKBACK_CONS if cons else SR_LOOKBACK_BASE
+                    STOP_PAD    = STOP_PAD_CONS    if cons else STOP_PAD_BASE
+
                     side = sig["side"]; px = last["close"]
                     state.update({
                         "open_symbol": sym,
@@ -361,7 +412,6 @@ def main():
                         "entry_time_utc": last["close_time"].to_pydatetime(),
                         "ref_low": sig["prior_low"],
                         "ref_high": sig["prior_high"],
-                        # 단타형
                         "risk_R": compute_risk_R(px, side, sig["prior_low"], sig["prior_high"]),
                         "ptp_done": False,
                         "be_active": False
@@ -376,6 +426,10 @@ def main():
                 df = dfs.get(sym)
                 if df is None:
                     continue
+
+                # Adaptive: 보유 중에도 보수 모드 판단하여 STOP_PAD 적용(동적)
+                cons_hold = conservative_mode(df)
+                STOP_PAD = STOP_PAD_CONS if cons_hold else STOP_PAD_BASE
 
                 # 1) 손절(본전 방어 포함)
                 so = stop_out(df, state["side"], state["ref_low"], state["ref_high"],
@@ -393,7 +447,8 @@ def main():
                                          state["entry_price"], px)
                     tg_photo(png, caption=f"{sym} EXIT-SL chart")
                     print("EXIT-SL:", sym, px, so["reason"])
-                    # 상태 리셋
+
+                    state["last_sl_time"] = df.iloc[-1]["close_time"].to_pydatetime()
                     state.update({"open_symbol":None,"side":None,"entry_price":None,
                                   "entry_time_utc":None,"ref_low":None,"ref_high":None,
                                   "risk_R":None,"ptp_done":False,"be_active":False})
@@ -425,13 +480,13 @@ def main():
                                          state["entry_price"], px)
                     tg_photo(png, caption=f"{sym} EXIT-TP chart")
                     print("EXIT-TP:", sym, px, ex["reason"])
-                    # 상태 리셋
+
                     state.update({"open_symbol":None,"side":None,"entry_price":None,
                                   "entry_time_utc":None,"ref_low":None,"ref_high":None,
                                   "risk_R":None,"ptp_done":False,"be_active":False})
 
         except Exception as e:
-            tg(f"loop error: {e}")
+            print("loop error:", e)
 
 if __name__ == "__main__":
     main()
