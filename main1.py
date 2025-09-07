@@ -37,7 +37,7 @@ def tg_photo(png_bytes, caption=""):
 # =========================
 # 설정값
 # =========================
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]   # 동시 진입 금지(항상 1개만 보유)
+SYMBOLS = ["BTCUSDT", "ETHUSDT"]   # 동시 진입 금지
 INTERVAL = "1m"
 LIMIT = 180                        # 최근 180분 사용
 
@@ -53,13 +53,19 @@ SR_LOOKBACK_CONS = 180             # 보수: 180분 SR
 STOP_PAD_BASE = 0.0015             # 기본: ±0.15%
 STOP_PAD_CONS = 0.0030             # 보수: ±0.30%
 
-# --- 단타형 청산
-PARTIAL_TP_R_MULT = 1.0            # 1R 수익 도달시 부분 익절
-PARTIAL_TP_FALLBACK_PCT = 0.003    # R 미계산 시 +0.3%에서 부분 익절
-MOVE_SL_TO_BE = True               # 부분 익절 후 본전 방어
-BE_PAD = 0.0                       # 본전 방어 여유(0이면 정확히 본전)
+# --- 수익 극대화(핵심 추가)
+PARTIAL_SIZE = 0.5                 # 부분익절 비중(신호 봇이므로 안내만)
+PARTIAL_TP_R_MULT = 1.0            # 1R 도달 시 부분익절
+PARTIAL_TP_FALLBACK_PCT = 0.003    # R 계산 불가 시 +0.3%에서 부분익절
+MOVE_SL_TO_BE = True               # 부분익절 후 본전 방어 가동
+BE_PAD = 0.0                       # 본전 방어 여유
 
-# --- Adaptive(자동 보수화)
+FINAL_TP_R = 2.5                   # 최종 TP 목표(RR). 트레일과 병행
+TRAIL_N = 7                        # 최근 N봉 저/고 기반 트레일
+USE_EMA_TRAIL = True               # EMA 트레일 사용
+EMA_TRAIL = 20                     # EMA 트레일 길이
+
+# --- Adaptive(자동 보수화 + 돌파 감지)
 EMA_FAST = 20
 EMA_SLOW = 50
 ATR_N = 14
@@ -69,13 +75,17 @@ CONSEC_VOL_SPIKES = 2              # 연속 스파이크 N개면 돌파 성격
 SL_COOLDOWN_MIN = 5                # 손절 직후 N분 진입 금지
 RECLAIM_CONFIRM = True             # 보수 모드에서 재전유 확인
 
+# --- 돌파형(continuation) 판정 파라미터
+BODY_EXPANSION = 0.60              # 바디/전체(range) 비율이 크면 돌파형
+HOLD_FOR_BREAKOUT_BARS = 2         # 돌파형 감지 직후 초기 TP 스킵할 최소 봉 수
+
 # --- 시각화
 GREEN = "#4DD2E6"  # 양봉
 RED   = "#FC495C"  # 음봉
 KST   = ZoneInfo("Asia/Seoul")
 
 # =========================
-# 전역(Adaptive 동적 적용을 위해 변경될 값)
+# 전역(Adaptive 동적 적용)
 # =========================
 SR_LOOKBACK = SR_LOOKBACK_BASE
 STOP_PAD    = STOP_PAD_BASE
@@ -85,16 +95,19 @@ STOP_PAD    = STOP_PAD_BASE
 # =========================
 state = {
     "open_symbol": None,
-    "side": None,                 # "long" or "short"
+    "side": None,
     "entry_price": None,
     "entry_time_utc": None,
     "ref_low": None,
     "ref_high": None,
 
-    # 단타형
+    # RR/부분익절/트레일
     "risk_R": None,
     "ptp_done": False,
     "be_active": False,
+    "hold_bars": 0,                # 보유한 봉 수(진입 후)
+    "breakout_mode": False,        # 돌파형 보유 모드(초기 TP 회피)
+    "breakout_armed_bars": 0,      # 돌파 보유 모드 경과 봉 수
 
     # 쿨다운
     "last_sl_time": None
@@ -198,11 +211,16 @@ def reclaim_confirm(df, side, level):
     last = df.iloc[-1]
     prev = df.iloc[-2]
     if side == "long":
-        # 지지선 위 종가 + 직전 고점 돌파(근사 허용)
         return (last["close"] > level) and (last["high"] >= max(prev["high"] * 0.999, prev["high"]))
     else:
-        # 저항선 아래 종가 + 직전 저점 이탈(근사 허용)
         return (last["close"] < level) and (last["low"]  <= min(prev["low"]  * 1.001, prev["low"]))
+
+def detect_breakout_candle(row):
+    """단일 봉이 돌파형인지: 바디 확장 + 볼륨 스파이크"""
+    rng = max(row["high"] - row["low"], 1e-12)
+    body = abs(row["close"] - row["open"])
+    body_ratio = body / rng
+    return (body_ratio >= BODY_EXPANSION)
 
 # =========================
 # 시그널 로직
@@ -229,23 +247,23 @@ def entry_signal(df):
     prior_high = prior["high"].max()
     prior_low  = prior["low"].min()
 
-    # SHORT: 거래량 피크 + 저항 근접 + 윗꼬리 + 양봉
     short_ok = (v_mult >= VOL_SPIKE_MULT) and ((high >= prior_high) or near(high, prior_high)) \
                and (up_ratio >= WICK_RATIO_MIN) and is_green
-    # LONG: 거래량 피크 + 지지 근접 + 아랫꼬리 + 음봉
     long_ok  = (v_mult >= VOL_SPIKE_MULT) and ((low  <= prior_low)  or near(low, prior_low)) \
                and (lo_ratio >= WICK_RATIO_MIN) and (not is_green)
 
     if short_ok:
         return {"side":"short","reason":f"vol x{v_mult:.1f}, near R({prior_high:.2f}), upper wick {up_ratio:.2f}",
-                "v_mult": v_mult, "prior_high": prior_high, "prior_low": prior_low}
+                "v_mult": v_mult, "prior_high": prior_high, "prior_low": prior_low,
+                "is_breakout": detect_breakout_candle(last)}
     if long_ok:
         return {"side":"long","reason":f"vol x{v_mult:.1f}, near S({prior_low:.2f}), lower wick {lo_ratio:.2f}",
-                "v_mult": v_mult, "prior_high": prior_high, "prior_low": prior_low}
+                "v_mult": v_mult, "prior_high": prior_high, "prior_low": prior_low,
+                "is_breakout": detect_breakout_candle(last)}
     return None
 
 def compute_risk_R(entry_px, side, ref_low, ref_high):
-    """진입가 vs 스윙 고/저 기반 1R(%) 계산; 불능이면 None"""
+    """진입가 vs 스윙 고/저 기반 1R(%) 계산"""
     if side == "long":
         stop = ref_low * (1 - STOP_PAD)
         R = (entry_px - stop) / entry_px
@@ -267,6 +285,33 @@ def partial_tp_needed(side, entry_px, cur_px, risk_R):
 def dynamic_stop_price_for_be(entry_px, side):
     return entry_px * (1 - BE_PAD) if side == "long" else entry_px * (1 + BE_PAD)
 
+def trail_stop_hit(df, side, entry_px):
+    """트레일링 스탑: 최근 N봉 저/고 + EMA 교차 둘 중 하나라도 이탈하면 True"""
+    if len(df) < max(TRAIL_N+1, EMA_TRAIL+1): return False
+    sub = df.iloc[-TRAIL_N:]
+    last = df.iloc[-1]
+    if side == "long":
+        bar_trail = sub["low"].min()
+        cond_bar = last["close"] < bar_trail
+        if USE_EMA_TRAIL:
+            ema = df["close"].ewm(span=EMA_TRAIL, adjust=False).mean().iloc[-1]
+            cond_ema = last["close"] < ema
+            return bool(cond_bar or cond_ema)
+        return bool(cond_bar)
+    else:
+        bar_trail = sub["high"].max()
+        cond_bar = last["close"] > bar_trail
+        if USE_EMA_TRAIL:
+            ema = df["close"].ewm(span=EMA_TRAIL, adjust=False).mean().iloc[-1]
+            cond_ema = last["close"] > ema
+            return bool(cond_bar or cond_ema)
+        return bool(cond_bar)
+
+def final_tp_hit_by_R(side, entry_px, cur_px, risk_R):
+    if not risk_R: return False
+    p = pnl_pct(side, entry_px, cur_px)
+    return p >= FINAL_TP_R * risk_R
+
 def stop_out(df, side, ref_low, ref_high, entry_px=None, be_active=False):
     """본전 방어 우선 → 스윙 무효화"""
     last = df.iloc[-1]
@@ -283,8 +328,8 @@ def stop_out(df, side, ref_low, ref_high, entry_px=None, be_active=False):
         if px > stop: return {"type":"sl","reason":f"broke swing high {ref_high:.2f}"}
     return None
 
-def exit_signal(df, side, ptp_done=False):
-    """TP: 기본은 방향색+볼륨, 부분익절 이후는 색 무시하고 볼륨만"""
+def exit_signal_spike(df, side, ptp_done=False, allow_early_tp=True):
+    """볼륨 스파이크 기반 TP (초기 돌파 보유모드면 early TP 금지)"""
     if len(df) < VOL_SMA_N+1: return None
     last = df.iloc[-1]
     prevN = df.iloc[-(VOL_SMA_N+1):-1]
@@ -293,6 +338,8 @@ def exit_signal(df, side, ptp_done=False):
     v_mult = last["volume"] / v_sma
     open_, close = last["open"], last["close"]
     is_green = close >= open_
+    if not allow_early_tp:
+        return None  # 돌파 보유 모드에서는 초반 스파이크 TP 비활성화
     if ptp_done:
         if v_mult >= VOL_SPIKE_MULT:
             return {"type":"tp","reason":f"vol x{v_mult:.1f} spike (post-PTP)"}
@@ -307,12 +354,6 @@ def exit_signal(df, side, ptp_done=False):
 # 차트(KST, 거래량=캔들 색)
 # =========================
 def make_chart_png(df, symbol, entry_time_utc, exit_time_utc, entry_px, exit_px):
-    """
-    - 배경: 검정
-    - 캔들: 양봉 #4DD2E6, 음봉 #FC495C
-    - 거래량: 캔들과 동일 색상
-    - x축: 한국시간(KST) HH:MM
-    """
     df = df.copy()
     df["kst_time"] = df["open_time"].dt.tz_convert(KST)
     entry_kst = entry_time_utc.astimezone(KST)
@@ -329,7 +370,7 @@ def make_chart_png(df, symbol, entry_time_utc, exit_time_utc, entry_px, exit_px)
         ax.grid(True, alpha=0.2, color="white")
     fig.patch.set_facecolor("black")
 
-    w = 0.8 / 1440.0  # 0.8분 폭(일 단위 눈금)
+    w = 0.8 / 1440.0
     for xi, o, h, l, c, col in zip(x, df["open"], df["high"], df["low"], df["close"], colors):
         ax1.plot([xi, xi], [l, h], color=col, linewidth=1)
         body_low, body_high = min(o, c), max(o, c)
@@ -360,7 +401,7 @@ def make_chart_png(df, symbol, entry_time_utc, exit_time_utc, entry_px, exit_px)
 # 메인 루프
 # =========================
 def main():
-    tg("running scanner...")
+    tg("running scanner with extended profit mode...")
     global SR_LOOKBACK, STOP_PAD
 
     while True:
@@ -370,10 +411,9 @@ def main():
         time.sleep(max((next_min - now).total_seconds(), 0.0))
 
         try:
-            # 데이터 수집 + 지표
             dfs = {sym: add_indicators(fetch_klines(sym)) for sym in SYMBOLS}
 
-            # 포지션 없으면: 두 코인 중 가장 강한 신호만 진입
+            # 포지션 없으면: 한 종목만 진입
             if state["open_symbol"] is None:
                 candidates = []
                 for sym in SYMBOLS:
@@ -381,7 +421,6 @@ def main():
                     if not can_enter(df):
                         continue
 
-                    # Adaptive: 보수 모드 여부에 따라 파라미터 주입
                     cons = conservative_mode(df)
                     SR_LOOKBACK = SR_LOOKBACK_CONS if cons else SR_LOOKBACK_BASE
                     STOP_PAD    = STOP_PAD_CONS    if cons else STOP_PAD_BASE
@@ -392,7 +431,7 @@ def main():
                         if cons and RECLAIM_CONFIRM:
                             level = sig["prior_low"] if sig["side"] == "long" else sig["prior_high"]
                             if not reclaim_confirm(df, sig["side"], level):
-                                continue  # 확인 실패 → 스킵
+                                continue
                         last = df.iloc[-1]
                         candidates.append((sig["v_mult"], sym, sig, last, cons))
 
@@ -400,11 +439,16 @@ def main():
                     candidates.sort(reverse=True, key=lambda x: x[0])
                     _, sym, sig, last, cons = candidates[0]
 
-                    # 진입 시점의 파라미터로 R 계산(고정)
+                    # 진입 시점의 파라미터 고정
                     SR_LOOKBACK = SR_LOOKBACK_CONS if cons else SR_LOOKBACK_BASE
                     STOP_PAD    = STOP_PAD_CONS    if cons else STOP_PAD_BASE
 
                     side = sig["side"]; px = last["close"]
+                    # 돌파형 보유 모드 조건: 연속 스파이크 환경 + 큰 바디
+                    breakout_env = cons  # 연속 스파이크/강추세 포함
+                    breakout_candle = bool(sig.get("is_breakout", False))
+                    breakout_mode = bool(breakout_env and breakout_candle)
+
                     state.update({
                         "open_symbol": sym,
                         "side": side,
@@ -412,22 +456,33 @@ def main():
                         "entry_time_utc": last["close_time"].to_pydatetime(),
                         "ref_low": sig["prior_low"],
                         "ref_high": sig["prior_high"],
+
                         "risk_R": compute_risk_R(px, side, sig["prior_low"], sig["prior_high"]),
                         "ptp_done": False,
-                        "be_active": False
+                        "be_active": False,
+                        "hold_bars": 0,
+
+                        "breakout_mode": breakout_mode,
+                        "breakout_armed_bars": 0
                     })
                     tg(f"*[ENTRY]* {sym} {side.upper()} @ {fmt_price(sym, px)}\n"
-                       f"{now_kst()}\nreason: {sig['reason']}")
-                    print("ENTRY:", sym, side, px, sig["reason"])
+                       f"{now_kst()}\nreason: {sig['reason']}"
+                       + (f"\nmode: breakout-hold" if breakout_mode else ""))
+                    print("ENTRY:", sym, side, px, sig["reason"], "breakout:", breakout_mode)
 
-            # 포지션 있으면: SL/부분TP/TP 감시
+            # 포지션 보유: SL/부분TP/트레일/최종TP
             else:
                 sym = state["open_symbol"]
                 df = dfs.get(sym)
-                if df is None:
+                if df is None: 
                     continue
 
-                # Adaptive: 보유 중에도 보수 모드 판단하여 STOP_PAD 적용(동적)
+                # 보유 봉 카운트 갱신
+                state["hold_bars"] += 1
+                if state["breakout_mode"] and state["breakout_armed_bars"] < HOLD_FOR_BREAKOUT_BARS:
+                    state["breakout_armed_bars"] += 1
+
+                # Adaptive: 보유 중에도 STOP_PAD 동적
                 cons_hold = conservative_mode(df)
                 STOP_PAD = STOP_PAD_CONS if cons_hold else STOP_PAD_BASE
 
@@ -438,7 +493,7 @@ def main():
                     px = df.iloc[-1]["close"]
                     tg(f"*[EXIT-SL]* {sym} {state['side'].upper()} @ {fmt_price(sym, px)}\n"
                        f"{now_kst()}\nreason: {so['reason']}")
-                    # 차트 전송: 진입 10분 전 ~ 청산 1분 후
+                    # 차트 전송
                     start_utc = state["entry_time_utc"] - timedelta(minutes=10)
                     end_utc   = df.iloc[-1]["close_time"].to_pydatetime() + timedelta(minutes=1)
                     cut = fetch_range_1m(sym, start_utc, end_utc)
@@ -451,14 +506,15 @@ def main():
                     state["last_sl_time"] = df.iloc[-1]["close_time"].to_pydatetime()
                     state.update({"open_symbol":None,"side":None,"entry_price":None,
                                   "entry_time_utc":None,"ref_low":None,"ref_high":None,
-                                  "risk_R":None,"ptp_done":False,"be_active":False})
+                                  "risk_R":None,"ptp_done":False,"be_active":False,
+                                  "hold_bars":0,"breakout_mode":False,"breakout_armed_bars":0})
                     continue
 
-                # 2) 부분 익절 + 본전 이동
+                # 2) 부분익절 + 본전 이동
                 cur_px = df.iloc[-1]["close"]
                 if not state["ptp_done"] and partial_tp_needed(
                         state["side"], state["entry_price"], cur_px, state["risk_R"]):
-                    tg(f"*[[PARTIAL-TP]]* {sym} {state['side'].upper()} @ {fmt_price(sym, cur_px)}\n"
+                    tg(f"*[[PARTIAL-TP {int(PARTIAL_SIZE*100)}%]]* {sym} {state['side'].upper()} @ {fmt_price(sym, cur_px)}\n"
                        f"{now_kst()}\nPnL: {pnl_pct(state['side'], state['entry_price'], cur_px)*100:.2f}%"
                        + (f" | R_used: {state['risk_R']:.4f}" if state["risk_R"] else " | no-R"))
                     print("PARTIAL-TP:", sym, cur_px)
@@ -466,8 +522,34 @@ def main():
                         state["be_active"] = True
                     state["ptp_done"] = True
 
-                # 3) 최종 익절
-                ex = exit_signal(df, state["side"], ptp_done=state["ptp_done"])
+                # 3) 트레일링 스탑 (PTP 이후 추세 수익 극대화)
+                trail_hit = state["ptp_done"] and trail_stop_hit(df, state["side"], state["entry_price"])
+                # 4) RR 기반 최종 TP
+                rr_hit = final_tp_hit_by_R(state["side"], state["entry_price"], cur_px, state["risk_R"])
+
+                if trail_hit or rr_hit:
+                    reason = "trail stop" if trail_hit else f"{FINAL_TP_R:.1f}R target"
+                    px = df.iloc[-1]["close"]
+                    tg(f"*[[EXIT-TP]]* {sym} {state['side'].upper()} @ {fmt_price(sym, px)}\n"
+                       f"{now_kst()}\nreason: {reason}")
+                    start_utc = state["entry_time_utc"] - timedelta(minutes=10)
+                    end_utc   = df.iloc[-1]["close_time"].to_pydatetime() + timedelta(minutes=1)
+                    cut = fetch_range_1m(sym, start_utc, end_utc)
+                    png = make_chart_png(cut, sym, state["entry_time_utc"],
+                                         df.iloc[-1]["close_time"].to_pydatetime(),
+                                         state["entry_price"], px)
+                    tg_photo(png, caption=f"{sym} EXIT-TP chart")
+                    print("EXIT-TP:", sym, px, reason)
+
+                    state.update({"open_symbol":None,"side":None,"entry_price":None,
+                                  "entry_time_utc":None,"ref_low":None,"ref_high":None,
+                                  "risk_R":None,"ptp_done":False,"be_active":False,
+                                  "hold_bars":0,"breakout_mode":False,"breakout_armed_bars":0})
+                    continue
+
+                # 5) (옵션) 초기 스파이크 기반 TP — 돌파형이면 일정 봉수 동안 비활성화
+                allow_early_tp = not (state["breakout_mode"] and state["breakout_armed_bars"] < HOLD_FOR_BREAKOUT_BARS)
+                ex = exit_signal_spike(df, state["side"], ptp_done=state["ptp_done"], allow_early_tp=allow_early_tp)
                 if ex:
                     px = df.iloc[-1]["close"]
                     tg(f"*[[EXIT-TP]]* {sym} {state['side'].upper()} @ {fmt_price(sym, px)}\n"
@@ -483,7 +565,8 @@ def main():
 
                     state.update({"open_symbol":None,"side":None,"entry_price":None,
                                   "entry_time_utc":None,"ref_low":None,"ref_high":None,
-                                  "risk_R":None,"ptp_done":False,"be_active":False})
+                                  "risk_R":None,"ptp_done":False,"be_active":False,
+                                  "hold_bars":0,"breakout_mode":False,"breakout_armed_bars":0})
 
         except Exception as e:
             print("loop error:", e)
