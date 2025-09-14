@@ -40,6 +40,7 @@ jobs:
             cd ~/fut-bot
             docker stop fut-bot
             docker rm fut-bot
+            docker system prune -a -f
             docker build -t fut-bot .
             docker run --name fut-bot\
               -e OKX_API_KEY=${{ secrets.OKX_API_KEY }} \
