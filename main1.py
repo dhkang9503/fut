@@ -175,8 +175,8 @@ def hourly_filter(sym: str, side: str) -> bool:
     df = buf_1h[sym]
     if len(df) < CCI_N+2: return False
     last = df.iloc[-1]
-    if side == "long" and last["cci"] > 0: return True
-    if side == "short" and last["cci"] < 0: return True
+    if side == "long" and last["cci"] > -100: return True
+    if side == "short" and last["cci"] < 100: return True
     return False
 
 # ========= PnL / Partial TP =========
