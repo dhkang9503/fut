@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Multi-Timeframe BB+CCI Futures Scanner (Binance WebSocket)
+Multi-Timeframe BB+CCI Futures Scanner (Binance WebSocket) — Readable Telegram Logs
 - Entry timeframe: 5m (BB+CCI)
 - Trend filter:    1h (CCI direction)
 - Symbols:         BTCUSDT, ETHUSDT, SOLUSDT
@@ -10,8 +10,9 @@ Multi-Timeframe BB+CCI Futures Scanner (Binance WebSocket)
   * Condition-based TP/SL (BB mid / bands + CCI)
   * Pre-event risk-off: CPI/PPI auto (monthly), FOMC manual — auto EXIT 5m before
   * Telegram commands: /ping /status /help
-  * Chart snapshots on CONFIRM/EXIT
+  * Chart snapshots on ENTRY/EXIT
   * Deduplicated alerts & cooldown
+  * NEW: English, readable Telegram logs with emojis
 """
 
 import os, io, json, time, threading, calendar
@@ -29,8 +30,8 @@ from websocket import WebSocketApp
 
 # ========= User Settings =========
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-ENTRY_INTERVAL = "5m"   # do not change (logic assumes 5m for entry)
-FILTER_INTERVAL = "1h"  # do not change (logic assumes 1h for filter)
+ENTRY_INTERVAL = "5m"   # 5-minute entry
+FILTER_INTERVAL = "1h"  # 1-hour filter
 STREAMS = [f"{s.lower()}@kline_{ENTRY_INTERVAL}" for s in SYMBOLS] + \
           [f"{s.lower()}@kline_{FILTER_INTERVAL}" for s in SYMBOLS]
 WS_URL  = "wss://fstream.binance.com/stream?streams=" + "/".join(STREAMS)
@@ -101,7 +102,7 @@ def tg_photo(png_bytes, caption=""):
 
 def tg_dedup_send(text: str, key: str, ttl_s: int = 120):
     now = time.time()
-    # purge
+    # purge old
     for k, ts in list(recent_msgs):
         if now - ts > ttl_s:
             try: recent_msgs.remove((k, ts))
@@ -143,12 +144,12 @@ def entry_signal_live(d: pd.DataFrame):
     long_cross = cross_up(prev["cci"], last["cci"], CCI_DN)
     long_band  = (prev["close"] <= prev["bb_dn"]) and (last["close"] > last["bb_dn"])
     if long_setup and long_cross and long_band:
-        return {"side":"long", "reason":"BB lower reclaim + CCI↑-100"}
+        return {"side":"long", "reason":"BB lower reclaim + CCI cross up (-100)"}
     short_setup = recent_touch(d["close"].iloc[:-1], d["bb_up"].iloc[:-1], TOUCH_LOOKBACK, "above")
     short_cross = cross_down(prev["cci"], last["cci"], CCI_UP)
     short_band  = (prev["close"] >= prev["bb_up"]) and (last["close"] < last["bb_up"])
     if short_setup and short_cross and short_band:
-        return {"side":"short", "reason":"BB upper reject + CCI↓+100"}
+        return {"side":"short", "reason":"BB upper reject + CCI cross down (+100)"}
     return None
 
 def confirm_signal_close(d: pd.DataFrame):
@@ -159,14 +160,14 @@ def exit_signal_bb_cci(d: pd.DataFrame, side: str):
     last, prev = d.iloc[-1], d.iloc[-2]
     if side == "long":
         if (last["close"] >= last["bb_mid"] and last["cci"] > 0):
-            return {"type":"tp", "reason":"BB mid reached & CCI>0"}
+            return {"type":"tp", "reason":"BB mid reached + CCI > 0"}
         if (last["close"] < last["bb_dn"]) or cross_down(prev["cci"], last["cci"], CCI_DN):
-            return {"type":"sl", "reason":"BB lower loss or CCI<-100"}
+            return {"type":"sl", "reason":"BB lower break OR CCI < -100"}
     else:
         if (last["close"] <= last["bb_mid"] and last["cci"] < 0):
-            return {"type":"tp", "reason":"BB mid reached & CCI<0"}
+            return {"type":"tp", "reason":"BB mid reached + CCI < 0"}
         if (last["close"] > last["bb_up"]) or cross_up(prev["cci"], last["cci"], CCI_UP):
-            return {"type":"sl", "reason":"BB upper break or CCI>+100"}
+            return {"type":"sl", "reason":"BB upper break OR CCI > +100"}
     return None
 
 # ========= Filters =========
@@ -188,7 +189,13 @@ def check_partial_tp(sym: str, df: pd.DataFrame, pos: dict) -> bool:
     cur_px = last["close"]
     p = pnl_pct(pos["side"], pos["entry"], cur_px)
     if not pos["ptp_done"] and p >= PARTIAL_TP_PCT:
-        tg(f"[[PARTIAL-TP {int(PARTIAL_SIZE*100)}%]] {sym} {pos['side'].upper()} @ {cur_px:.2f}\nPnL: {p*100:.2f}%")
+        msg = (
+            f"🎯 [PARTIAL TP {int(PARTIAL_SIZE*100)}%] {sym} {pos['side'].upper()}\n"
+            f"• Price: {cur_px:.2f}\n"
+            f"• PnL: {p*100:.2f}%\n"
+            f"• Status: Remaining {int((1-PARTIAL_SIZE)*100)}% → BE active ({pos['entry']:.2f})"
+        )
+        tg(msg)
         pos["ptp_done"] = True
         if MOVE_SL_TO_BE:
             pos["be_active"] = True
@@ -200,7 +207,7 @@ def stop_out(sym: str, df: pd.DataFrame, pos: dict):
     px = last["close"]
     if pos.get("be_active"):
         if (pos["side"]=="long" and px <= pos["entry"]) or (pos["side"]=="short" and px >= pos["entry"]):
-            return {"type":"sl", "reason":"breakeven stop"}
+            return {"type":"sl_be", "reason":"BE stop triggered"}
     return exit_signal_bb_cci(df, pos["side"])
 
 # ========= Chart =========
@@ -282,12 +289,13 @@ def check_event_riskoff():
                 df = buf_5m[sym]
                 if len(df) == 0: continue
                 last = df.iloc[-1]
-                tg_key = f"EXIT|FORCE|{sym}|{round(last['close'],2)}|{ev_name}"
-                tg_dedup_send(
-                    f"[EXIT-FORCE] {sym} {pos['side'].upper()} @ {last['close']:.2f}\n"
-                    f"{now_kst()}\nreason: Pre-{ev_name} event risk-off",
-                    key=tg_key, ttl_s=300
+                msg = (
+                    f"⚠️ [FORCED EXIT] {sym} {pos['side'].upper()}\n"
+                    f"• Price: {last['close']:.2f}\n"
+                    f"• Reason: Pre-{ev_name} risk-off (5m before)\n"
+                    f"• Action: Position closed"
                 )
+                tg_dedup_send(msg, key=f"EXIT|FORCE|{sym}|{round(last['close'],2)}|{ev_name}", ttl_s=300)
                 positions[sym] = None
 
 # ========= Status helpers =========
@@ -427,18 +435,37 @@ def on_message(ws, message):
                     ex = stop_out(sym, df, pos)
                     if ex:
                         last_exit_at[sym] = time.time()
-                        msg_key = f"EXIT|{ex['type']}|{sym}|{round(c,2)}"
-                        tg_dedup_send(
-                            f"[EXIT-{ex['type'].upper()}] {sym} {pos['side'].upper()} @ {c:.2f}\n"
-                            f"{now_kst()}\nreason: {ex['reason']}",
-                            key=msg_key, ttl_s=120
-                        )
+                        if ex['type'] == 'sl_be':
+                            msg = (
+                                f"🟰 [BREAKEVEN EXIT] {sym} {pos['side'].upper()}\n"
+                                f"• Price: {c:.2f}\n"
+                                f"• Reason: {ex['reason']}\n"
+                                f"• Action: Position closed at entry"
+                            )
+                            key = f"EXIT|BE|{sym}|{round(c,2)}"
+                        elif ex['type'] == 'tp':
+                            msg = (
+                                f"💰 [FINAL TP] {sym} {pos['side'].upper()}\n"
+                                f"• Price: {c:.2f}\n"
+                                f"• Reason: {ex['reason']}\n"
+                                f"• Action: Position closed ✅"
+                            )
+                            key = f"EXIT|TP|{sym}|{round(c,2)}"
+                        else:  # normal stop
+                            msg = (
+                                f"❌ [STOP LOSS] {sym} {pos['side'].upper()}\n"
+                                f"• Price: {c:.2f}\n"
+                                f"• Reason: {ex['reason']}\n"
+                                f"• Result: Loss realized"
+                            )
+                            key = f"EXIT|SL|{sym}|{round(c,2)}"
+                        tg_dedup_send(msg, key=key, ttl_s=180)
                         if SEND_CHARTS_ON_EXIT:
                             png = make_chart_png(df.tail(220), sym,
                                                  entry_time_utc=pos['entry_time'],
                                                  exit_time_utc=row["close_time"].to_pydatetime(),
                                                  entry_px=pos['entry'], exit_px=c)
-                            tg_photo(png, caption=f"{sym} {ex['type'].upper()} chart")
+                            tg_photo(png, caption=f"{sym} EXIT chart")
                         positions[sym] = None
                     else:
                         check_partial_tp(sym, df, pos)
@@ -455,21 +482,24 @@ def on_message(ws, message):
                         "be_active": False,
                     }
                     key = f"CONFIRM|{sym}|{sig['side']}|{round(c,2)}|{int(ct_ms)}"
-                    tg_dedup_send(
-                        f"[CONFIRM] {sym} {sig['side'].upper()} @ {c:.2f}\n"
-                        f"{now_kst()}\nreason: {sig['reason']} (1h filter OK)",
-                        key=key, ttl_s=300
+                    msg = (
+                        f"🚀 [ENTRY CONFIRMED] {sym} {sig['side'].upper()}\n"
+                        f"• Price: {c:.2f}\n"
+                        f"• Time: {datetime.now(timezone.utc).astimezone(KST).strftime('%Y-%m-%d %H:%M KST')}\n"
+                        f"• Reason: {sig['reason']} | 1h trend OK"
                     )
+                    tg_dedup_send(msg, key=key, ttl_s=300)
                     if SEND_CHARTS_ON_CONFIRM:
                         png = make_chart_png(df.tail(220), sym,
                                              entry_time_utc=row["close_time"].to_pydatetime(),
                                              exit_time_utc=None,
                                              entry_px=c, exit_px=None)
-                        tg_photo(png, caption=f"{sym} CONFIRM chart")
+                        tg_photo(png, caption=f"{sym} ENTRY chart")
                 elif sig:
                     tg_dedup_send(
-                        f"[IGNORE] {sym} {sig['side'].upper()} @ {c:.2f}\n"
-                        f"{now_kst()}\nreason: {sig['reason']} (1h filter FAIL)",
+                        f"⏱ [IGNORED] {sym} {sig['side'].upper()}\n"
+                        f"• Price: {c:.2f}\n"
+                        f"• Reason: {sig['reason']} | 1h filter FAIL",
                         key=f"IGNORE|{sym}|{sig['side']}|{round(c,2)}|{int(ct_ms)}",
                         ttl_s=120
                     )
