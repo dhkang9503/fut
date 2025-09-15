@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-5m-Only BB+CCI Futures Scanner (Binance WebSocket) — Readable Telegram Logs
-- Entry & management timeframe: 5m (no 1h filter)
+1h-Only BB+CCI Futures Scanner (Binance WebSocket) — Readable Telegram Logs (Patched)
+- Fixed: duplicate EXIT logs spam
+- Entry & management timeframe: 1h (single timeframe)
 - Symbols: BTCUSDT, ETHUSDT, SOLUSDT
 - Features:
   * Multiple concurrent positions (per symbol)
@@ -29,7 +30,7 @@ from websocket import WebSocketApp
 
 # ========= User Settings =========
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-ENTRY_INTERVAL = "5m"   # 5-minute entry/management
+ENTRY_INTERVAL = "1h"   # 1-hour entry/management
 STREAMS = [f"{s.lower()}@kline_{ENTRY_INTERVAL}" for s in SYMBOLS]
 WS_URL  = "wss://fstream.binance.com/stream?streams=" + "/".join(STREAMS)
 
@@ -62,8 +63,8 @@ START_TS = time.time()
 LAST_LOOP_TS = time.time()
 LAST_LOOP_AT = None
 
-# Buffers (5m only)
-buf_5m = {s: pd.DataFrame() for s in SYMBOLS}
+# Buffers (1h only)
+buf_tf = {s: pd.DataFrame() for s in SYMBOLS}
 
 # Positions: per symbol or None
 # {"side": "long/short", "entry": float, "entry_time": dt, "ptp_done": bool, "be_active": bool}
@@ -71,7 +72,7 @@ positions = {s: None for s in SYMBOLS}
 
 # Dedup / Cooldown
 recent_msgs = deque(maxlen=300)
-EXIT_COOLDOWN_S = 30
+EXIT_COOLDOWN_S = 90   # increased cooldown to reduce spam
 last_exit_at = {s: 0.0 for s in SYMBOLS}
 
 # ========= Telegram helpers =========
@@ -134,8 +135,8 @@ def recent_touch(series_close, series_band, lookback, mode):
     if len(sub_c) == 0 or len(sub_b) == 0: return False
     return bool((sub_c <= sub_b).any() if mode=="below" else (sub_c >= sub_b).any())
 
-def entry_signal_live(d: pd.DataFrame):
-    """5m close signal only"""
+def entry_signal_close(d: pd.DataFrame):
+    """1h close signal only"""
     if len(d) < max(BB_N, CCI_N)+2: return None
     last, prev = d.iloc[-1], d.iloc[-2]
 
@@ -153,9 +154,6 @@ def entry_signal_live(d: pd.DataFrame):
     if short_setup and short_cross and short_band:
         return {"side":"short", "reason":"BB upper reject + CCI cross down (+100)"}
     return None
-
-def confirm_signal_close(d: pd.DataFrame):
-    return entry_signal_live(d)
 
 def exit_signal_bb_cci(d: pd.DataFrame, side: str):
     if len(d) < max(BB_N, CCI_N)+2: return None
@@ -262,9 +260,7 @@ def generate_monthly_events(year=None, month=None):
     return evs
 
 # FOMC schedule: add manually as needed (UTC)
-FOMC_EVENTS = [
-    # ("FOMC", datetime(2025, 9, 19, 18, 0, tzinfo=timezone.utc)),
-]
+FOMC_EVENTS = []
 
 def check_event_riskoff():
     """If within EVENT_EXIT_BEFORE_MIN of CPI/PPI/FOMC, force exit all open positions."""
@@ -279,7 +275,7 @@ def check_event_riskoff():
             for sym in list(positions.keys()):
                 pos = positions[sym]
                 if not pos: continue
-                df = buf_5m[sym]
+                df = buf_tf[sym]
                 if len(df) == 0: continue
                 last = df.iloc[-1]
                 msg = (
@@ -288,7 +284,7 @@ def check_event_riskoff():
                     f"• Reason: Pre-{ev_name} risk-off (5m before)\n"
                     f"• Action: Position closed"
                 )
-                tg_dedup_send(msg, key=f"EXIT|FORCE|{sym}|{round(last['close'],2)}|{ev_name}", ttl_s=300)
+                tg_dedup_send(msg, key=f"EXIT|FORCE|{sym}|{ev_name}", ttl_s=300)
                 positions[sym] = None
 
 # ========= Status helpers =========
@@ -315,13 +311,13 @@ def build_status_text():
         mm, ss = divmod(int(age), 60)
         last_str = f"{mm}m {ss}s ago"
     uptime = format_uptime(now - START_TS)
-    health = "OK ✅" if age < 120 else "STALE ⚠️"
+    health = "OK ✅" if age < 1800 else "STALE ⚠️"  # 30m threshold for 1h tf
     pos_lines = []
     for s, p in positions.items():
         if not p:
             pos_lines.append(f"{s}: none")
             continue
-        df = buf_5m[s]
+        df = buf_tf[s]
         cur = df.iloc[-1]["close"] if len(df) else p["entry"]
         pnl = pnl_pct(p["side"], p["entry"], cur)*100
         be = " BE" if p.get("be_active") else ""
@@ -385,9 +381,47 @@ def tg_listen_loop():
             print("tg_listen_loop error:", e)
             time.sleep(3)
 
-def start_tg_listener_thread():
-    t = threading.Thread(target=tg_listen_loop, daemon=True)
-    t.start()
+# ========= EXIT processing helper =========
+def process_exit(sym: str, df: pd.DataFrame, pos: dict, ex: dict, cur_px: float, row_ct):
+    global positions, last_exit_at
+    etype = ex['type']
+    reason = ex['reason']
+    now_key = f"EXIT|{sym}|{pos['side']}|{etype}"
+
+    if time.time() - last_exit_at.get(sym, 0.0) < EXIT_COOLDOWN_S:
+        return
+
+    if etype == 'sl_be':
+        msg = (
+            f"🟰 [BREAKEVEN EXIT] {sym} {pos['side'].upper()}\n"
+            f"• Price: {cur_px:.2f}\n"
+            f"• Reason: {reason}\n"
+            f"• Action: Position closed at entry"
+        )
+    elif etype == 'tp':
+        msg = (
+            f"💰 [FINAL TP] {sym} {pos['side'].upper()}\n"
+            f"• Price: {cur_px:.2f}\n"
+            f"• Reason: {reason}\n"
+            f"• Action: Position closed ✅"
+        )
+    else:
+        msg = (
+            f"❌ [STOP LOSS] {sym} {pos['side'].upper()}\n"
+            f"• Price: {cur_px:.2f}\n"
+            f"• Reason: {reason}\n"
+            f"• Result: Loss realized"
+        )
+
+    tg_dedup_send(msg, key=now_key, ttl_s=300)
+    if SEND_CHARTS_ON_EXIT:
+        png = make_chart_png(df.tail(220), sym,
+                             entry_time_utc=pos['entry_time'],
+                             exit_time_utc=row_ct.to_pydatetime(),
+                             entry_px=pos['entry'], exit_px=cur_px)
+        tg_photo(png, caption=f"{sym} EXIT chart")
+    positions[sym] = None
+    last_exit_at[sym] = time.time()
 
 # ========= WebSocket handlers =========
 def on_message(ws, message):
@@ -404,7 +438,7 @@ def on_message(ws, message):
 
         ct_ms = k["T"]
         o,h,l,c,v = map(float, (k["o"],k["h"],k["l"],k["c"],k["v"]))
-        is_final = bool(k["x"])
+        is_final = bool(k["x"])  # 1h close
 
         LAST_LOOP_TS = time.time()
         LAST_LOOP_AT = now_kst()
@@ -413,61 +447,31 @@ def on_message(ws, message):
                "close_time": pd.to_datetime(ct_ms, unit="ms", utc=True)}
 
         # Update buffer
-        df = buf_5m[sym]
+        df = buf_tf[sym]
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
         df = compute_bb_cci(df).tail(MAX_KEEP)
-        buf_5m[sym] = df
+        buf_tf[sym] = df
 
         # Pre-event risk-off check (on any tick)
         check_event_riskoff()
 
+        # Only evaluate entries & exits on candle close (reduce noise on 1h)
+        if not is_final:
+            return
+
         # EXIT (if position exists)
         pos = positions.get(sym)
         if pos:
-            # cooldown against spam
-            if time.time() - last_exit_at.get(sym, 0.0) >= EXIT_COOLDOWN_S:
-                ex = stop_out(sym, df, pos)
-                if ex:
-                    last_exit_at[sym] = time.time()
-                    if ex['type'] == 'sl_be':
-                        msg = (
-                            f"🟰 [BREAKEVEN EXIT] {sym} {pos['side'].upper()}\n"
-                            f"• Price: {c:.2f}\n"
-                            f"• Reason: {ex['reason']}\n"
-                            f"• Action: Position closed at entry"
-                        )
-                        key = f"EXIT|BE|{sym}|{round(c,2)}"
-                    elif ex['type'] == 'tp':
-                        msg = (
-                            f"💰 [FINAL TP] {sym} {pos['side'].upper()}\n"
-                            f"• Price: {c:.2f}\n"
-                            f"• Reason: {ex['reason']}\n"
-                            f"• Action: Position closed ✅"
-                        )
-                        key = f"EXIT|TP|{sym}|{round(c,2)}"
-                    else:  # normal stop
-                        msg = (
-                            f"❌ [STOP LOSS] {sym} {pos['side'].upper()}\n"
-                            f"• Price: {c:.2f}\n"
-                            f"• Reason: {ex['reason']}\n"
-                            f"• Result: Loss realized"
-                        )
-                        key = f"EXIT|SL|{sym}|{round(c,2)}"
-                    tg_dedup_send(msg, key=key, ttl_s=180)
-                    if SEND_CHARTS_ON_EXIT:
-                        png = make_chart_png(df.tail(220), sym,
-                                             entry_time_utc=pos['entry_time'],
-                                             exit_time_utc=row["close_time"].to_pydatetime(),
-                                             entry_px=pos['entry'], exit_px=c)
-                    
-                        tg_photo(png, caption=f"{sym} EXIT chart")
-                    positions[sym] = None
-                else:
-                    check_partial_tp(sym, df, pos)
+            ex = stop_out(sym, df, pos)
+            if ex:
+                process_exit(sym, df, pos, ex, c, row["close_time"])
+            else:
+                check_partial_tp(sym, df, pos)
+            return
 
-        # ENTRY (5m close)
-        if is_final and positions[sym] is None:
-            sig = confirm_signal_close(df)
+        # ENTRY (on 1h close)
+        if positions[sym] is None:
+            sig = entry_signal_close(df)
             if sig:
                 positions[sym] = {
                     "side": sig["side"],
@@ -483,7 +487,7 @@ def on_message(ws, message):
                     f"• Time: {datetime.now(timezone.utc).astimezone(KST).strftime('%Y-%m-%d %H:%M KST')}\n"
                     f"• Reason: {sig['reason']}"
                 )
-                tg_dedup_send(msg, key=key, ttl_s=300)
+                tg_dedup_send(msg, key=key, ttl_s=600)
                 if SEND_CHARTS_ON_CONFIRM:
                     png = make_chart_png(df.tail(220), sym,
                                          entry_time_utc=row["close_time"].to_pydatetime(),
@@ -494,7 +498,7 @@ def on_message(ws, message):
     except Exception as e:
         print("on_message error:", e)
 
-def on_open(ws): tg("5m-Only BB+CCI Scanner started (partial TP+BE, multi-position).")
+def on_open(ws): tg("1h-Only BB+CCI Scanner started (partial TP+BE, multi-position).")
 
 def on_error(ws, error): print("ws error:", error)
 
@@ -510,5 +514,5 @@ if __name__ == "__main__":
     # Start Telegram command listener
     t = threading.Thread(target=tg_listen_loop, daemon=True)
     t.start()
-    tg("Launching 5m-only BB+CCI (partial TP+BE, multi-position, events risk-off)…")
+    tg("Launching 1h-only BB+CCI (partial TP+BE, multi-position, events risk-off)…")
     run_ws()
