@@ -1,6 +1,5 @@
-requests
+ccxt
 pandas
 numpy
-matplotlib
-websocket-client
-python-dateutil
+python-dotenv
+requests
