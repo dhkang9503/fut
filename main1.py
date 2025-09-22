@@ -570,10 +570,10 @@ def main():
                 STATE['cooldown_until']= time.time()+3600*24
                 time.sleep(60); continue
 
-            blocked, label = in_news_block()
-            if blocked and STATE['open'] is None:
-                tg_send(f"[NEWS BLOCK] {label}, skip new entries")
-                time.sleep(60); continue
+            #blocked, label = in_news_block()
+            #if blocked and STATE['open'] is None:
+                #tg_send(f"[NEWS BLOCK] {label}, skip new entries")
+                #time.sleep(60); continue
 
             if STATE['open']:
                 monitor_position()
