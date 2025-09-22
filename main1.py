@@ -48,8 +48,8 @@ NYT = ZoneInfo("America/New_York")
 
 # ========= TELEGRAM =========
 load_dotenv()
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+TG_TOKEN = os.getenv("OKX_TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = os.getenv("OKX_TELEGRAM_CHAT_ID", "")
 
 def tg_send(msg: str):
     if not TG_TOKEN or not TG_CHAT:
