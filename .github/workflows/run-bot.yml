@@ -40,6 +40,7 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           script: |
+            curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/deleteWebhook"
             cd ~/fut-bot
             docker stop fut-bot
             docker rm fut-bot
