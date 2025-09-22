@@ -280,7 +280,7 @@ def run_once(ex: CcxtBitgetAdapter, s: State):
 if __name__ == "__main__":
     # 어댑터 초기화
     ex = CcxtBitgetAdapter()
-    tg_send(f"{ex.fetch_equity()}")
+    log(f"{ex.fetch_equity()}")
     # 매시 정각+2분마다 1회 실행
     BUFFER_MIN = 21
     last_hour = None
