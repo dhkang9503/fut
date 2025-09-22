@@ -1,26 +1,15 @@
 #!/usr/bin/env python3
 """
-Bitget Auto-Trader (Full Automatic, Stabilized, Complete)
-- Symbol: BTC/USDT perpetual (USDT-M, isolated)
-- Leverage: fixed 50x
-- Margin usage: 10% of equity (configurable)
-- Risk gate: skip if potential loss > 1.5% equity
-- Strategy: 1m trigger + 5m filter + 15m/1h trend filter + volume spike
-- TP/SL fully automated with minimum +4% profit threshold (to cover taker fees)
-- TP1 skipped if <4% profit potential
-- TP2 adjusted to max(R multiple, 4%)
-- News blocks: CPI/PPI/FOMC auto skip (±30m)
-- Risk control: daily -5% stop, 3 consecutive losses cooldown
-- Telegram integration: optional commands and alerts
-
-Requirements:
-  pip install ccxt pandas numpy python-dotenv requests pytz
+Bitget Auto-Trader (Multi-Symbol: BTC, ETH, SOL)
+- 기본 전략은 동일 (볼밴+CCI, 다중 타임프레임, 리스크 게이트)
+- 심볼: BTC/USDT, ETH/USDT, SOL/USDT (USDT-M, isolated)
+- 우선순위: BTC > ETH > SOL
+- 포지션이 없으면 3개 심볼을 모두 스캔하고 신호가 뜬 심볼에서 진입
 """
 
 import os, time, traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-import numpy as np
 import pandas as pd
 import ccxt
 from dotenv import load_dotenv
@@ -28,15 +17,14 @@ import requests
 from zoneinfo import ZoneInfo
 
 # ========= CONFIG =========
-SYMBOL = "BTC/USDT:USDT"
+SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
 LEVERAGE = 50
-MARGIN_FRAC = 0.01
+MARGIN_FRAC = 0.10
 RISK_PCT = 0.015
 TP2_R = 1.2
-MIN_PROFIT_PCT = 0.04   # minimum 4% profit before TP allowed
+MIN_PROFIT_PCT = 0.04
 MAX_DAILY_LOSS_PCT = 0.05
 COOLDOWN_AFTER_3_LOSSES_MIN = 60
-PRICE_POLL_SEC = 3
 
 BB_PERIOD = 20
 BB_MULT = 2.0
@@ -48,8 +36,8 @@ NYT = ZoneInfo("America/New_York")
 
 # ========= TELEGRAM =========
 load_dotenv()
-TG_TOKEN = os.getenv("OKX_TELEGRAM_TOKEN", "")
-TG_CHAT = os.getenv("OKX_TELEGRAM_CHAT_ID", "")
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
 def tg_send(msg: str):
     if not TG_TOKEN or not TG_CHAT:
@@ -75,29 +63,10 @@ def cci(df: pd.DataFrame, period=CCI_PERIOD):
     mad = (tp - sma).abs().rolling(period).mean()
     return (tp - sma)/(0.015*mad)
 
-# ========= NEWS BLOCKS =========
-def build_news_blocks():
-    blocks = []
-    now = datetime.now(NYT).date()
-    today = datetime.combine(now, datetime.min.time(), tzinfo=NYT)
-    cpi_time = today.replace(hour=8, minute=30)
-    cpi_kst = cpi_time.astimezone(KST)
-    blocks.append((cpi_kst - timedelta(minutes=30), cpi_kst + timedelta(minutes=30), "CPI/PPI"))
-    fomc_time = today.replace(hour=14, minute=0)
-    fomc_kst = fomc_time.astimezone(KST)
-    blocks.append((fomc_kst - timedelta(minutes=30), fomc_kst + timedelta(minutes=30), "FOMC"))
-    return blocks
-
-def in_news_block():
-    now = datetime.now(KST)
-    for start, end, label in build_news_blocks():
-        if start <= now <= end:
-            return True, label
-    return False, None
-
 # ========= STATE =========
 @dataclass
 class Position:
+    symbol: str
     side: str
     entry: float
     sl: float
@@ -167,7 +136,7 @@ def check_signal(df1, df5, df15, df60):
     return None
 
 # ========= ORDER EXECUTION =========
-def open_position(sig, eq):
+def open_position(symbol, sig, eq):
     price = sig['price']
     side = sig['side']
     margin = eq*MARGIN_FRAC
@@ -180,37 +149,37 @@ def open_position(sig, eq):
     if side=='long' and tp2<min_tp: tp2=min_tp
     if side=='short' and tp2>min_tp: tp2=min_tp
     size = nominal/price
-    pos = Position(side, price, sl, tp2, size)
+    pos = Position(symbol, side, price, sl, tp2, size)
     STATE['open']=pos
-    tg_send(f"[OPEN] {side} {size:.4f} @ {price}, SL {sl}, TP2 {tp2}")
+    tg_send(f"[OPEN] {symbol} {side} {size:.4f} @ {price}, SL {sl}, TP2 {tp2}")
 
 # ========= POSITION MONITOR =========
 def monitor_position():
     pos: Position = STATE['open']
     if not pos: return
     try:
-        ticker = EX.fetch_ticker(SYMBOL)
+        ticker = EX.fetch_ticker(pos.symbol)
         last = ticker['last']
         if pos.side=='long':
             if last<=pos.sl:
-                tg_send(f"[STOP LOSS] long closed @ {last}")
+                tg_send(f"[STOP LOSS] {pos.symbol} long closed @ {last}")
                 STATE['open']=None; STATE['consec_losses']+=1
                 if STATE['consec_losses']>=3:
                     STATE['cooldown_until']=time.time()+COOLDOWN_AFTER_3_LOSSES_MIN*60
                 return
             if last>=pos.tp2:
-                tg_send(f"[TAKE PROFIT] long closed @ {last}")
+                tg_send(f"[TAKE PROFIT] {pos.symbol} long closed @ {last}")
                 STATE['open']=None; STATE['consec_losses']=0
                 return
         else:
             if last>=pos.sl:
-                tg_send(f"[STOP LOSS] short closed @ {last}")
+                tg_send(f"[STOP LOSS] {pos.symbol} short closed @ {last}")
                 STATE['open']=None; STATE['consec_losses']+=1
                 if STATE['consec_losses']>=3:
                     STATE['cooldown_until']=time.time()+COOLDOWN_AFTER_3_LOSSES_MIN*60
                 return
             if last<=pos.tp2:
-                tg_send(f"[TAKE PROFIT] short closed @ {last}")
+                tg_send(f"[TAKE PROFIT] {pos.symbol} short closed @ {last}")
                 STATE['open']=None; STATE['consec_losses']=0
                 return
     except Exception as e:
@@ -220,7 +189,7 @@ def monitor_position():
 def main():
     global EX
     EX = build_exchange()
-    tg_send("Bot started (Full Auto Complete)")
+    tg_send("Bot started (Multi-Symbol Auto)")
     while True:
         try:
             today = datetime.now(KST).date()
@@ -234,18 +203,16 @@ def main():
                 tg_send("[DAILY STOP] exceeded -5%")
                 STATE['cooldown_until']=time.time()+3600*24
                 time.sleep(60); continue
-            blocked, label=in_news_block()
-            if blocked:
-                tg_send(f"[NEWS BLOCK] {label}, skip")
-                time.sleep(60); continue
             if not STATE['open']:
-                df1=fetch_ohlcv(SYMBOL,"1m",limit=BB_PERIOD+50)
-                df5=fetch_ohlcv(SYMBOL,"5m",limit=BB_PERIOD+50)
-                df15=fetch_ohlcv(SYMBOL,"15m",limit=BB_PERIOD+50)
-                df60=fetch_ohlcv(SYMBOL,"1h",limit=BB_PERIOD+50)
-                sig=check_signal(df1,df5,df15,df60)
-                if sig:
-                    open_position(sig, eq_now)
+                for sym in SYMBOLS:
+                    df1=fetch_ohlcv(sym,"1m",limit=BB_PERIOD+50)
+                    df5=fetch_ohlcv(sym,"5m",limit=BB_PERIOD+50)
+                    df15=fetch_ohlcv(sym,"15m",limit=BB_PERIOD+50)
+                    df60=fetch_ohlcv(sym,"1h",limit=BB_PERIOD+50)
+                    sig=check_signal(df1,df5,df15,df60)
+                    if sig:
+                        open_position(sym, sig, eq_now)
+                        break
             else:
                 monitor_position()
         except Exception as e:
