@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-Bitget Auto-Trader (Multi-Symbol Live Orders)
+Bitget Auto-Trader (Multi-Symbol Live Orders + Telegram Commands)
 - Symbols: BTC/USDT, ETH/USDT @ 50x; SOL/USDT @ 30x  (USDT-M, Isolated)
-- Opens/closes REAL positions via ccxt.create_order()
+- REAL orders via ccxt.create_order()
 - Strategy: 1m trigger + 5m filter + 15m/1h trend filter + volume spike
 - Min TP: +4% (covers taker ~0.08% * 50)
 - Risk gate: skip if potential loss > 1.5% equity
-- Protections: daily -5% stop, 3 consecutive losses cooldown, (optional) news block
-- Telegram alerts
+- Protections: daily -5% stop, 3 consecutive losses cooldown, optional news block
+- Telegram alerts + **Telegram commands**:
+  • `/ping` → 서버 헬스체크
+  • `/set margin 0.01` → 시드 진입 비중(MARGIN_FRAC) 실시간 변경
+  • `/position` → 현재 포지션 상세
+  • `/status` → Equity/쿨다운/일손익/설정 요약
 
 Requirements:
   pip install ccxt pandas numpy python-dotenv requests pytz
 """
 
-import os, time, traceback
+import os, time, traceback, threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import pandas as pd
@@ -25,14 +29,13 @@ from zoneinfo import ZoneInfo
 # ========= CONFIG =========
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
 LEVERAGE_MAP = {"BTC": 50, "ETH": 50, "SOL": 30}
-MARGIN_FRAC = 0.01
+MARGIN_FRAC = 0.10   # <-- 텔레그램 /set margin 으로 실시간 변경 가능
 RISK_PCT = 0.015
 TP2_R = 1.2
 MIN_PROFIT_PCT = 0.04
 MAX_DAILY_LOSS_PCT = 0.05
 COOLDOWN_AFTER_3_LOSSES_MIN = 60
 LOOP_SLEEP_SEC = 5
-PRICE_POLL_SEC = 3
 
 BB_PERIOD = 20
 BB_MULT = 2.0
@@ -46,24 +49,45 @@ NYT = ZoneInfo("America/New_York")
 load_dotenv()
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
+_last_update_id = None
+
 
 def tg_send(msg: str):
     if not TG_TOKEN or not TG_CHAT:
         print("[TG]", msg)
         return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": msg}
-        )
+        requests.post(f"{TG_API}/sendMessage", json={"chat_id": TG_CHAT, "text": msg})
     except Exception as e:
         print("[TG ERROR]", e)
+
+
+def tg_get_updates(timeout=10):
+    global _last_update_id
+    if not TG_TOKEN:
+        return []
+    params = {"timeout": timeout}
+    if _last_update_id is not None:
+        params["offset"] = _last_update_id + 1
+    try:
+        r = requests.get(f"{TG_API}/getUpdates", params=params, timeout=timeout+5)
+        data = r.json()
+        if not data.get("ok"):
+            return []
+        updates = data.get("result", [])
+        if updates:
+            _last_update_id = updates[-1]["update_id"]
+        return updates
+    except Exception:
+        return []
 
 # ========= INDICATORS =========
 def bollinger(close: pd.Series, period=BB_PERIOD, mult=BB_MULT):
     mid = close.rolling(period).mean()
     std = close.rolling(period).std(ddof=0)
     return mid, mid + mult*std, mid - mult*std
+
 
 def cci(df: pd.DataFrame, period=CCI_PERIOD):
     tp = (df['high'] + df['low'] + df['close'])/3
@@ -82,6 +106,7 @@ def build_news_blocks():
     blocks.append((fomc - timedelta(minutes=30), fomc + timedelta(minutes=30), "FOMC"))
     return blocks
 
+
 def in_news_block():
     now = datetime.now(KST)
     for s,e,label in build_news_blocks():
@@ -98,6 +123,7 @@ class Position:
     sl: float
     tp2: float
     size: float
+
 
 STATE = {
     'open': None,  # Position | None
@@ -121,14 +147,18 @@ def build_exchange():
         'options': {'defaultType': 'swap'},
     })
 
+
 EX = None
+
 
 def _base(sym: str) -> str:
     return sym.split('/')[0]
 
+
 def get_leverage(sym: str) -> int:
     base = _base(sym)
     return LEVERAGE_MAP.get(base, 50)
+
 
 def ensure_isolated_and_leverage(symbol: str):
     lev = get_leverage(symbol)
@@ -148,6 +178,7 @@ def fetch_ohlcv(symbol, timeframe, limit=200):
     df['dt'] = pd.to_datetime(df['ts'], unit='ms', utc=True).dt.tz_convert(KST)
     df.set_index('dt', inplace=True)
     return df
+
 
 def fetch_equity_usdt():
     bal = EX.fetch_balance({'type': 'swap'})
@@ -177,13 +208,14 @@ def check_signal(df1, df5, df15, df60):
 
 # ========= ORDERS =========
 def open_position(symbol: str, sig: dict, equity_usdt: float):
+    global MARGIN_FRAC
     ensure_isolated_and_leverage(symbol)
     price = sig['price']; side = sig['side']
     lev = get_leverage(symbol)
     margin = equity_usdt * MARGIN_FRAC
     nominal = margin * lev
 
-    # SL distance (example 0.3%) — you can switch to swing/BB-based
+    # SL distance (example 0.3%)
     sl_dist = price * 0.003
     sl = (price - sl_dist) if side=='long' else (price + sl_dist)
 
@@ -209,15 +241,15 @@ def open_position(symbol: str, sig: dict, equity_usdt: float):
     # --- PLACE MARKET ORDER ---
     side_type = 'buy' if side=='long' else 'sell'
     try:
-        order = EX.create_order(symbol=symbol, type='market', side=side_type, amount=size,
-                                params={'marginMode': 'isolated', 'reduceOnly': False})
+        EX.create_order(symbol=symbol, type='market', side=side_type, amount=size,
+                        params={'marginMode': 'isolated', 'reduceOnly': False})
     except Exception as e:
         tg_send(f"[OPEN ERROR] {symbol} {side} size={size:.6f}: {e}")
         return None
 
     pos = Position(symbol, side, price, sl, tp2, size)
     STATE['open'] = pos
-    tg_send(f"[OPEN] {symbol} {side.upper()} @ {price:.2f} size={size:.6f} | SL {sl:.2f} | TP {tp2:.2f} | lev {lev}x")
+    tg_send(f"[OPEN] {symbol} {side.upper()} @ {price:.2f} size={size:.6f} | SL {sl:.2f} | TP {tp2:.2f} | lev {lev}x | margin_frac {MARGIN_FRAC}")
     return pos
 
 
@@ -231,6 +263,7 @@ def close_position_market(pos: Position, tag: str):
         tg_send(f"[CLOSE ERROR] {pos.symbol}: {e}")
 
 # ========= POSITION MONITOR =========
+
 def monitor_position():
     pos: Position = STATE['open']
     if not pos:
@@ -263,6 +296,86 @@ def monitor_position():
     except Exception as e:
         tg_send(f"[MONITOR ERROR] {e}")
 
+# ========= TELEGRAM COMMANDS =========
+
+def _fmt_pos() -> str:
+    pos: Position = STATE['open']
+    if not pos:
+        return "No open position"
+    try:
+        last = float(EX.fetch_ticker(pos.symbol)['last'])
+    except Exception:
+        last = None
+    lines = [
+        f"symbol: {pos.symbol}",
+        f"side: {pos.side}",
+        f"entry: {pos.entry}",
+        f"sl: {pos.sl}",
+        f"tp: {pos.tp2}",
+        f"size: {pos.size}",
+    ]
+    if last is not None:
+        pnl = (last - pos.entry) / pos.entry * (1 if pos.side=='long' else -1)
+        lines.append(f"last: {last} (pnl: {pnl*100:.2f}%)")
+    return "\n".join(lines)
+
+
+def process_command(cmd_text: str):
+    global MARGIN_FRAC
+    t = cmd_text.strip()
+    if t.startswith('/ping'):
+        tg_send('pong ✅')
+        return
+    if t.startswith('/status'):
+        try:
+            eq = fetch_equity_usdt()
+        except Exception:
+            eq = None
+        msg = ["[STATUS]",
+               f"equity={eq}",
+               f"cooldown_until={STATE['cooldown_until']}",
+               f"consec_losses={STATE['consec_losses']}",
+               f"margin_frac={MARGIN_FRAC}"]
+        tg_send("\n".join(msg))
+        return
+    if t.startswith('/position') or t.startswith('/pos'):
+        tg_send(_fmt_pos())
+        return
+    if t.startswith('/set'):
+        parts = t.split()
+        if len(parts)>=3 and parts[1].lower()=='margin':
+            try:
+                val = float(parts[2])
+                if 0.001 <= val <= 0.25:
+                    MARGIN_FRAC = val
+                    tg_send(f"[SET] margin_frac={MARGIN_FRAC}")
+                else:
+                    tg_send("[SET ERROR] margin must be 0.001~0.25")
+            except Exception:
+                tg_send("[SET ERROR] usage: /set margin 0.01")
+        else:
+            tg_send("[SET] unknown or missing parameter. try: /set margin 0.01")
+        return
+
+
+def command_poller():
+    while True:
+        try:
+            ups = tg_get_updates(timeout=10)
+            for u in ups:
+                msg = u.get('message') or {}
+                chat_id = str(msg.get('chat',{}).get('id',''))
+                text = msg.get('text','')
+                if not text:
+                    continue
+                # 보안: 지정된 TG_CHAT에서만 명령 처리
+                if TG_CHAT and chat_id != str(TG_CHAT):
+                    continue
+                process_command(text)
+        except Exception:
+            pass
+        time.sleep(1)
+
 # ========= MAIN LOOP =========
 
 def fetch_ohlcv_bundle(sym: str):
@@ -276,7 +389,11 @@ def fetch_ohlcv_bundle(sym: str):
 def main():
     global EX
     EX = build_exchange()
-    tg_send("Bot started (Multi-Symbol LIVE)")
+    tg_send("Bot started (Multi-Symbol LIVE + Commands)")
+
+    # Start Telegram command poller
+    if TG_TOKEN:
+        threading.Thread(target=command_poller, daemon=True).start()
 
     while True:
         try:
@@ -311,7 +428,7 @@ def main():
                     sig = check_signal(df1, df5, df15, df60)
                     if sig:
                         pos = open_position(sym, sig, eq_now)
-                        if pos:  # opened successfully
+                        if pos:
                             break
         except Exception as e:
             tg_send(f"[ERROR] {e}\n{traceback.format_exc()}")
