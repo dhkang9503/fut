@@ -1,598 +1,348 @@
 #!/usr/bin/env python3
 """
-Bitget Auto-Trader (LIVE + Auto Mode Switch + Risk Modes)
-- Symbols: BTC/USDT, ETH/USDT @ 50x; SOL/USDT @ 30x  (USDT-M, Isolated)
-- Strategy Modes:
-  • REVERSION (default): BB(20,2) + CCI(20) 역추세 스캘핑
-  • TREND (auto): CCI 극단 + 볼밴 확장 + 거래량 폭발 → 돌파 추종 (ATR SL/트레일)
-- **Risk Modes (Telegram /risk)**
-  • fast   : 복구 모드 (신호 완화, 진입 기회↑)
-  • normal : 기본 모드 (현재 기본값)
-  • safe   : 보존 모드 (4h 필터+엄격 조건)
-- Auto mode switch: REVERSION↔TREND 자동 전환 (+ 5분 히스테리시스)
-- REAL orders via ccxt.create_order(), reduceOnly=True on exits
-- Protections: min TP +4%, risk gate (≤1.5% equity), daily -5% stop, 3-loss cooldown, (optional) news block
-- Telegram: alerts + commands (/ping, /status, /position, /set margin x, /mode [auto|reversion|trend], **/risk [fast|normal|safe]**)
+Bitget 자동매매 봇 (BTC+SOL 전용) — 1순위 리스크 + SL-ONLY 서버사이드 + BE(수수료 포함)
 
-Requirements:
-  pip install ccxt pandas numpy python-dotenv requests pytz
+핵심 변경
+  • 진입 직후: **서버사이드 SL만** 생성(반드시 reduceOnly)
+  • TP1/TP2: 로직으로 체결 (부분청산/완전청산)
+  • TP1 체결 시: SL을 **진입가 ± (2*FEE_RATE)** 로 이동(수수료까지 BE)  
+    - 롱: new_stop = entry * (1 + 2*FEE_RATE)  
+    - 숏: new_stop = entry * (1 - 2*FEE_RATE)
+    ※ 레버리지는 BE 가격 오프셋(%)에 **영향 없음**. 수수료는 노치널 기준이므로, 오프셋 %는 대략 2*fee로 충분.
+
+환경변수
+  - BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSWORD
+  - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  - (선택) FEE_RATE  (기본 0.0008 = 0.08%/사이드)
+
+리스크(1순위)
+  1) 서버사이드 SL
+  2) 일일 하드락 -4% (수동 /resume 필요)
+  3) 실계좌 동기화(fetch_balance)
+  4) TG 킬스위치: /panic /pause /resume
 """
+import os, json, time, logging, math, requests
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from typing import Dict, Optional, List
 
-import os, time, traceback, threading
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-import pandas as pd
-import numpy as np
-import ccxt
-from dotenv import load_dotenv
-import requests
-from zoneinfo import ZoneInfo
-
-# ========= CONFIG =========
-SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
-LEVERAGE_MAP = {"BTC": 50, "ETH": 50, "SOL": 30}
-MARGIN_FRAC = 0.10
-RISK_PCT = 0.015
-TP2_R = 1.2
-MIN_PROFIT_PCT = 0.04
-MAX_DAILY_LOSS_PCT = 0.05
-COOLDOWN_AFTER_3_LOSSES_MIN = 60
-LOOP_SLEEP_SEC = 5
-PRICE_POLL_SEC = 3
-
-# Base indicators
-BB_PERIOD = 20
-BB_MULT = 2.0
-CCI_PERIOD = 20
-ATR_LEN = 14
-ATR_SL_MULT = 0.8
-ATR_TP_ANCHOR = 1.5
-ATR_TRAIL_STEP = 0.5
-
-# Auto-mode switching
-MODE_LOCK_SEC = 300  # 5m
-
-KST = ZoneInfo("Asia/Seoul")
-NYT = ZoneInfo("America/New_York")
-
-# ========= TELEGRAM =========
-load_dotenv()
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
-_last_update_id = None
-
-def tg_send(msg: str):
-    if not TG_TOKEN or not TG_CHAT:
-        print("[TG]", msg)
-        return
-    try:
-        requests.post(f"{TG_API}/sendMessage", json={"chat_id": TG_CHAT, "text": msg})
-    except Exception as e:
-        print("[TG ERROR]", e)
-
-def tg_get_updates(timeout=10):
-    global _last_update_id
-    if not TG_TOKEN:
-        return []
-    params = {"timeout": timeout}
-    if _last_update_id is not None:
-        params["offset"] = _last_update_id + 1
-    try:
-        r = requests.get(f"{TG_API}/getUpdates", params=params, timeout=timeout+5)
-        data = r.json()
-        if not data.get("ok"):
-            return []
-        updates = data.get("result", [])
-        if updates:
-            _last_update_id = updates[-1]["update_id"]
-        return updates
-    except Exception:
-        return []
-
-# ========= INDICATORS =========
-def bollinger(close: pd.Series, period=BB_PERIOD, mult=BB_MULT):
-    mid = close.rolling(period).mean()
-    std = close.rolling(period).std(ddof=0)
-    return mid, mid + mult*std, mid - mult*std
-
-def cci(df: pd.DataFrame, period=CCI_PERIOD):
-    tp = (df['high'] + df['low'] + df['close'])/3
-    sma = tp.rolling(period).mean()
-    mad = (tp - sma).abs().rolling(period).mean()
-    return (tp - sma)/(0.015*mad)
-
-def true_range(df: pd.DataFrame):
-    prev_close = df['close'].shift(1)
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - prev_close).abs()
-    tr3 = (df['low'] - prev_close).abs()
-    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-def atr(df: pd.DataFrame, n=ATR_LEN):
-    tr = true_range(df)
-    return tr.rolling(n).mean()
-
-def bb_bandwidth(df: pd.DataFrame):
-    mid, up, lo = bollinger(df['close'])
-    midv = float(mid.iloc[-1]) if not np.isnan(mid.iloc[-1]) else 0.0
-    if midv == 0.0:
-        return 0.0
-    return float((up.iloc[-1] - lo.iloc[-1]) / midv)
-
-# ========= NEWS BLOCKS (optional; quick fixed-times) =========
-def build_news_blocks():
-    blocks = []
-    now = datetime.now(NYT).date()
-    today = datetime.combine(now, datetime.min.time(), tzinfo=NYT)
-    cpi = today.replace(hour=8, minute=30).astimezone(KST)
-    fomc= today.replace(hour=14, minute=0).astimezone(KST)
-    blocks.append((cpi - timedelta(minutes=30), cpi + timedelta(minutes=30), "CPI/PPI"))
-    blocks.append((fomc - timedelta(minutes=30), fomc + timedelta(minutes=30), "FOMC"))
-    return blocks
-
-def in_news_block():
-    now = datetime.now(KST)
-    for s,e,label in build_news_blocks():
-        if s <= now <= e:
-            return True, label
-    return False, None
-
-# ========= STATE =========
-@dataclass
-class Position:
-    symbol: str
-    side: str  # long/short
-    entry: float
-    sl: float
-    tp2: float
-    size: float
-    mode: str  # REVERSION | TREND
-
-STATE = {
-    'open': None,
-    'daily_start_equity': None,
-    'daily_loss_usd': 0.0,
-    'consec_losses': 0,
-    'cooldown_until': 0.0,
-    'day': None,
-    'mode': 'REVERSION',
-    'auto_mode': True,
-    'last_mode_switch_ts': 0.0,
-    'risk_mode': 'normal',  # fast | normal | safe
-}
-
-# ========= EXCHANGE =========
-def build_exchange():
-    key = os.getenv('BITGET_API_KEY'); secret = os.getenv('BITGET_API_SECRET'); password = os.getenv('BITGET_API_PASSWORD')
-    if not (key and secret and password):
-        raise RuntimeError("Missing BITGET_API_* env vars")
-    return ccxt.bitget({
-        'apiKey': key,
-        'secret': secret,
-        'password': password,
-        'enableRateLimit': True,
-        'options': {'defaultType': 'swap'},
-    })
-
-EX = None
-
-def _base(sym: str) -> str:
-    return sym.split('/')[0]
-
-def get_leverage(sym: str) -> int:
-    base = _base(sym)
-    return LEVERAGE_MAP.get(base, 50)
-
-def ensure_isolated_and_leverage(symbol: str):
-    lev = get_leverage(symbol)
-    try:
-        EX.set_margin_mode('isolated', symbol, params={'productType': 'USDT-FUTURES'})
-    except Exception:
-        pass
-    try:
-        EX.set_leverage(lev, symbol, params={'productType': 'USDT-FUTURES'})
-    except Exception:
-        pass
-
-# ========= DATA FETCH =========
-def fetch_ohlcv(symbol, timeframe, limit=200):
-    o = EX.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(o, columns=['ts','open','high','low','close','volume'])
-    df['dt'] = pd.to_datetime(df['ts'], unit='ms', utc=True).dt.tz_convert(KST)
-    df.set_index('dt', inplace=True)
-    return df
-
-def fetch_equity_usdt():
-    bal = EX.fetch_balance({'type': 'swap'})
-    usdt = bal.get('USDT') or {}
-    return float(usdt.get('total') or usdt.get('free') or 0.0)
-
-# ========= RISK MODE PARAMS =========
-
-def get_params():
-    rm = STATE.get('risk_mode','normal')
-    # defaults (normal)
-    p = {
-        'VOL_SPIKE_MULT_REV': 1.5,
-        'VOL_SPIKE_MULT_TR' : 2.0,
-        'BB_EXPAND_BW_TR'   : 0.010,  # 1.0%
-        'BB_COOL_BW_RV'     : 0.007,  # 0.7%
-        'CCI_TREND_ON'      : 200,
-        'CCI_TREND_OFF'     : 100,
-        'USE_4H_FILTER'     : False,
-    }
-    if rm == 'fast':
-        p.update({
-            'VOL_SPIKE_MULT_REV': 1.2,
-            'VOL_SPIKE_MULT_TR' : 1.5,
-            'BB_EXPAND_BW_TR'   : 0.008,
-            'BB_COOL_BW_RV'     : 0.008,  # 조금 느슨
-            'CCI_TREND_ON'      : 180,
-            'CCI_TREND_OFF'     : 80,
-            'USE_4H_FILTER'     : False,
-        })
-    elif rm == 'safe':
-        p.update({
-            'VOL_SPIKE_MULT_REV': 1.6,
-            'VOL_SPIKE_MULT_TR' : 2.2,
-            'BB_EXPAND_BW_TR'   : 0.012,
-            'BB_COOL_BW_RV'     : 0.006,
-            'CCI_TREND_ON'      : 220,
-            'CCI_TREND_OFF'     : 100,
-            'USE_4H_FILTER'     : True,
-        })
-    return p
-
-# ========= SIGNALS =========
-
-def check_signal_reversion(df1, df5, df15, df60, df4h=None):
-    P = get_params()
-    # 4h 필터 (safe 모드에서만 활성)
-    if P['USE_4H_FILTER'] and df4h is not None:
-        c4h = float(cci(df4h).iloc[-1])
-        if abs(c4h) > 200:
-            return None  # 강추세 역추세 금지
-    mid1, up1, lo1 = bollinger(df1['close']); cci1 = cci(df1)
-    mid5, up5, lo5 = bollinger(df5['close']); cci5 = cci(df5)
-    cci15 = cci(df15); cci60 = cci(df60)
-    if len(df1)<BB_PERIOD+2 or len(df5)<BB_PERIOD+2: return None
-    # 추세 중립 필터 (1h/15m)
-    if not(-50 <= cci15.iloc[-1] <= 50 and -50 <= cci60.iloc[-1] <= 50):
-        return None
-    c1_prev, c1 = df1['close'].iloc[-2], df1['close'].iloc[-1]
-    cci1_prev, cci1_now = cci1.iloc[-2], cci1.iloc[-1]
-    c5, mid5_now, cci5_prev, cci5_now = df5['close'].iloc[-1], mid5.iloc[-1], cci5.iloc[-2], cci5.iloc[-1]
-    bull5 = (c5>=mid5_now and cci5_now>cci5_prev)
-    bear5 = (c5<=mid5_now and cci5_now<cci5_prev)
-    vol_mean = df1['volume'].iloc[-20:].mean(); vol_now = df1['volume'].iloc[-1]
-    vol_ok = vol_now >= P['VOL_SPIKE_MULT_REV']*vol_mean
-    long_cond = (c1_prev<lo1.iloc[-1] and c1>=lo1.iloc[-1]) and (cci1_prev<-P['CCI_TREND_OFF'] and cci1_now>cci1_prev)
-    short_cond= (c1_prev>up1.iloc[-1] and c1<=up1.iloc[-1]) and (cci1_prev> P['CCI_TREND_OFF'] and cci1_now<cci1_prev)
-    if bull5 and long_cond and vol_ok: return {'side':'long','price':float(c1)}
-    if bear5 and short_cond and vol_ok: return {'side':'short','price':float(c1)}
-    return None
-
-
-def check_signal_trend(df1, df5, df15, df60, df4h=None):
-    P = get_params()
-    cci5_last = float(cci(df5).iloc[-1]); cci15_last = float(cci(df15).iloc[-1])
-    bw = bb_bandwidth(df5)
-    vol_ok = df1['volume'].iloc[-1] >= P['VOL_SPIKE_MULT_TR'] * df1['volume'].iloc[-20:].mean()
-    if not ((abs(cci5_last)>=P['CCI_TREND_ON'] or abs(cci15_last)>=P['CCI_TREND_ON']) and bw>=P['BB_EXPAND_BW_TR'] and vol_ok):
-        return None
-    # 4h 방향 정합(안전 모드): 4h와 같은 방향만
-    if P['USE_4H_FILTER'] and df4h is not None:
-        c4h = float(cci(df4h).iloc[-1])
-        if (c4h>200 and cci5_last<0) or (c4h<-200 and cci5_last>0):
-            return None
-    mid5, up5, lo5 = bollinger(df5['close'])
-    above = (df5['close'].iloc[-1] >= up5.iloc[-1]) and (df5['close'].iloc[-2] >= up5.iloc[-2])
-    below = (df5['close'].iloc[-1] <= lo5.iloc[-1]) and (df5['close'].iloc[-2] <= lo5.iloc[-2])
-    if above and cci5_last >= float(cci(df5).iloc[-2]):
-        return {'side':'long','price':float(df1['close'].iloc[-1]), 'trend': True}
-    if below and cci5_last <= float(cci(df5).iloc[-2]):
-        return {'side':'short','price':float(df1['close'].iloc[-1]), 'trend': True}
-    return None
-
-# ========= MODE SWITCH =========
-
-def should_switch_to_trend(df1, df5, df15):
-    P = get_params()
-    c5 = float(cci(df5).iloc[-1]); c15 = float(cci(df15).iloc[-1])
-    bw = bb_bandwidth(df5)
-    vol_ok = df1['volume'].iloc[-1] >= P['VOL_SPIKE_MULT_TR'] * df1['volume'].iloc[-20:].mean()
-    out_2sigma = (
-        df5['high'].iloc[-1] >= bollinger(df5['close'])[1].iloc[-1] or
-        df5['low'].iloc[-1]  <= bollinger(df5['close'])[2].iloc[-1]
-    )
-    return (abs(c5)>=P['CCI_TREND_ON'] or abs(c15)>=P['CCI_TREND_ON']) and (bw>=P['BB_EXPAND_BW_TR']) and vol_ok and out_2sigma
-
-def should_switch_to_reversion(df5, df15):
-    P = get_params()
-    c5 = float(cci(df5).iloc[-1]); c15 = float(cci(df15).iloc[-1])
-    bw = bb_bandwidth(df5)
-    return (abs(c5)<=P['CCI_TREND_OFF'] and abs(c15)<=P['CCI_TREND_OFF']) and (bw < P['BB_COOL_BW_RV'])
-
-def maybe_switch_mode(df1, df5, df15):
-    if not STATE['auto_mode']:
-        return
-    now = time.time()
-    if now - STATE.get('last_mode_switch_ts', 0) < MODE_LOCK_SEC:
-        return
-    if STATE['mode']=='REVERSION' and should_switch_to_trend(df1, df5, df15):
-        STATE['mode']='TREND'; STATE['last_mode_switch_ts']=now
-        tg_send(f"[MODE] switched to TREND (risk={STATE['risk_mode']})")
-    elif STATE['mode']=='TREND' and should_switch_to_reversion(df5, df15):
-        STATE['mode']='REVERSION'; STATE['last_mode_switch_ts']=now
-        tg_send(f"[MODE] back to REVERSION (risk={STATE['risk_mode']})")
-
-# ========= ORDERS =========
-
-def open_position(symbol: str, sig: dict, equity_usdt: float):
-    global MARGIN_FRAC
-    ensure_isolated_and_leverage(symbol)
-    price = float(sig['price']); side = sig['side']
-    mode = STATE['mode']
-    lev = get_leverage(symbol)
-    margin = equity_usdt * MARGIN_FRAC
-    nominal = margin * lev
-
-    if mode=='REVERSION':
-        sl_dist = price * 0.003
-        sl = (price - sl_dist) if side=='long' else (price + sl_dist)
-        expected_loss = nominal * (abs(price - sl) / price)
-        if expected_loss > equity_usdt * RISK_PCT:
-            tg_send(f"[SKIP] Risk gate: exp loss {expected_loss:.4f} > {equity_usdt*RISK_PCT:.4f}")
-            return None
-        if side=='long':
-            tp2 = max(price + TP2_R*(price - sl), price*(1+MIN_PROFIT_PCT))
-        else:
-            tp2 = min(price - TP2_R*(sl - price), price*(1-MIN_PROFIT_PCT))
-    else:
-        df5 = fetch_ohlcv(symbol, "5m", limit=max(BB_PERIOD, ATR_LEN)+50)
-        a = float(atr(df5, ATR_LEN).iloc[-1])
-        if a == 0 or np.isnan(a):
-            return None
-        sl = (price - ATR_SL_MULT*a) if side=='long' else (price + ATR_SL_MULT*a)
-        expected_loss = nominal * (abs(price - sl) / price)
-        if expected_loss > equity_usdt * RISK_PCT:
-            tg_send(f"[SKIP] Risk gate: exp loss {expected_loss:.4f} > {equity_usdt*RISK_PCT:.4f}")
-            return None
-        tp_anchor = ATR_TP_ANCHOR * a
-        tp2 = (price + tp_anchor) if side=='long' else (price - tp_anchor)
-        min_tp = price*(1+MIN_PROFIT_PCT) if side=='long' else price*(1-MIN_PROFIT_PCT)
-        if (side=='long' and tp2 < min_tp): tp2 = min_tp
-        if (side=='short' and tp2 > min_tp): tp2 = min_tp
-
-    size = nominal / price
-    side_type = 'buy' if side=='long' else 'sell'
-    try:
-        EX.create_order(symbol=symbol, type='market', side=side_type, amount=size,
-                        params={'marginMode': 'isolated', 'reduceOnly': False})
-    except Exception as e:
-        tg_send(f"[OPEN ERROR] {symbol} {side} size={size:.6f}: {e}")
-        return None
-
-    pos = Position(symbol, side, price, sl, tp2, size, mode)
-    STATE['open'] = pos
-    tg_send(f"[OPEN] {symbol} {side.upper()} @ {price:.2f} size={size:.6f} | SL {sl:.2f} | TP {tp2:.2f} | lev {lev}x | margin_frac {MARGIN_FRAC} | mode {mode} | risk {STATE['risk_mode']}")
-    return pos
-
-
-def close_position_market(pos: Position, tag: str):
-    side_type = 'sell' if pos.side=='long' else 'buy'
-    try:
-        EX.create_order(symbol=pos.symbol, type='market', side=side_type, amount=pos.size,
-                        params={'reduceOnly': True, 'marginMode': 'isolated'})
-        tg_send(f"[{tag}] {pos.symbol} {pos.side.upper()} closed")
-    except Exception as e:
-        tg_send(f"[CLOSE ERROR] {pos.symbol}: {e}")
-
-# ========= POSITION MONITOR =========
-
-def monitor_position():
-    pos: Position = STATE['open']
-    if not pos:
-        return
-    try:
-        last = float(EX.fetch_ticker(pos.symbol)['last'])
-        if pos.mode=='REVERSION':
-            if pos.side=='long':
-                if last <= pos.sl:
-                    close_position_market(pos, 'STOP LOSS'); STATE['open']=None; STATE['consec_losses']+=1
-                    if STATE['consec_losses']>=3: STATE['cooldown_until']=time.time()+COOLDOWN_AFTER_3_LOSSES_MIN*60
-                    return
-                if last >= pos.tp2:
-                    close_position_market(pos, 'TAKE PROFIT'); STATE['open']=None; STATE['consec_losses']=0; return
-            else:
-                if last >= pos.sl:
-                    close_position_market(pos, 'STOP LOSS'); STATE['open']=None; STATE['consec_losses']+=1
-                    if STATE['consec_losses']>=3: STATE['cooldown_until']=time.time()+COOLDOWN_AFTER_3_LOSSES_MIN*60
-                    return
-                if last <= pos.tp2:
-                    close_position_market(pos, 'TAKE PROFIT'); STATE['open']=None; STATE['consec_losses']=0; return
-        else:
-            df5 = fetch_ohlcv(pos.symbol, "5m", limit=max(BB_PERIOD, ATR_LEN)+50)
-            a = float(atr(df5, ATR_LEN).iloc[-1])
-            if pos.side=='long':
-                trail = last - ATR_TRAIL_STEP*a
-                if trail > pos.sl: pos.sl = trail
-                if last <= pos.sl:
-                    close_position_market(pos, 'STOP LOSS'); STATE['open']=None; STATE['consec_losses']+=1
-                    if STATE['consec_losses']>=3: STATE['cooldown_until']=time.time()+COOLDOWN_AFTER_3_LOSSES_MIN*60
-                    return
-                if last >= pos.tp2:
-                    close_position_market(pos, 'TAKE PROFIT'); STATE['open']=None; STATE['consec_losses']=0; return
-            else:
-                trail = last + ATR_TRAIL_STEP*a
-                if trail < pos.sl: pos.sl = trail
-                if last >= pos.sl:
-                    close_position_market(pos, 'STOP LOSS'); STATE['open']=None; STATE['consec_losses']+=1
-                    if STATE['consec_losses']>=3: STATE['cooldown_until']=time.time()+COOLDOWN_AFTER_3_LOSSES_MIN*60
-                    return
-                if last <= pos.tp2:
-                    close_position_market(pos, 'TAKE PROFIT'); STATE['open']=None; STATE['consec_losses']=0; return
-    except Exception as e:
-        tg_send(f"[MONITOR ERROR] {e}")
-
-# ========= TELEGRAM COMMANDS =========
-
-def _fmt_pos() -> str:
-    pos: Position = STATE['open']
-    if not pos:
-        return "No open position"
-    try:
-        last = float(EX.fetch_ticker(pos.symbol)['last'])
-    except Exception:
-        last = None
-    lines = [
-        f"symbol: {pos.symbol}",
-        f"side: {pos.side}",
-        f"entry: {pos.entry}",
-        f"sl: {pos.sl}",
-        f"tp: {pos.tp2}",
-        f"size: {pos.size}",
-        f"mode: {pos.mode}",
-        f"risk: {STATE['risk_mode']}",
-    ]
-    if last is not None:
-        pnl = (last - pos.entry) / pos.entry * (1 if pos.side=='long' else -1)
-        lines.append(f"last: {last} (pnl: {pnl*100:.2f}%)")
-    return "\n".join(lines)
-
-
-def process_command(cmd_text: str):
-    global MARGIN_FRAC
-    t = cmd_text.strip()
-    if t.startswith('/ping'):
-        tg_send('pong ✅'); return
-    if t.startswith('/status'):
-        try: eq = fetch_equity_usdt()
-        except Exception: eq = None
-        msg = ["[STATUS]",
-               f"equity={eq}",
-               f"cooldown_until={STATE['cooldown_until']}",
-               f"consec_losses={STATE['consec_losses']}",
-               f"margin_frac={MARGIN_FRAC}",
-               f"mode={STATE['mode']}",
-               f"auto_mode={STATE['auto_mode']}",
-               f"risk_mode={STATE['risk_mode']}" ]
-        tg_send("\n".join(msg)); return
-    if t.startswith('/position') or t.startswith('/pos'):
-        tg_send(_fmt_pos()); return
-    if t.startswith('/set'):
-        parts = t.split()
-        if len(parts)>=3 and parts[1].lower()=='margin':
-            try:
-                val = float(parts[2])
-                if 0.001 <= val <= 0.25:
-                    MARGIN_FRAC = val; tg_send(f"[SET] margin_frac={MARGIN_FRAC}")
-                else:
-                    tg_send("[SET ERROR] margin must be 0.001~0.25")
-            except Exception:
-                tg_send("[SET ERROR] usage: /set margin 0.01")
-        else:
-            tg_send("[SET] unknown or missing parameter. try: /set margin 0.01")
-        return
-    if t.startswith('/mode'):
-        parts = t.split()
-        if len(parts)==1:
-            tg_send(f"mode={STATE['mode']} auto_mode={STATE['auto_mode']}"); return
-        arg = parts[1].lower()
-        if arg=='auto':
-            STATE['auto_mode']=True; tg_send('[MODE] auto on'); return
-        if arg in ('reversion','trend'):
-            STATE['auto_mode']=False; STATE['mode']=arg.upper(); STATE['last_mode_switch_ts']=time.time()
-            tg_send(f"[MODE] forced to {STATE['mode']} (auto off)"); return
-        tg_send('usage: /mode [auto|reversion|trend]'); return
-    if t.startswith('/risk'):
-        parts = t.split()
-        if len(parts)==1:
-            tg_send(f"risk_mode={STATE['risk_mode']}"); return
-        arg = parts[1].lower()
-        if arg in ('fast','normal','safe'):
-            STATE['risk_mode'] = arg
-            tg_send(f"[RISK] set to {arg}")
-            return
-        tg_send('usage: /risk [fast|normal|safe]'); return
-
-
-def command_poller():
-    while True:
+# ---- Lean logger: send most messages to Telegram; print only critical ----
+class _LeanLogger:
+    def info(self, msg: str):
         try:
-            ups = tg_get_updates(timeout=10)
-            for u in ups:
-                msg = u.get('message') or {}
-                chat_id = str(msg.get('chat',{}).get('id',''))
-                text = msg.get('text','')
-                if not text:
-                    continue
-                if TG_CHAT and chat_id != str(TG_CHAT):
-                    continue
-                process_command(text)
+            tg_send(str(msg))
         except Exception:
             pass
-        time.sleep(1)
-
-# ========= MAIN LOOP =========
-
-def fetch_ohlcv_bundle(sym: str):
-    df1 = fetch_ohlcv(sym, "1m", limit=BB_PERIOD+50)
-    df5 = fetch_ohlcv(sym, "5m", limit=BB_PERIOD+50)
-    df15= fetch_ohlcv(sym, "15m",limit=BB_PERIOD+50)
-    df60= fetch_ohlcv(sym, "1h", limit=BB_PERIOD+50)
-    df4h= fetch_ohlcv(sym, "4h", limit=BB_PERIOD+50)
-    return df1, df5, df15, df60, df4h
-
-
-def main():
-    global EX
-    EX = build_exchange()
-    tg_send("Bot started (LIVE + Auto Mode + Risk Modes)")
-
-    if TG_TOKEN:
-        threading.Thread(target=command_poller, daemon=True).start()
-
-    while True:
+    def warning(self, msg: str):
         try:
-            today = datetime.now(KST).date()
-            if STATE['daily_start_equity'] is None or STATE['day'] != str(today):
-                eq = fetch_equity_usdt()
-                STATE['daily_start_equity']=eq; STATE['daily_loss_usd']=0.0; STATE['consec_losses']=0; STATE['day']=str(today)
-                tg_send(f"[DAY START] equity={eq}")
+            tg_send("⚠️ " + str(msg))
+        except Exception:
+            pass
+    def error(self, msg: str, critical: bool = True):
+        try:
+            tg_send("❌ " + str(msg))
+        except Exception:
+            pass
+        if critical:
+            try:
+                print(f"[CRITICAL] {msg}")
+            except Exception:
+                pass
 
-            if time.time() < STATE['cooldown_until']:
-                time.sleep(LOOP_SLEEP_SEC); continue
-            eq_now = fetch_equity_usdt(); daily_pnl = eq_now - STATE['daily_start_equity']
-            if daily_pnl < -MAX_DAILY_LOSS_PCT * STATE['daily_start_equity']:
-                tg_send("[DAILY STOP] exceeded -5% — pausing until tomorrow")
-                STATE['cooldown_until']= time.time()+3600*24
-                time.sleep(60); continue
+# replace std logging with lean logger (shadow the module)
+logging = _LeanLogger()
 
-            #blocked, label = in_news_block()
-            #if blocked and STATE['open'] is None:
-                #tg_send(f"[NEWS BLOCK] {label}, skip new entries")
-                #time.sleep(60); continue
+# ---------------------- ENV ----------------------
+BITGET_API_KEY      = os.getenv("BITGET_API_KEY", "")
+BITGET_API_SECRET   = os.getenv("BITGET_API_SECRET", "")
+BITGET_API_PASSWORD = os.getenv("BITGET_API_PASSWORD", "")
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+FEE_RATE = float(os.getenv("FEE_RATE", "0.0008"))  # per side
 
-            if STATE['open']:
-                monitor_position()
-            else:
-                for sym in SYMBOLS:
-                    df1, df5, df15, df60, df4h = fetch_ohlcv_bundle(sym)
-                    maybe_switch_mode(df1, df5, df15)
-                    if STATE['mode']=='REVERSION':
-                        sig = check_signal_reversion(df1, df5, df15, df60, df4h)
-                    else:
-                        sig = check_signal_trend(df1, df5, df15, df60, df4h)
-                    if sig:
-                        pos = open_position(sym, sig, eq_now)
-                        if pos:
-                            break
+SYMBOLS = {"BTCUSDT": {"leverage": 100}, "SOLUSDT": {"leverage": 60}}
+INTERVAL = "1h"; BB_PERIOD=20; BB_NSTD=2.0; CCI_PERIOD=20
+SL_PCT=0.02; TP1_PCT=0.04; TP2_PCT=0.06; DAILY_STOP=0.04
+STATE_FILE="state.json"; LOG_FILE=None
+
+# logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
+#     format="%(asctime)s [%(levelname)s] %(message)s")
+
+# ---------------------- DATA ----------------------
+@dataclass
+class Position:
+    symbol: str; side: str; entry: float; notional: float
+    remaining_frac: float = 1.0; tp1_hit: bool=False; stop: float=0.0
+    opened_at: str = ""; sl_order_id: Optional[str] = None
+
+@dataclass
+class State:
+    equity: float = 2000.0; current_day: str = ""; day_start_equity: float = 2000.0
+    open_pos: Optional[Position] = None; last_update_id: int = 0
+    sizing_mode: str = "percent"; sizing_value: float = 0.10
+    hard_paused: bool = False
+
+# ---------------------- UTIL ----------------------
+def now_utc(): return datetime.now(timezone.utc)
+
+def load_state()->State:
+    if os.path.exists(STATE_FILE):
+        d=json.load(open(STATE_FILE)); pos=d.get("open_pos")
+        return State(d.get("equity",2000.0), d.get("current_day", now_utc().date().isoformat()),
+                     d.get("day_start_equity",2000.0), Position(**pos) if pos else None,
+                     d.get("last_update_id",0), d.get("sizing_mode","percent"), d.get("sizing_value",0.10),
+                     d.get("hard_paused", False))
+    s=State(); s.current_day=now_utc().date().isoformat(); s.day_start_equity=s.equity; save_state(s); return s
+
+def save_state(s:State):
+    d=asdict(s); d["open_pos"]=asdict(s.open_pos) if s.open_pos else None
+    json.dump(d, open(STATE_FILE,"w"), indent=2)
+
+# ---------------------- Telegram ----------------------
+TG_BASE=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+def tg_send(text:str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
+    try: requests.post(f"{TG_BASE}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+    except Exception as e: logging.error(f"Telegram send error: {e}")
+
+def parse_size_command(text:str,s:State)->Optional[str]:
+    parts=text.strip().split();
+    if len(parts)<3: return "사용법: /size percent <숫자> 또는 /size fixed <USDT>"
+    _,mode,val=parts[:3]
+    try: num=float(val)
+    except: return "숫자를 올바르게 입력하세요. 예) /size percent 10 또는 /size fixed 100"
+    if mode.lower()=="percent":
+        if not(0<num<=100): return "percent 값은 0~100 사이여야 합니다."
+        s.sizing_mode="percent"; s.sizing_value=num/100.0
+    elif mode.lower()=="fixed":
+        if num<=0: return "fixed 금액은 0보다 커야 합니다."
+        s.sizing_mode="fixed"; s.sizing_value=num
+    else: return "mode는 percent 또는 fixed"
+    save_state(s); return f"포지션 크기: {s.sizing_mode}={(s.sizing_value if s.sizing_mode=='fixed' else str(int(s.sizing_value*100))+'%')}"
+
+def tg_poll_and_handle(s:State):
+    if not TELEGRAM_BOT_TOKEN: return
+    try:
+        resp=requests.get(f"{TG_BASE}/getUpdates", params={"timeout":5, "offset": s.last_update_id+1}).json()
+        if not resp.get("ok"): return
+        for upd in resp.get("result",[]):
+            s.last_update_id=upd["update_id"]; msg=upd.get("message") or {}; text=(msg.get("text") or "").strip()
+            chat_id=str(msg.get("chat",{}).get("id"))
+            if TELEGRAM_CHAT_ID and chat_id!=str(TELEGRAM_CHAT_ID): continue
+            if not text: continue
+            if text.startswith("/size"): tg_send(parse_size_command(text,s) or "설정 반영 완료")
+            elif text.startswith("/status"):
+                tg_send(f"equity={s.equity:.2f}, day_start={s.day_start_equity:.2f}, open={'Y' if s.open_pos else 'N'}\n"
+                        f"size={s.sizing_mode} {(s.sizing_value if s.sizing_mode=='fixed' else str(int(s.sizing_value*100))+'%')}\n"
+                        f"hard_paused={s.hard_paused}")
+            elif text.startswith("/help"): tg_send("/size percent <x> | /size fixed <usdt> | /status | /panic | /pause | /resume")
+            elif text.startswith("/panic"): s.hard_paused=True; s.__dict__["panic_now"]=True; save_state(s); tg_send("PANIC: 전량 청산 + 하드락")
+            elif text.startswith("/pause"): s.hard_paused=True; save_state(s); tg_send("일시정지 설정")
+            elif text.startswith("/resume"): s.hard_paused=False; s.__dict__.pop("panic_now",None); save_state(s); tg_send("재개")
+    except Exception as e: logging.error(f"Telegram poll error: {e}")
+
+# ---------------------- Indicators ----------------------
+def bollinger_and_cci(df:List[Dict], period=20, nstd=2.0)->List[Dict]:
+    closes=[x['close'] for x in df]; highs=[x['high'] for x in df]; lows=[x['low'] for x in df]
+    ma=[]; sd=[]
+    for i in range(len(closes)):
+        if i+1<period: ma.append(float('nan')); sd.append(float('nan'))
+        else:
+            w=closes[i+1-period:i+1]; m=sum(w)/period; var=sum((v-m)**2 for v in w)/period
+            ma.append(m); sd.append(var**0.5)
+    bb_mid=ma; bb_up=[m+nstd*s if not math.isnan(m) else float('nan') for m,s in zip(ma,sd)]
+    bb_low=[m-nstd*s if not math.isnan(m) else float('nan') for m,s in zip(ma,sd)]
+    cci=[]; tps=[(h+l+c)/3.0 for h,l,c in zip(highs,lows,closes)]
+    for i in range(len(tps)):
+        if i+1<period: cci.append(float('nan'))
+        else:
+            w=tps[i+1-period:i+1]; m=sum(w)/period; mad=sum(abs(x-m) for x in w)/period
+            cci.append((tps[i]-m)/(0.015*mad) if mad>0 else 0.0)
+    out=[]
+    for i,row in enumerate(df):
+        r=dict(row); r.update({'bb_mid':bb_mid[i],'bb_upper':bb_up[i],'bb_lower':bb_low[i],'cci20':cci[i]}); out.append(r)
+    return [r for r in out if not math.isnan(r['bb_mid']) and not math.isnan(r['cci20'])]
+
+# ---------------------- CCXT Adapter ----------------------
+class CcxtBitgetAdapter:
+    def __init__(self):
+        import ccxt
+        self.ccxt=ccxt.bitget({'apiKey':BITGET_API_KEY,'secret':BITGET_API_SECRET,'password':BITGET_API_PASSWORD,'enableRateLimit':True,'options':{'defaultType':'swap','defaultSubType':'linear'}})
+        self.symbol_map={'BTCUSDT':'BTC/USDT:USDT','SOLUSDT':'SOL/USDT:USDT'}
+        for sym,cfg in SYMBOLS.items():
+            try: self.ccxt.setLeverage(cfg.get('leverage',20), self.symbol_map[sym], params={'marginMode':'cross'})
+            except Exception as e: logging.warning(f"setLeverage fail {sym}: {e}")
+    def _cc(self,s): return self.symbol_map.get(s,s)
+    def fetch_ohlcv(self,symbol,interval="1h",limit=300)->List[Dict]:
+        try:
+            ohl=self.ccxt.fetch_ohlcv(self._cc(symbol), timeframe=interval, limit=limit)
+            return [{'time':datetime.fromtimestamp(t/1000,tz=timezone.utc),'open':float(o),'high':float(h),'low':float(l),'close':float(c),'volume':float(v)} for t,o,h,l,c,v in ohl]
+        except Exception as e: logging.error(f"fetch_ohlcv {symbol}: {e}"); return []
+    def fetch_equity(self)->float:
+        try:
+            bal=self.ccxt.fetch_balance(params={'type':'swap'}); usdt=bal.get('USDT') or {}
+            return float(usdt.get('total') or usdt.get('free') or 0.0)
+        except Exception as e: logging.error(f"fetch_equity: {e}"); return 0.0
+    def _last(self,ccs):
+        try: t=self.ccxt.fetch_ticker(ccs); return float(t.get('last')) if t else float('nan')
+        except Exception as e: logging.error(f"ticker {ccs}: {e}"); return float('nan')
+    def _amt_from_notional(self, ccs, notional, ref_px=None):
+        px=ref_px if (ref_px and ref_px>0) else self._last(ccs)
+        if not px or math.isnan(px) or px<=0: raise RuntimeError("가격 조회 실패")
+        amt=notional/px
+        try:
+            m=self.ccxt.market(ccs); prec=m.get('precision',{}).get('amount');
+            if prec is not None:
+                step=10**(-prec); amt=math.floor(amt/step)*step
+        except Exception: pass
+        return max(amt,0.0)
+    def place_market(self,symbol,side,notional):
+        ccs=self._cc(symbol); amt=self._amt_from_notional(ccs,notional)
+        order=self.ccxt.create_order(ccs,'market','buy' if side=='long' else 'sell',amt,params={'reduceOnly':False})
+        price=float(order.get('average') or order.get('price') or self._last(ccs) or 0.0)
+        return {'price':price,'amount':amt,'raw':order}
+    def place_stop(self,symbol,side,stop_price,notional):
+        """서버사이드 SL만 생성 (reduceOnly, stopPrice)
+        반환: order_id 또는 None
+        """
+        ccs=self._cc(symbol); amt=self._amt_from_notional(ccs,notional,ref_px=stop_price)
+        try:
+            o=self.ccxt.create_order(ccs,'market','sell' if side=='long' else 'buy',amt,params={'reduceOnly':True,'stopPrice':stop_price})
+            return o.get('id') if isinstance(o,dict) else getattr(o,'id',None)
         except Exception as e:
-            tg_send(f"[ERROR] {e}\n{traceback.format_exc()}")
-            time.sleep(10)
-        time.sleep(LOOP_SLEEP_SEC)
+            logging.error(f"place_stop fail {symbol}: {e}"); return None
+    def cancel_order(self, symbol, order_id):
+        try: self.ccxt.cancel_order(order_id, self._cc(symbol))
+        except Exception as e: logging.warning(f"cancel_order fail {symbol}:{order_id}: {e}")
+
+# ---------------------- Signals ----------------------
+def long_signal(r): return (r['close']<r['bb_mid']) and (r['close']>r['bb_lower']) and (r['cci20']>-100)
+
+def short_signal(r):
+    if r['close']>=r['bb_mid'] and r['cci20']>=100: return False
+    return (r['close']<r['bb_mid']) and (r['cci20']<100)
+
+# ---------------------- Sizing ----------------------
+def compute_margin(s:State)->float:
+    return max(0.0, s.equity*(s.sizing_value) if s.sizing_mode=='percent' else float(s.sizing_value))
+
+# ---------------------- Main ----------------------
+def run_once(ex:CcxtBitgetAdapter, s:State):
+    tg_poll_and_handle(s)
+    # sync equity
+    try:
+        real=ex.fetch_equity()
+        if real>0: s.equity=real
+    except Exception as e: logging.warning(f"equity sync fail: {e}")
+    # roll day
+    today=now_utc().date().isoformat()
+    if s.current_day!=today: s.current_day=today; s.day_start_equity=s.equity
+    # daily hard lock
+    if (s.day_start_equity - s.equity)/max(1e-9,s.day_start_equity) >= DAILY_STOP:
+        s.hard_paused=True; save_state(s); tg_send(f"Daily hard lock {-int(DAILY_STOP*100)}% reached"); return
+    # panic
+    if getattr(s,'panic_now',False) and s.open_pos:
+        try:
+            pos=s.open_pos; ex.place_market(pos.symbol, 'short' if pos.side=='long' else 'long', pos.notional*pos.remaining_frac)
+        except Exception as e: logging.error(f"panic close fail: {e}")
+        s.open_pos=None; s.hard_paused=True; s.__dict__.pop('panic_now',None); save_state(s); tg_send("Panic closed & locked"); return
+    # manage (TP/SL 로직)
+    if s.open_pos:
+        # 서버사이드 SL이 있으므로 여기선 TP1/TP2 로직만 수행(봉 확정 후 판단)
+        # OHLCV 1개만 가져와 최근봉로직 적용
+        ind = None
+        try:
+            ohlcv = ex.fetch_ohlcv(s.open_pos.symbol, INTERVAL, limit=1)
+            ind = bollinger_and_cci(ohlcv, BB_PERIOD, BB_NSTD) if ohlcv else None
+        except Exception as e:
+            logging.warning(f"manage fetch ohlcv fail: {e}")
+        if ind:
+            r = ind[-1]
+            pos = s.open_pos
+            entry = pos.entry
+            side = pos.side
+            tp1 = entry*(1+TP1_PCT if side=='long' else 1-TP1_PCT)
+            tp2 = entry*(1+TP2_PCT if side=='long' else 1-TP2_PCT)
+            # TP1
+            if (r['high']>=tp1 and side=='long') or (r['low']<=tp1 and side=='short'):
+                # half close at market
+                try:
+                    ex.place_market(pos.symbol, 'short' if side=='long' else 'long', pos.notional*0.5)
+                except Exception as e:
+                    logging.error(f"TP1 close fail: {e}")
+                pos.remaining_frac = 0.5
+                pos.tp1_hit = True
+                # MOVE SL -> BE + fees (≈ entry ± 2*fee)
+                be_adj = 2.0 * FEE_RATE
+                new_stop = entry*(1+be_adj) if side=='long' else entry*(1-be_adj)
+                # cancel old SL & place new one
+                if pos.sl_order_id:
+                    ex.cancel_order(pos.symbol, pos.sl_order_id)
+                pos.sl_order_id = ex.place_stop(pos.symbol, side, new_stop, pos.notional*pos.remaining_frac)
+                pos.stop = new_stop
+                save_state(s)
+                tg_send(f"TP1 {pos.symbol} {side}. SL->BE(+fees) at {new_stop:.2f}")
+                return
+            # TP2 (full close)
+            if (r['high']>=tp2 and side=='long') or (r['low']<=tp2 and side=='short'):
+                try:
+                    ex.place_market(pos.symbol, 'short' if side=='long' else 'long', pos.notional*pos.remaining_frac)
+                except Exception as e:
+                    logging.error(f"TP2 close fail: {e}")
+                # cancel SL
+                if pos.sl_order_id: ex.cancel_order(pos.symbol, pos.sl_order_id)
+                s.open_pos=None; save_state(s); tg_send(f"TP2 {pos.symbol} {side} closed")
+                return
+        save_state(s); return
+    # blocked?
+    if s.hard_paused: return
+    # entries
+    for sym,cfg in SYMBOLS.items():
+        ohlcv=ex.fetch_ohlcv(sym, INTERVAL, limit=300)
+        if not ohlcv or len(ohlcv)<50: continue
+        ind=bollinger_and_cci(ohlcv, BB_PERIOD, BB_NSTD); r=ind[-1]
+        if (r['close']>=r['bb_mid'] and r['cci20']>=100): continue
+        go_long=long_signal(r); go_short=(not go_long) and short_signal(r)
+        if not(go_long or go_short): continue
+        margin = s.equity*s.sizing_value if s.sizing_mode=='percent' else s.sizing_value
+        if margin<=0: tg_send("포지션 크기 0. /size 로 설정"); break
+        notional = margin * cfg['leverage']
+        # entry
+        try:
+            res=ex.place_market(sym, 'long' if go_long else 'short', notional)
+            entry_price=res['price']
+            # place SL only
+            stop_price = entry_price*(1-SL_PCT) if go_long else entry_price*(1+SL_PCT)
+            sl_id = ex.place_stop(sym, 'long' if go_long else 'short', stop_price, notional)
+            s.open_pos = Position(symbol=sym, side='long' if go_long else 'short', entry=entry_price,
+                                  notional=notional, remaining_frac=1.0, tp1_hit=False, stop=stop_price, opened_at=now_utc().isoformat(), sl_order_id=sl_id)
+            save_state(s)
+            tg_send(f"OPEN {sym} {'long' if go_long else 'short'} @ {entry_price:.2f} | SL {stop_price:.2f}")
+            break
+        except Exception as e:
+            tg_send(f"Entry failed {sym}: {e}")
 
 if __name__ == "__main__":
-    main()
+    ex = CcxtBitgetAdapter()
+    st = load_state()
+
+    import time
+    from datetime import datetime, timezone, timedelta
+
+    BUFFER_MIN = 2  # 정각 + 2분에 실행
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            # 다음 정각(+버퍼) 목표 시각
+            next_hour = (now.replace(minute=0, second=0, microsecond=0) 
+                         + timedelta(hours=1, minutes=BUFFER_MIN))
+            sleep_s = max(1, (next_hour - now).total_seconds())
+            time.sleep(sleep_s)
+
+            # 실행
+            st = load_state()       # 상태 재로드(프로세스 재시작/수정 대비)
+            run_once(ex, st)
+        except Exception as e:
+            logging.error(f"run loop error: {e}")
+            time.sleep(10)  # 오류시 잠깐 쉬고 재시도
