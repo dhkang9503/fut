@@ -77,7 +77,7 @@ class Position:
 
 @dataclass
 class State:
-    equity: float = 2000.0; current_day: str = ""; day_start_equity: float = 2000.0
+    equity: float = 0.0; current_day: str = ""; day_start_equity: float = 0.0
     open_pos: Optional[Position] = None; last_update_id: int = 0
     sizing_mode: str = "percent"; sizing_value: float = 0.10
     hard_paused: bool = False
@@ -163,6 +163,13 @@ def tg_poll_and_handle(s: State):
                 s.hard_paused = False
                 s.__dict__.pop("panic_now", None)
                 tg_send("재개")
+            elif text.startswith("/sync"):
+                try:
+                    s.equity = ex.fetch_equity()
+                    tg_send(f"Synced equity={s.equity:.2f}")
+                except Exception as e:
+                    tg_send(f"Sync failed: {e}")
+
 
         # <<< 여기! 전체 루프 처리 후 반드시 저장
         save_state(s)
@@ -261,7 +268,13 @@ def run_once(ex:CcxtBitgetAdapter, s:State):
     # sync equity
     try:
         real=ex.fetch_equity()
-        if real>0: s.equity=real
+        s.equity=real
+        # after s.equity = real
+        if not s.current_day:
+            s.current_day = now_utc().date().isoformat()
+        if s.day_start_equity == 0.0:
+            s.day_start_equity = s.equity
+
     except Exception as e: logging.warning(f"equity sync fail: {e}")
     # roll day
     today=now_utc().date().isoformat()
