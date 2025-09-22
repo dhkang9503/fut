@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 # ========= CONFIG =========
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
 LEVERAGE = 50
-MARGIN_FRAC = 0.10
+MARGIN_FRAC = 0.01
 RISK_PCT = 0.015
 TP2_R = 1.2
 MIN_PROFIT_PCT = 0.04
