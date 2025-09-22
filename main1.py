@@ -121,26 +121,55 @@ def parse_size_command(text:str,s:State)->Optional[str]:
     else: return "mode는 percent 또는 fixed"
     save_state(s); return f"포지션 크기: {s.sizing_mode}={(s.sizing_value if s.sizing_mode=='fixed' else str(int(s.sizing_value*100))+'%')}"
 
-def tg_poll_and_handle(s:State):
-    if not TELEGRAM_BOT_TOKEN: return
+def tg_poll_and_handle(s: State):
+    if not TELEGRAM_BOT_TOKEN:
+        return
     try:
-        resp=requests.get(f"{TG_BASE}/getUpdates", params={"timeout":5, "offset": s.last_update_id+1}).json()
-        if not resp.get("ok"): return
-        for upd in resp.get("result",[]):
-            s.last_update_id=upd["update_id"]; msg=upd.get("message") or {}; text=(msg.get("text") or "").strip()
-            chat_id=str(msg.get("chat",{}).get("id"))
-            if TELEGRAM_CHAT_ID and chat_id!=str(TELEGRAM_CHAT_ID): continue
-            if not text: continue
-            if text.startswith("/size"): tg_send(parse_size_command(text,s) or "설정 반영 완료")
-            elif text.startswith("/status"):
-                tg_send(f"equity={s.equity:.2f}, day_start={s.day_start_equity:.2f}, open={'Y' if s.open_pos else 'N'}\n"
-                        f"size={s.sizing_mode} {(s.sizing_value if s.sizing_mode=='fixed' else str(int(s.sizing_value*100))+'%')}\n"
-                        f"hard_paused={s.hard_paused}")
-            elif text.startswith("/help"): tg_send("/size percent <x> | /size fixed <usdt> | /status | /panic | /pause | /resume")
-            elif text.startswith("/panic"): s.hard_paused=True; s.__dict__["panic_now"]=True; save_state(s); tg_send("PANIC: 전량 청산 + 하드락")
-            elif text.startswith("/pause"): s.hard_paused=True; save_state(s); tg_send("일시정지 설정")
-            elif text.startswith("/resume"): s.hard_paused=False; s.__dict__.pop("panic_now",None); save_state(s); tg_send("재개")
-    except Exception as e: logging.error(f"Telegram poll error: {e}")
+        r = requests.get(
+            f"{TG_BASE}/getUpdates",
+            params={"timeout": 5, "offset": s.last_update_id + 1}
+        )
+        data = r.json()
+        if not data.get("ok"):
+            return
+        for upd in data.get("result", []):
+            s.last_update_id = upd["update_id"]  # <<< 최신 ID 갱신
+            msg = upd.get("message") or {}
+            chat_id = str(msg.get("chat", {}).get("id"))
+            text = (msg.get("text") or "").strip()
+            if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
+                continue
+            if not text:
+                continue
+
+            if text.startswith("/size"):
+                tg_send(parse_size_command(text, s) or "설정 반영 완료")
+            elif text.startswith("/status") or text.startswith("/state"):
+                tg_send(
+                    f"equity={s.equity:.2f}, day_start={s.day_start_equity:.2f}, open={'Y' if s.open_pos else 'N'}\n"
+                    f"size={s.sizing_mode} {(s.sizing_value if s.sizing_mode=='fixed' else str(int(s.sizing_value*100))+'%')}\n"
+                    f"hard_paused={s.hard_paused}"
+                )
+            elif text.startswith("/help"):
+                tg_send("/size percent <x> | /size fixed <usdt> | /status | /panic | /pause | /resume")
+            elif text.startswith("/panic"):
+                s.hard_paused = True
+                s.__dict__["panic_now"] = True
+                tg_send("PANIC: 전량 청산 + 하드락")
+            elif text.startswith("/pause"):
+                s.hard_paused = True
+                tg_send("일시정지 설정")
+            elif text.startswith("/resume"):
+                s.hard_paused = False
+                s.__dict__.pop("panic_now", None)
+                tg_send("재개")
+
+        # <<< 여기! 전체 루프 처리 후 반드시 저장
+        save_state(s)
+
+    except Exception as e:
+        logging.error(f"Telegram poll error: {e}")
+
 
 # ---------------------- Indicators ----------------------
 def bollinger_and_cci(df:List[Dict], period=20, nstd=2.0)->List[Dict]:
