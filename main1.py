@@ -48,7 +48,7 @@ NYT = ZoneInfo("America/New_York")
 
 # ========= TELEGRAM =========
 load_dotenv()
-TG_TOKEN = os.getenv("OKX_TELEGRAM_BOT_TOKEN", "")
+TG_TOKEN = os.getenv("OKX_TELEGRAM_TOKEN", "")
 TG_CHAT = os.getenv("OKX_TELEGRAM_CHAT_ID", "")
 
 def tg_send(msg: str):
