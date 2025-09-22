@@ -102,6 +102,7 @@ def save_state(s:State):
 TG_BASE=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 def tg_send(text:str):
+    print(text)
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     try: requests.post(f"{TG_BASE}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
     except Exception as e: logging.error(f"Telegram send error: {e}")
