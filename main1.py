@@ -330,6 +330,8 @@ if __name__ == "__main__":
     import time
     from datetime import datetime, timezone, timedelta
 
+    tg_send("Bot started")
+
     BUFFER_MIN = 2  # 정각 + 2분에 실행
     while True:
         try:
