@@ -229,7 +229,6 @@ def compute_margin(s:State)->float:
 
 # ---------------------- Main ----------------------
 def run_once(ex:CcxtBitgetAdapter, s:State):
-    tg_poll_and_handle(s)
     # sync equity
     try:
         real=ex.fetch_equity()
@@ -325,26 +324,27 @@ def run_once(ex:CcxtBitgetAdapter, s:State):
 
 if __name__ == "__main__":
     ex = CcxtBitgetAdapter()
-    st = load_state()
+    last_traded_hour = None
 
-    import time
     from datetime import datetime, timezone, timedelta
+    POLL_EVERY_SEC = 3
+    BUFFER_MIN = 2  # 정각 +2분 실행
 
-    tg_send("Bot started")
-
-    BUFFER_MIN = 2  # 정각 + 2분에 실행
     while True:
         try:
-            now = datetime.now(timezone.utc)
-            # 다음 정각(+버퍼) 목표 시각
-            next_hour = (now.replace(minute=0, second=0, microsecond=0) 
-                         + timedelta(hours=1, minutes=BUFFER_MIN))
-            sleep_s = max(1, (next_hour - now).total_seconds())
-            time.sleep(sleep_s)
+            # 1) 텔레그램 커맨드 상시 처리
+            st = load_state()
+            tg_poll_and_handle(st)
 
-            # 실행
-            st = load_state()       # 상태 재로드(프로세스 재시작/수정 대비)
-            run_once(ex, st)
+            # 2) 매 시 정각+버퍼에 run_once 실행 (시간당 1회만)
+            now = datetime.now(timezone.utc)
+            target = now.replace(minute=BUFFER_MIN, second=0, microsecond=0)
+            if now.minute == BUFFER_MIN and now.second < POLL_EVERY_SEC:
+                if last_traded_hour != now.hour:
+                    run_once(ex, st)
+                    last_traded_hour = now.hour
+
+            time.sleep(POLL_EVERY_SEC)
         except Exception as e:
-            logging.error(f"run loop error: {e}")
-            time.sleep(10)  # 오류시 잠깐 쉬고 재시도
+            print(f"[CRITICAL] main loop error: {e}")
+            time.sleep(5)
