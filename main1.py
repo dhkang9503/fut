@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 # ========= CONFIG =========
 SYMBOL = "BTC/USDT:USDT"
 LEVERAGE = 50
-MARGIN_FRAC = 0.10
+MARGIN_FRAC = 0.01
 RISK_PCT = 0.015
 TP2_R = 1.2
 MIN_PROFIT_PCT = 0.04   # minimum 4% profit before TP allowed
