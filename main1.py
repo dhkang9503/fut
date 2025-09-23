@@ -24,10 +24,10 @@ TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 
 SIZING_MODE  = os.getenv("SIZING_MODE", "percent").lower()   # 'percent' or 'fixed'
-SIZING_VALUE = float(os.getenv("SIZING_VALUE", "0.10"))      # 10% equity or fixed USDT
+SIZING_VALUE = float(os.getenv("SIZING_VALUE", "0.01"))      # 10% equity or fixed USDT
 FEE_RATE     = float(os.getenv("FEE_RATE", "0.0008"))        # per side, 0.08%
 DAILY_STOP   = float(os.getenv("DAILY_STOP", "0.04"))        # 4%
-ENTRY_BUFFER_MIN = int(os.getenv("ENTRY_BUFFER_MIN", "2"))   # run at HH:02 UTC
+ENTRY_BUFFER_MIN = int(os.getenv("ENTRY_BUFFER_MIN", "5"))   # run at HH:02 UTC
 
 # Symbols & leverage
 SYMBOLS = {
