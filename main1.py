@@ -1,387 +1,621 @@
+
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Bitget AutoTrader — Single File / No State Files / Telegram Alerts
-Strategy: 1h Bollinger(20,2) + CCI(20)
-Entry:  Long  if bb_low < close < bb_mid and CCI>-100
-        Short if close < bb_mid and CCI<+100  (but NOT when close>=bb_mid & CCI>=+100)
-Exit:   Server-side SL = 2%
-        TP1 = +4% (close 50%, then move SL to BE(+fees) = entry ± 2*fee)
-        TP2 = +6% (close remainder)
-Risk:   Daily hard lock at 4% drawdown from day_start (no new entries that day)
-Run:    Loop; trade only at hh:ENTRY_BUFFER_MIN (default :02) UTC
+Triangle Breakout Detector — Multi (ETH/XRP/SOL 5m) + Retest + Leverage + Fake-breakout filters
+-----------------------------------------------------------------------------------------------
+Adds *fake breakout* filters before confirming a breakout:
+- Require N confirming bars to also close beyond the trendline (same direction)
+- Minimum breakout candle body relative to ATR
+- Minimum body-to-range ratio to avoid long-wick spikes
+
+Only after confirmation do we send the breakout alert and arm the *retest* watcher.
 """
+import os
+import asyncio
+import json
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
-import os, time, math, json
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional, Dict, List
+import aiohttp  # pip install aiohttp
+import websockets  # pip install websockets
+import numpy as np  # pip install numpy
 
-# ========================= ENV =========================
-BITGET_API_KEY      = os.getenv("BITGET_API_KEY", "")
-BITGET_API_SECRET   = os.getenv("BITGET_API_SECRET", "")
-BITGET_API_PASSWORD = os.getenv("BITGET_API_PASSWORD", "")
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+REST_BASE = "https://fapi.binance.com"
+WS_BASE = "wss://fstream.binance.com/stream"
+KLINES_ENDPOINT = "/fapi/v1/klines"
 
-SIZING_MODE  = os.getenv("SIZING_MODE", "percent").lower()   # 'percent' or 'fixed'
-SIZING_VALUE = float(os.getenv("SIZING_VALUE", "0.01"))      # 10% equity or fixed USDT
-FEE_RATE     = float(os.getenv("FEE_RATE", "0.0008"))        # per side, 0.08%
-DAILY_STOP   = float(os.getenv("DAILY_STOP", "0.04"))        # 4%
-ENTRY_BUFFER_MIN = int(os.getenv("ENTRY_BUFFER_MIN", "5"))   # run at HH:02 UTC
+SYMBOLS = ["ethusdt", "xrpusdt", "solusdt"]
 
-# Symbols & leverage
-SYMBOLS = {
-    "BTCUSDT": {"lev": 100, "cc": "BTC/USDT:USDT"},
-    "SOLUSDT": {"lev": 60,  "cc": "SOL/USDT:USDT"},
-}
+# --------------------------- Config --------------------------- #
 
-# Strategy params
-INTERVAL   = "1h"
-BB_PERIOD  = 20
-BB_NSTD    = 2.0
-CCI_PERIOD = 20
-SL_PCT   = 0.02
-TP1_PCT  = 0.04
-TP2_PCT  = 0.06
+@dataclass
+class Config:
+    interval: str = "5m"
+    seed_candles: int = 600
+    ws_reconnect_delay: int = 5
 
-# ========================= Utils / Notify =========================
-def now_utc():
-    return datetime.now(timezone.utc)
+    # Triangle detection params
+    pivot_span: int = 3
+    max_pivots: int = 30
+    min_pivots_required: int = 4
+    lookback_bars: int = 200
 
-def notify(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[INFO]", text)
-        return
-    import requests
-    TG_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    try:
-        requests.post(f"{TG_BASE}/sendMessage",
-                      json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-                      timeout=10)
-    except Exception as e:
-        print(f"[CRITICAL][TG] send error: {e} | msg={text[:120]}")
+    # Triangle validation thresholds
+    min_contraction_ratio: float = 0.35
+    atr_window: int = 14
+    atr_contraction_factor: float = 0.7
 
-def pct(a, b):
-    return 0.0 if b == 0 else (a / b - 1.0)
+    # Breakout rules
+    breakout_buffer_pct: float = 0.001
+    vol_ma_window: int = 20
+    vol_confirm_factor: float = 1.5
 
-# ========================= Indicators =========================
-def indicators_from_ohlcv(ohlcv: List[List[float]]):
-    """
-    ohlcv: list of [ts_ms, open, high, low, close, volume]
-    returns list of dict with keys: time, open, high, low, close, bb_mid, bb_upper, bb_lower, cci20
-    """
-    from statistics import mean
-    out = []
-    closes = []
-    highs = []
-    lows = []
-    tps = []
-    for i, (t,o,h,l,c,v) in enumerate(ohlcv):
-        closes.append(float(c)); highs.append(float(h)); lows.append(float(l))
-        tps.append((float(h)+float(l)+float(c))/3.0)
-        # BB
-        if len(closes) >= BB_PERIOD:
-            window = closes[-BB_PERIOD:]
-            m = sum(window)/BB_PERIOD
-            var = sum((x-m)**2 for x in window)/BB_PERIOD
-            sd = var**0.5
-            bb_mid = m; bb_up = m + BB_NSTD*sd; bb_low = m - BB_NSTD*sd
-        else:
-            bb_mid = bb_up = bb_low = float("nan")
-        # CCI
-        if len(tps) >= CCI_PERIOD:
-            w = tps[-CCI_PERIOD:]
-            m = sum(w)/CCI_PERIOD
-            mad = sum(abs(x-m) for x in w)/CCI_PERIOD
-            cci = (tps[-1]-m)/(0.015*mad) if mad>0 else 0.0
-        else:
-            cci = float("nan")
-        if not (math.isnan(bb_mid) or math.isnan(cci)):
-            out.append({
-                "time": datetime.fromtimestamp(t/1000, tz=timezone.utc),
-                "open": float(o), "high": float(h), "low": float(l), "close": float(c),
-                "bb_mid": bb_mid, "bb_upper": bb_up, "bb_lower": bb_low, "cci20": cci
-            })
-    return out
+    # Fake-breakout filters
+    confirm_bars: int = 1               # require this many *subsequent* bars also closing beyond the line
+    min_body_atr: float = 0.25          # breakout candle body >= 0.25 * ATR
+    min_body_to_range: float = 0.40     # breakout candle body / range >= 0.40 (limits long wicks)
 
-def long_signal(r):   # bb_low < close < bb_mid & cci>-100
-    return (r["close"] < r["bb_mid"]) and (r["close"] > r["bb_lower"]) and (r["cci20"] > -100)
+    # Retest entry rules
+    retest_max_bars: int = 10
+    retest_tolerance_pct: float = 0.002
+    retest_confirm_close: bool = True
+    stop_buffer_pct: float = 0.002
+    tp_rr_list: Tuple[float, ...] = (1.0, 2.0)
+    use_atr_targets: bool = False
+    atr_tp_multipliers: Tuple[float, ...] = (1.0, 1.5, 2.0)
 
-def short_signal(r):  # close<bb_mid & cci<+100, but forbid (close>=bb_mid & cci>=+100)
-    if r["close"] >= r["bb_mid"] and r["cci20"] >= 100:
+    # Direction filter
+    use_direction_filter: bool = True
+    ema_period: int = 200
+    htf_interval: str = "15m"
+    htf_ema_period: int = 200
+    htf_slope_lookback: int = 10
+
+    # Leverage targeting
+    loss_pct_at_sl: float = 0.10
+    leverage_cap: float = 50.0
+
+    # Telegram
+    enable_telegram: bool = True
+    telegram_bot_token: str = os.getenv('TELEGRAM_BOT_TOKEN')
+    telegram_chat_id: str = os.getenv('TELEGRAM_CHAT_ID')
+    telegram_parse_mode: str = "Markdown"
+
+cfg = Config()
+
+# --------------------------- Types --------------------------- #
+
+@dataclass
+class Candle:
+    open_time: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    close_time: int
+
+@dataclass
+class TriangleState:
+    upper_slope: float
+    upper_intercept: float
+    lower_slope: float
+    lower_intercept: float
+    start_idx: int
+    end_idx: int
+
+@dataclass
+class PendingRetest:
+    direction: str           # 'UP' or 'DOWN'
+    breakout_idx: int
+    line_at_breakout: float
+    upper_slope: float
+    upper_intercept: float
+    lower_slope: float
+    lower_intercept: float
+
+@dataclass
+class PendingBreakoutConfirm:
+    direction: str
+    breakout_idx: int
+    confirms_needed: int
+    confirms_got: int
+    upper_slope: float
+    upper_intercept: float
+    lower_slope: float
+    lower_intercept: float
+    line_at_breakout: float
+
+@dataclass
+class SymbolState:
+    symbol: str
+    candles: List[Candle] = field(default_factory=list)
+    last_alert_time: float = 0.0
+    pending: Optional[PendingRetest] = None
+    pending_confirm: Optional[PendingBreakoutConfirm] = None
+
+# --------------------------- Utils --------------------------- #
+
+def pivot_high(candles: List[Candle], i: int, span: int) -> bool:
+    if i - span < 0 or i + span >= len(candles): 
         return False
-    return (r["close"] < r["bb_mid"]) and (r["cci20"] < 100)
+    h = candles[i].high
+    for j in range(i - span, i + span + 1):
+        if candles[j].high > h:
+            return False
+    return True
 
-# ========================= CCXT / Bitget =========================
-class Bitget:
-    def __init__(self):
-        import ccxt
-        self.x = ccxt.bitget({
-            "apiKey": BITGET_API_KEY,
-            "secret": BITGET_API_SECRET,
-            "password": BITGET_API_PASSWORD,
-            "enableRateLimit": True,
-            "options": {"defaultType": "swap", "defaultSubType": "linear"},
-        })
-        # set leverage
-        for sym, meta in SYMBOLS.items():
-            try:
-                self.x.setLeverage(meta["lev"], meta["cc"], params={"marginMode":"cross"})
-            except Exception:
-                pass
+def pivot_low(candles: List[Candle], i: int, span: int) -> bool:
+    if i - span < 0 or i + span >= len(candles): 
+        return False
+    l = candles[i].low
+    for j in range(i - span, i + span + 1):
+        if candles[j].low < l:
+            return False
+    return True
 
-    def fetch_equity(self) -> float:
-        try:
-            bal = self.x.fetch_balance(params={"type":"swap"})
-            usdt = bal.get("USDT") or {}
-            total = float(usdt.get("total") or usdt.get("free") or 0.0)
-            return total
-        except Exception as e:
-            notify(f"❌ fetch_equity error: {e}")
-            return 0.0
+def linear_regression(xs: List[float], ys: List[float]) -> Tuple[float, float]:
+    if len(xs) < 2: 
+        return 0.0, ys[-1] if ys else 0.0
+    m, b = np.polyfit(xs, ys, 1)
+    return float(m), float(b)
 
-    def fetch_ohlcv(self, cc_symbol: str, timeframe="1h", limit=300):
-        try:
-            return self.x.fetch_ohlcv(cc_symbol, timeframe=timeframe, limit=limit)
-        except Exception as e:
-            notify(f"❌ fetch_ohlcv error {cc_symbol}: {e}")
-            return []
+def atr(candles: List[Candle], n: int) -> float:
+    if len(candles) < n + 1:
+        return 0.0
+    trs = []
+    for i in range(1, n+1):
+        high = candles[-i].high
+        low = candles[-i].low
+        prev_close = candles[-i-1].close
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    return float(sum(trs) / n)
 
-    def _amount_from_notional(self, cc_symbol: str, notional: float, price_hint: Optional[float]=None) -> float:
-        px = price_hint
-        if not px or px <= 0:
-            try:
-                t = self.x.fetch_ticker(cc_symbol)
-                px = float(t.get("last"))
-            except Exception:
-                pass
-        if not px or px <= 0:
-            raise RuntimeError("가격 조회 실패")
-        amt = notional / px
-        try:
-            m = self.x.market(cc_symbol)
-            prec = m.get("precision", {}).get("amount")
-            if prec is not None:
-                step = 10 ** (-prec)
-                amt = math.floor(amt / step) * step
-        except Exception:
-            pass
-        return max(amt, 0.0)
+def moving_average(vals: List[float], n: int) -> float:
+    if len(vals) < n or n <= 0: 
+        return 0.0
+    return float(sum(vals[-n:]) / n)
 
-    def market_open(self, cc_symbol: str, side: str, notional: float) -> Dict:
-        amt = self._amount_from_notional(cc_symbol, notional)
-        ord_side = "buy" if side == "long" else "sell"
-        o = self.x.create_order(cc_symbol, type="market", side=ord_side, amount=amt, params={"reduceOnly": False})
-        price = float(o.get("average") or o.get("price") or 0.0)
-        if price <= 0:
-            t = self.x.fetch_ticker(cc_symbol); price = float(t.get("last"))
-        return {"amount": amt, "price": price, "raw": o}
+def ema(values: List[float], period: int) -> List[float]:
+    if not values:
+        return []
+    k = 2/(period+1)
+    ema_vals = [values[0]]
+    for v in values[1:]:
+        ema_vals.append(ema_vals[-1] + k*(v - ema_vals[-1]))
+    return ema_vals
 
-    def place_stop_loss(self, cc_symbol: str, side: str, stop_price: float, notional: float) -> Optional[str]:
-        amt = self._amount_from_notional(cc_symbol, notional, price_hint=stop_price)
-        reduce_side = "sell" if side=="long" else "buy"
-        params_list = [
-            {"reduceOnly": True, "stopPrice": stop_price},
-            {"reduceOnly": True, "triggerPrice": stop_price},
-            {"reduceOnly": True, "stopLossPrice": stop_price},
-        ]
-        last_err = None
-        for p in params_list:
-            try:
-                o = self.x.create_order(cc_symbol, type="market", side=reduce_side, amount=amt, params=p)
-                return o.get("id") if isinstance(o, dict) else getattr(o, "id", None)
-            except Exception as e:
-                last_err = e
-                continue
-        notify(f"⚠️ SL order failed ({cc_symbol}) : {last_err}")
+def price_vs_trendlines(state: TriangleState, idx: int) -> Tuple[float, float]:
+    upper = state.upper_slope * idx + state.upper_intercept
+    lower = state.lower_slope * idx + state.lower_intercept
+    return upper, lower
+
+# --------------------------- Core Logic --------------------------- #
+
+def compute_triangle(candles: List[Candle], start_idx: int, end_idx: int, span: int, max_pivots: int, min_piv_req: int) -> Optional[TriangleState]:
+    highs_x, highs_y = [], []
+    lows_x, lows_y = [], []
+
+    for i in range(start_idx, end_idx+1):
+        if pivot_high(candles, i, span):
+            highs_x.append(i); highs_y.append(candles[i].high)
+        if pivot_low(candles, i, span):
+            lows_x.append(i); lows_y.append(candles[i].low)
+
+    highs_x, highs_y = highs_x[-max_pivots:], highs_y[-max_pivots:]
+    lows_x, lows_y   = lows_x[-max_pivots:], lows_y[-max_pivots:]
+
+    if len(highs_x) < min_piv_req or len(lows_x) < min_piv_req:
         return None
 
-    def cancel_order(self, cc_symbol: str, order_id: str):
+    m_up, b_up = linear_regression(highs_x, highs_y)
+    m_lo, b_lo = linear_regression(lows_x, lows_y)
+
+    if not (m_up < 0 and m_lo > 0):
+        return None
+
+    gap_start = (m_up*start_idx + b_up) - (m_lo*start_idx + b_lo)
+    gap_end   = (m_up*end_idx   + b_up) - (m_lo*end_idx   + b_lo)
+    if gap_start <= 0 or gap_end <= 0:
+        return None
+    if gap_end >= gap_start:
+        return None
+
+    return TriangleState(m_up, b_up, m_lo, b_lo, start_idx, end_idx)
+
+def contraction_ok(candles: List[Candle], state: TriangleState, atr_win: int, atr_factor: float, contraction_ratio: float) -> bool:
+    window = candles[state.start_idx: state.end_idx+1]
+    if len(window) < atr_win + 10:
+        return False
+
+    cut = len(window) // 2
+    early = window[:cut]
+    late = window[cut:]
+    early_range = max(c.high for c in early) - min(c.low for c in early)
+    late_range  = max(c.high for c in late)  - min(c.low for c in late)
+    if early_range <= 0:
+        return False
+    ratio = late_range / early_range
+    if ratio > contraction_ratio:
+        return False
+
+    atr_recent = atr(window, atr_win)
+    atr_long   = atr(candles[max(0, state.start_idx-atr_win): state.end_idx+1], atr_win)
+    if atr_recent <= 0 or atr_long <= 0:
+        return False
+    if atr_recent / atr_long > atr_factor:
+        return False
+
+    return True
+
+def breakout_seed_signal(candles: List[Candle], state: TriangleState, vol_ma_win: int, vol_factor: float, buffer_pct: float) -> Optional[Dict]:
+    """Initial breakout hit (first close beyond line with volume)."""
+    i = len(candles) - 1
+    last = candles[i]
+    upper, lower = price_vs_trendlines(state, i)
+    vols = [c.volume for c in candles]
+    vol_ma = moving_average(vols, vol_ma_win)
+
+    if last.close > upper * (1 + buffer_pct) and last.volume >= vol_ma * vol_factor:
+        return {"direction": "UP", "close": last.close, "open": last.open, "high": last.high, "low": last.low,
+                "line": upper, "volume": last.volume, "vol_ma": vol_ma, "idx": i}
+    if last.close < lower * (1 - buffer_pct) and last.volume >= vol_ma * vol_factor:
+        return {"direction": "DOWN", "close": last.close, "open": last.open, "high": last.high, "low": last.low,
+                "line": lower, "volume": last.volume, "vol_ma": vol_ma, "idx": i}
+    return None
+
+def passes_body_filters(sig: Dict, atr_val: float) -> bool:
+    body = abs(sig["close"] - sig["open"])
+    rng = max(1e-12, sig["high"] - sig["low"])
+    if atr_val <= 0:
+        return False
+    # Body relative to ATR
+    if body < cfg.min_body_atr * atr_val:
+        return False
+    # Body relative to candle range (limits long-wick)
+    if (body / rng) < cfg.min_body_to_range:
+        return False
+    return True
+
+def line_value_for_direction(state: TriangleState, direction: str, idx: int) -> float:
+    if direction == "UP":
+        return state.upper_slope * idx + state.upper_intercept
+    else:
+        return state.lower_slope * idx + state.lower_intercept
+
+def bar_confirms_breakout(direction: str, close_price: float, line_value: float, buffer_pct: float) -> bool:
+    if direction == "UP":
+        return close_price > line_value * (1 + buffer_pct)
+    else:
+        return close_price < line_value * (1 - buffer_pct)
+
+# --------------------------- Direction & Leverage --------------------------- #
+
+async def compute_direction_context(symbol: str, latest_close: float) -> Dict[str, str]:
+    if not cfg.use_direction_filter:
+        return {"tag": "No filter", "ctx": ""}
+    async with aiohttp.ClientSession() as session:
+        stf_kl = await fetch_klines(session, symbol, cfg.interval, max(cfg.seed_candles, cfg.ema_period+20))
+        stf_closes = [c.close for c in stf_kl]
+        stf_ema = ema(stf_closes, cfg.ema_period)[-1] if len(stf_closes) >= cfg.ema_period else 0.0
+
+        htf_kl = await fetch_klines(session, symbol, cfg.htf_interval, max(400, cfg.htf_ema_period+cfg.htf_slope_lookback+5))
+        htf_closes = [c.close for c in htf_kl]
+        htf_emas = ema(htf_closes, cfg.htf_ema_period)
+        if len(htf_emas) < cfg.htf_slope_lookback+1:
+            return {"tag": "Insufficient HTF data", "ctx": ""}
+        htf_ema_last = htf_emas[-1]
+        htf_ema_prev = htf_emas[-1 - cfg.htf_slope_lookback]
+        htf_slope_up = htf_ema_last > htf_ema_prev
+        htf_slope_down = htf_ema_last < htf_ema_prev
+
+    long_ok  = latest_close > stf_ema and htf_slope_up
+    short_ok = latest_close < stf_ema and htf_slope_down
+
+    if long_ok and not short_ok:
+        tag = "LONG preferred"
+    elif short_ok and not long_ok:
+        tag = "SHORT preferred"
+    else:
+        tag = "Counter-trend (caution)"
+
+    ctx = f"STF EMA200: {stf_ema:.4f} | HTF {cfg.htf_interval} EMA{cfg.htf_ema_period} slope: {'UP' if htf_slope_up else ('DOWN' if htf_slope_down else 'FLAT')}"
+    return {"tag": tag, "ctx": ctx}
+
+def leverage_for_loss(entry: float, sl: float) -> float:
+    if entry <= 0 or sl <= 0:
+        return 1.0
+    distance_pct = abs(entry - sl) / entry
+    if distance_pct == 0:
+        return 1.0
+    L = cfg.loss_pct_at_sl / distance_pct
+    return max(1.0, min(cfg.leverage_cap, L))
+
+# --------------------------- IO: Binance & Telegram --------------------------- #
+
+async def fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int) -> List[Candle]:
+    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+    url = REST_BASE + KLINES_ENDPOINT
+    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+    candles = []
+    for k in data:
+        candles.append(Candle(
+            open_time=int(k[0]),
+            open=float(k[1]),
+            high=float(k[2]),
+            low=float(k[3]),
+            close=float(k[4]),
+            volume=float(k[5]),
+            close_time=int(k[6])
+        ))
+    return candles
+
+def parse_ws_kline(msg: Dict) -> Optional[Tuple[str, Candle]]:
+    try:
+        stream = msg.get("stream", "")
+        symbol = stream.split("@")[0]
+        k = msg["data"]["k"]
+        if not k["x"]:
+            return None
+        candle = Candle(
+            open_time=int(k["t"]),
+            open=float(k["o"]),
+            high=float(k["h"]),
+            low=float(k["l"]),
+            close=float(k["c"]),
+            volume=float(k["q"]),
+            close_time=int(k["T"]),
+        )
+        return symbol, candle
+    except Exception:
+        return None
+
+async def send_telegram(text: str):
+    if not cfg.enable_telegram:
+        return
+    token = cfg.telegram_bot_token.strip()
+    chat_id = cfg.telegram_chat_id.strip()
+    if not token or not chat_id or "PUT_YOUR" in token or "PUT_YOUR" in chat_id:
+        print("[WARN] Telegram not configured. Set telegram_bot_token and telegram_chat_id.")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": cfg.telegram_parse_mode, "disable_web_page_preview": True}
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
-            self.x.cancel_order(order_id, cc_symbol)
+            async with session.post(url, json=payload) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    print(f"[Telegram] HTTP {resp.status}: {body}")
         except Exception as e:
-            notify(f"⚠️ cancel_order fail {cc_symbol}:{order_id}: {e}")
+            print(f"[Telegram] Error: {e}")
 
-# ========================= Runtime (no persisted state) =========================
-@dataclass
-class Position:
-    sym: str
-    side: str
-    entry: float
-    notional: float
-    remaining_frac: float = 1.0
-    tp1_hit: bool = False
-    sl_price: float = 0.0
-    sl_order_id: Optional[str] = None
+# --------------------------- Streams & Handlers --------------------------- #
 
-class Engine:
-    def __init__(self, ex: Bitget):
-        self.ex = ex
-        self.equity = 0.0
-        self.day_start_equity = 0.0
-        self.current_day = None
-        self.hard_paused = False
-        self.last_traded_hour = None
-        self.pos: Optional[Position] = None
+async def seed_all(states: Dict[str, SymbolState]):
+    async with aiohttp.ClientSession() as session:
+        for sym in SYMBOLS:
+            kl = await fetch_klines(session, sym, cfg.interval, cfg.seed_candles)
+            states[sym].candles = kl
+            await asyncio.sleep(0.1)
 
-    # --------- Sizing ---------
-    def compute_margin(self) -> float:
-        if SIZING_MODE == "percent":
-            return max(0.0, self.equity * SIZING_VALUE)
-        else:
-            return max(0.0, float(SIZING_VALUE))
-
-    # --------- Core Tick ---------
-    def tick(self):
-        # 1) sync equity
-        self.equity = self.ex.fetch_equity()
-        # 2) roll day
-        d = now_utc().date()
-        if (self.current_day is None) or (self.current_day != d):
-            self.current_day = d
-            self.day_start_equity = self.equity
-            self.hard_paused = False
-
-        # 3) daily hard lock
-        if self.day_start_equity > 0 and (self.day_start_equity - self.equity) / self.day_start_equity >= DAILY_STOP:
-            if not self.hard_paused:
-                self.hard_paused = True
-                notify(f"🧯 Daily hard lock {int(DAILY_STOP*100)}% reached. New entries disabled for UTC {d}.")
-            return
-
-        # 4) manage existing position
-        if self.pos:
-            cc = SYMBOLS[self.pos.sym]["cc"]
-            ohl = self.ex.fetch_ohlcv(cc, timeframe=INTERVAL, limit=1)
-            if ohl:
-                _, o, h, l, c, v = ohl[-1]
-                side = self.pos.side
-                entry = self.pos.entry
-                notional = self.pos.notional
-                rem = self.pos.remaining_frac
-
-                tp1 = entry*(1+TP1_PCT if side=='long' else 1-TP1_PCT)
-                sl  = self.pos.sl_price if self.pos.sl_price>0 else entry*(1-SL_PCT if side=='long' else 1+SL_PCT)
-                tp2 = entry*(1+TP2_PCT if side=='long' else 1-TP2_PCT) if self.pos.tp1_hit else None
-
-                # Priority: SL -> TP1 -> TP2
-                hit = None
-                if (l <= sl and side=='long') or (h >= sl and side=='short'):
-                    hit = "SL"
-                elif ((h>=tp1 and side=='long') or (l<=tp1 and side=='short')):
-                    hit = "TP1" if not self.pos.tp1_hit else ("TP2" if tp2 and ((h>=tp2 and side=='long') or (l<=tp2 and side=='short')) else "TP1")
-                elif tp2 and ((h>=tp2 and side=='long') or (l<=tp2 and side=='short')):
-                    hit = "TP2"
-
-                if hit == "SL":
-                    # close remainder at SL (reduceOnly market)
-                    self._close_market(entry, sl, rem, reason="SL")
-                    self.pos = None
-                    return
-
-                if hit == "TP1" and not self.pos.tp1_hit:
-                    # close 50% at tp1
-                    self._close_market(entry, tp1, 0.5, reason="TP1")
-                    self.pos.remaining_frac = 0.5
-                    self.pos.tp1_hit = True
-                    # move SL -> BE(+fees)
-                    be_adj = 2.0 * FEE_RATE
-                    new_stop = entry*(1+be_adj) if side=='long' else entry*(1-be_adj)
-                    # cancel prev SL & place new
-                    if self.pos.sl_order_id:
-                        self.ex.cancel_order(cc, self.pos.sl_order_id)
-                    self.pos.sl_order_id = self.ex.place_stop_loss(cc, side, new_stop, notional*self.pos.remaining_frac)
-                    self.pos.sl_price = new_stop
-                    notify(f"🔧 Move SL to BE(+fees) {self.pos.sym} {side} @ {new_stop:.2f}")
-                    return
-
-                if hit == "TP2":
-                    self._close_market(entry, tp2, rem, reason="TP2")
-                    if self.pos.sl_order_id:
-                        self.ex.cancel_order(cc, self.pos.sl_order_id)
-                    self.pos = None
-                    return
-
-        # 5) entries
-        if self.pos or self.hard_paused:
-            return
-
-        # BTC -> SOL 순서로 검사
-        for sym in ["BTCUSDT", "SOLUSDT"]:
-            cc = SYMBOLS[sym]["cc"]
-            lev = SYMBOLS[sym]["lev"]
-            ohl = self.ex.fetch_ohlcv(cc, timeframe=INTERVAL, limit=300)
-            if len(ohl) < 50:
-                continue
-            rows = indicators_from_ohlcv(ohl)
-            r = rows[-1]
-            if (r["close"]>=r["bb_mid"] and r["cci20"]>=100):
-                continue
-            go_long = long_signal(r)
-            go_short = (not go_long) and short_signal(r)
-            if not (go_long or go_short):
-                continue
-
-            margin = self.compute_margin()
-            if margin <= 0:
-                notify("⚠️ margin=0: check SIZING_MODE/SIZING_VALUE or equity")
-                break
-            notional = margin * lev
-            # open position
-            res = self.ex.market_open(cc, "long" if go_long else "short", notional)
-            entry_price = res["price"]
-            # place SL server-side
-            stop_price = entry_price*(1-SL_PCT) if go_long else entry_price*(1+SL_PCT)
-            sl_id = self.ex.place_stop_loss(cc, "long" if go_long else "short", stop_price, notional)
-            self.pos = Position(sym=sym, side="long" if go_long else "short",
-                                entry=entry_price, notional=notional,
-                                remaining_frac=1.0, tp1_hit=False,
-                                sl_price=stop_price, sl_order_id=sl_id)
-            notify(f"🟢 OPEN {sym} {self.pos.side} @ {entry_price:.2f} | lev {lev}x | SL {stop_price:.2f}")
-            break
-
-    # --------- Helpers ---------
-    def _close_market(self, entry: float, px: float, frac: float, reason: str):
-        """Simulate PnL / fees for notification only; actual exit is through reduce-only market."""
-        side = self.pos.side
-        cc = SYMBOLS[self.pos.sym]["cc"]
-        notional = self.pos.notional * frac
-        # place reduce-only market
-        try:
-            self.ex.market_open(cc, "short" if side=="long" else "long", notional)
-        except Exception as e:
-            notify(f"❌ close market error ({reason}) {self.pos.sym}: {e}")
-        pnl = notional * ( (px/entry - 1) if side=="long" else (1 - px/entry) )
-        fee = notional * FEE_RATE
-        self.equity += pnl - fee
-        notify(f"🔴 {reason} {self.pos.sym} {side} @ {px:.2f} | pnl(after fee) {pnl-fee:.2f} | equity≈{self.equity:.2f}")
-
-# ========================= Main Loop =========================
-def main():
-    # Checks
-    if not (BITGET_API_KEY and BITGET_API_SECRET and BITGET_API_PASSWORD):
-        raise SystemExit("Set BITGET_API_KEY/BITGET_API_SECRET/BITGET_API_PASSWORD")
-    ex = Bitget()
-    eng = Engine(ex)
-
-    notify("🤖 Bitget AutoTrader started. Strategy=BB(20,2)+CCI(20). SL server-side; TP1/TP2 logic; daily hard lock.")
-
+async def multiplex_stream(symbols: List[str], interval: str):
+    streams = "/".join([f"{s}@kline_{interval}" for s in symbols])
+    url = f"{WS_BASE}?streams={streams}"
     while True:
         try:
-            now = now_utc()
-            # trade only once per hour at HH:ENTRY_BUFFER_MIN
-            if now.minute == ENTRY_BUFFER_MIN:
-                if eng.last_traded_hour != now.hour:
-                    eng.last_traded_hour = now.hour
-                    eng.tick()
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+                async for message in ws:
+                    yield json.loads(message)
+        except Exception:
+            await asyncio.sleep(cfg.ws_reconnect_delay)
+            continue
+
+def within_tolerance(price: float, line: float, tol_pct: float) -> bool:
+    return abs(price - line) <= line * tol_pct
+
+def compute_sl_tp(direction: str, entry_price: float, retest_extreme: float, line_at_retest: float, atr_val: float) -> Dict[str, float]:
+    if direction == "UP":
+        sl = min(retest_extreme, line_at_retest) * (1 - cfg.stop_buffer_pct)
+        risk = max(1e-9, entry_price - sl)
+        targets = {}
+        if cfg.use_atr_targets and atr_val > 0:
+            for m in cfg.atr_tp_multipliers:
+                targets[f"TP_ATR_{m}x"] = entry_price + m * atr_val
+        else:
+            for r in cfg.tp_rr_list:
+                targets[f"TP_{r:.1f}R"] = entry_price + r * risk
+        return {"SL": sl, **targets}
+    else:
+        sl = max(retest_extreme, line_at_retest) * (1 + cfg.stop_buffer_pct)
+        risk = max(1e-9, sl - entry_price)
+        targets = {}
+        if cfg.use_atr_targets and atr_val > 0:
+            for m in cfg.atr_tp_multipliers:
+                targets[f"TP_ATR_{m}x"] = entry_price - m * atr_val
+        else:
+            for r in cfg.tp_rr_list:
+                targets[f"TP_{r:.1f}R"] = entry_price - r * risk
+        return {"SL": sl, **targets}
+
+# --------------------------- Main Loop --------------------------- #
+
+async def main():
+    print(f"Starting Multi-Symbol Triangle Breakout (5m) with Fake-breakout filters for: {', '.join([s.upper() for s in SYMBOLS])}")
+    states: Dict[str, SymbolState] = {s: SymbolState(symbol=s) for s in SYMBOLS}
+    await seed_all(states)
+
+    async for raw in multiplex_stream(SYMBOLS, cfg.interval):
+        parsed = parse_ws_kline(raw)
+        if not parsed:
+            continue
+        sym, candle = parsed
+        st = states.get(sym)
+        if not st:
+            continue
+        st.candles.append(candle)
+        if len(st.candles) > max(cfg.seed_candles, cfg.lookback_bars*3):
+            st.candles = st.candles[-max(cfg.seed_candles, cfg.lookback_bars*3):]
+
+        i = len(st.candles) - 1
+        end_idx = i
+        start_idx = max(0, end_idx - cfg.lookback_bars)
+        tri = compute_triangle(st.candles, start_idx, end_idx, cfg.pivot_span, cfg.max_pivots, cfg.min_pivots_required)
+
+        # If we are waiting for breakout confirmations, process them first
+        if st.pending_confirm:
+            # still within same triangle slopes to compute line
+            direction = st.pending_confirm.direction
+            line_here = line_value_for_direction(tri if tri else TriangleState(st.pending_confirm.upper_slope, st.pending_confirm.upper_intercept, st.pending_confirm.lower_slope, st.pending_confirm.lower_intercept, 0, 0), direction, i)
+            if bar_confirms_breakout(direction, st.candles[i].close, line_here, cfg.breakout_buffer_pct):
+                st.pending_confirm.confirms_got += 1
+                if st.pending_confirm.confirms_got >= st.pending_confirm.confirms_needed:
+                    # confirmation achieved: send breakout alert & arm retest
+                    price = st.candles[i].close
+                    vols = [c.volume for c in st.candles]
+                    vol_ma = moving_average(vols, cfg.vol_ma_window)
+                    dir_ctx = await compute_direction_context(sym, price)
+                    tag = dir_ctx["tag"]; ctx_str = dir_ctx["ctx"]
+                    text = (
+                        f"*{sym.upper()} {cfg.interval}* — *TRIANGLE BREAKOUT (confirmed)* `{direction}`\n"
+                        f"• Close: `{price:.6f}` vs Line: `{line_here:.6f}`\n"
+                        f"• Volume MA({cfg.vol_ma_window}): `{vol_ma:.0f}`\n"
+                        f"• Direction: *{tag}*\n"
+                        f"• TrendCtx: `{ctx_str}`\n"
+                        f"• Next: watching for *retest* within `{cfg.retest_max_bars}` bars (±{cfg.retest_tolerance_pct*100:.2f}%)"
+                    )
+                    print(text.replace("*","").replace("`",""))
+                    await send_telegram(text)
+
+                    st.pending = PendingRetest(
+                        direction=direction,
+                        breakout_idx=i,
+                        line_at_breakout=line_here,
+                        upper_slope=tri.upper_slope if tri else st.pending_confirm.upper_slope,
+                        upper_intercept=tri.upper_intercept if tri else st.pending_confirm.upper_intercept,
+                        lower_slope=tri.lower_slope if tri else st.pending_confirm.lower_slope,
+                        lower_intercept=tri.lower_intercept if tri else st.pending_confirm.lower_intercept,
+                    )
+                    st.pending_confirm = None
             else:
-                # manage open position also on non-trade minutes? -> keep hourly only per spec
-                pass
-            time.sleep(2)
-        except Exception as e:
-            print(f"[CRITICAL] main loop error: {e}")
-            notify(f"❌ main loop error: {e}")
-            time.sleep(5)
+                # invalidated
+                await send_telegram(f"*{sym.upper()} {cfg.interval}* — Breakout invalidated during confirmation phase.")
+                st.pending_confirm = None
+
+            # continue to next loop (avoid double-processing as new triangle may form)
+            continue
+
+        # Fresh triangle & initial breakout seed
+        if tri and contraction_ok(st.candles, tri, cfg.atr_window, cfg.atr_contraction_factor, cfg.min_contraction_ratio):
+            sig = breakout_seed_signal(st.candles, tri, cfg.vol_ma_window, cfg.vol_confirm_factor, cfg.breakout_buffer_pct)
+            now = time.time()
+            if sig and now - st.last_alert_time > 10:
+                # Candlestick quality filters (anti-fake)
+                atr_val = atr(st.candles, cfg.atr_window)
+                if not passes_body_filters(sig, atr_val):
+                    # soft notify? For now, just skip.
+                    continue
+
+                st.last_alert_time = now
+                direction = sig["direction"]
+                line_at_break = sig["line"]
+
+                # If confirmation bars requested, stage confirmation
+                if cfg.confirm_bars > 0:
+                    st.pending_confirm = PendingBreakoutConfirm(
+                        direction=direction,
+                        breakout_idx=sig["idx"],
+                        confirms_needed=cfg.confirm_bars,
+                        confirms_got=0,
+                        upper_slope=tri.upper_slope,
+                        upper_intercept=tri.upper_intercept,
+                        lower_slope=tri.lower_slope,
+                        lower_intercept=tri.lower_intercept,
+                        line_at_breakout=line_at_break,
+                    )
+                    await send_telegram(f"*{sym.upper()} {cfg.interval}* — Breakout spotted, waiting `{cfg.confirm_bars}` confirm bar(s) to filter fake-outs.")
+                else:
+                    # No confirmation needed: alert immediately and arm retest
+                    price = sig["close"]
+                    dir_ctx = await compute_direction_context(sym, price)
+                    tag = dir_ctx["tag"]; ctx_str = dir_ctx["ctx"]
+                    text = (
+                        f"*{sym.upper()} {cfg.interval}* — *TRIANGLE BREAKOUT* `{direction}`\n"
+                        f"• Close: `{price:.6f}` vs Line: `{line_at_break:.6f}`\n"
+                        f"• Direction: *{tag}*\n"
+                        f"• TrendCtx: `{ctx_str}`\n"
+                        f"• Next: watching for *retest* within `{cfg.retest_max_bars}` bars (±{cfg.retest_tolerance_pct*100:.2f}%)"
+                    )
+                    print(text.replace("*","").replace("`",""))
+                    await send_telegram(text)
+                    st.pending = PendingRetest(
+                        direction=direction,
+                        breakout_idx=i,
+                        line_at_breakout=line_at_break,
+                        upper_slope=tri.upper_slope,
+                        upper_intercept=tri.upper_intercept,
+                        lower_slope=tri.lower_slope,
+                        lower_intercept=tri.lower_intercept,
+                    )
+
+        # Retest handling
+        if st.pending:
+            bars_since = i - st.pending.breakout_idx
+            if bars_since > cfg.retest_max_bars:
+                await send_telegram(f"*{sym.upper()} {cfg.interval}* — Retest window expired (>{cfg.retest_max_bars} bars).")
+                st.pending = None
+                continue
+
+            if st.pending.direction == "UP":
+                line_here = st.pending.upper_slope * i + st.pending.upper_intercept
+                touched = within_tolerance(st.candles[i].low, line_here, cfg.retest_tolerance_pct)
+                confirm = st.candles[i].close > line_here if cfg.retest_confirm_close else touched
+                if touched and confirm:
+                    entry = st.candles[i].close
+                    retest_extreme = st.candles[i].low
+                    atr_val = atr(st.candles, cfg.atr_window)
+                    levels = compute_sl_tp("UP", entry, retest_extreme, line_here, atr_val)
+                    sl = levels["SL"]; L = leverage_for_loss(entry, sl)
+                    lev_note = f"Lev≈`{L:.2f}x` to risk ~{cfg.loss_pct_at_sl*100:.0f}% at SL"
+                    level_str = "\n".join([f"• {k}: `{v:.6f}`" for k, v in levels.items() if k != "SL"])
+                    msg = (
+                        f"*{sym.upper()} {cfg.interval}* — ✅ *Retest LONG Entry*\n"
+                        f"• Entry: `{entry:.6f}` (retested upper line `{line_here:.6f}`)\n"
+                        f"• SL: `{sl:.6f}`  ({lev_note})\n"
+                        f"{level_str}"
+                    )
+                    print(msg.replace("*","").replace("`",""))
+                    await send_telegram(msg)
+                    st.pending = None
+            else:
+                line_here = st.pending.lower_slope * i + st.pending.lower_intercept
+                touched = within_tolerance(st.candles[i].high, line_here, cfg.retest_tolerance_pct)
+                confirm = st.candles[i].close < line_here if cfg.retest_confirm_close else touched
+                if touched and confirm:
+                    entry = st.candles[i].close
+                    retest_extreme = st.candles[i].high
+                    atr_val = atr(st.candles, cfg.atr_window)
+                    levels = compute_sl_tp("DOWN", entry, retest_extreme, line_here, atr_val)
+                    sl = levels["SL"]; L = leverage_for_loss(entry, sl)
+                    lev_note = f"Lev≈`{L:.2f}x` to risk ~{cfg.loss_pct_at_sl*100:.0f}% at SL"
+                    level_str = "\n".join([f"• {k}: `{v:.6f}`" for k, v in levels.items() if k != "SL"])
+                    msg = (
+                        f"*{sym.upper()} {cfg.interval}* — ✅ *Retest SHORT Entry*\n"
+                        f"• Entry: `{entry:.6f}` (retested lower line `{line_here:.6f}`)\n"
+                        f"• SL: `{sl:.6f}`  ({lev_note})\n"
+                        f"{level_str}"
+                    )
+                    print(msg.replace("*","").replace("`",""))
+                    await send_telegram(msg)
+                    st.pending = None
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Shutting down...")
