@@ -446,7 +446,7 @@ def compute_sl_tp(direction: str, entry_price: float, retest_extreme: float, lin
 # --------------------------- Main Loop --------------------------- #
 
 async def main():
-    print(f"Starting Multi-Symbol Triangle Breakout (5m) with Fake-breakout filters for: {', '.join([s.upper() for s in SYMBOLS])}")
+    send_telegram(f"Starting Multi-Symbol Triangle Breakout (5m) with Fake-breakout filters for: {', '.join([s.upper() for s in SYMBOLS])}")
     states: Dict[str, SymbolState] = {s: SymbolState(symbol=s) for s in SYMBOLS}
     await seed_all(states)
 
