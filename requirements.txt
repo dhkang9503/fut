@@ -1,3 +1,6 @@
 aiohttp
 websockets
 numpy
+pandas
+requests
+python-dateutil
