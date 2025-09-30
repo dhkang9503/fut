@@ -180,7 +180,7 @@ def tg_send(text: str):
 # 메인 루프
 # =========================
 def main_loop():
-    print("Starting live signal bot...")
+    tg_send("Starting live signal bot...")
     print("Symbols:", SYMBOLS)
     print("Alert SHORT:", ALERT_SHORT, " / LONG:", ALERT_LONG)
     last_alerted: Dict[Tuple[str, str], pd.Timestamp] = {}  # (symbol, side) -> last close_time we alerted on
@@ -257,7 +257,7 @@ def main_loop():
                     last_alerted[key] = last15
 
         except Exception as e:
-            print("[ERROR]", repr(e))
+            tg_send("[ERROR]", repr(e))
 
         # 폴링 간격 유지
         elapsed = time.time() - loop_start
