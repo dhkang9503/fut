@@ -1,6 +1,3 @@
-ccxt
-pandas
+aiohttp
+websockets
 numpy
-python-dotenv
-requests
-pytz
