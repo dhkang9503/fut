@@ -64,13 +64,12 @@ async def stream_kline_5m(on_bar_close: Callable[[Dict[str, Any]], Awaitable[Non
                 _last_pong_ts = _last_msg_ts
 
                 async def _pinger():
+                    global _last_pong_ts
                     while True:
                         await asyncio.sleep(PING_INTERVAL)
                         try:
                             pong_waiter = await ws.ping()  # native ping frame
                             await asyncio.wait_for(pong_waiter, timeout=PONG_TIMEOUT)
-                            # pong OK
-                            nonlocal _last_pong_ts
                             _last_pong_ts = time.time()
                         except asyncio.TimeoutError:
                             raise asyncio.TimeoutError("pong-timeout")
@@ -78,6 +77,7 @@ async def stream_kline_5m(on_bar_close: Callable[[Dict[str, Any]], Awaitable[Non
                             raise
 
                 async def _receiver():
+                    global _last_msg_ts, _last_pong_ts, _last_kline_ts
                     async for raw in ws:
                         _last_msg_ts = time.time()
                         if raw == "pong":
@@ -88,15 +88,12 @@ async def stream_kline_5m(on_bar_close: Callable[[Dict[str, Any]], Awaitable[Non
                         except Exception:
                             continue
 
-                        # Ignore non-data frames
                         if not isinstance(msg, dict):
                             continue
 
-                        # Candle/ticker multiplexer
                         data = msg.get("data")
                         channel = (msg.get("arg") or {}).get("channel", "")
 
-                        # Use ticker only as heartbeat; ignore its content
                         if channel == "ticker":
                             continue
 
@@ -121,10 +118,8 @@ async def stream_kline_5m(on_bar_close: Callable[[Dict[str, Any]], Awaitable[Non
                     while True:
                         await asyncio.sleep(5)
                         now = time.time()
-                        # if pong is overdue → reconnect
                         if (now - _last_pong_ts) > (PING_INTERVAL + PONG_TIMEOUT + 5):
                             raise asyncio.TimeoutError("pong-missed")
-                        # if overall quiet beyond STALE_SEC → soft reconnect
                         if (now - _last_msg_ts) > STALE_SEC:
                             raise asyncio.TimeoutError("stale-connection")
 
@@ -132,7 +127,6 @@ async def stream_kline_5m(on_bar_close: Callable[[Dict[str, Any]], Awaitable[Non
 
         except Exception as e:
             await notify(f"WS error, reconnecting: {e}")
-            # Exponential backoff with jitter
             delay = min(backoff, MAX_BACKOFF) * (1 + random.uniform(-0.1, 0.1))
             await asyncio.sleep(delay)
             backoff = min(backoff * 2, MAX_BACKOFF)
