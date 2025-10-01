@@ -427,7 +427,8 @@ async def main():
                f"• TFs: 5m(entry), 15m(filter), 1h(trend)\n"
                f"• Filters: 1h EMA200(slope+side), 15m EMA50↔EMA200, 5m ATR≥{cfg.atr_guard_ratio:.2f}×ATR200\n"
                f"• Patterns: triangles({', '.join(cfg.patterns_tri)}), box, double_top/bottom, head&shoulders")
-    print(start_msg); await telegram(start_msg)
+    print(start_msg)
+    await telegram(start_msg)
     if not cfg.telegram_bot_token or not cfg.telegram_chat_id:
         print("[WARN] Set TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID to receive Telegram messages.")
     states:Dict[str,SymbolState]={s:SymbolState() for s in SYMBOLS}
