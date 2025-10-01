@@ -1,25 +1,15 @@
-import asyncio, os, pandas as pd
+import asyncio
+from .ws_public import stream_kline_5m
 from .exec_engine import Engine
 from .storage import init_db
 from .telegram import notify
 
-async def fake_feed(engine:Engine):
-    path=os.getenv("BACKTEST_CSV","")
-    if not path:
-        await notify("Set BACKTEST_CSV to feed historical data into the bot for a dry run.")
-        return
-    df=pd.read_csv(path); df["time"]=pd.to_datetime(df["time"])
-    for _,r in df.iterrows():
-        bar=dict(time=int(r["time"].timestamp()), open=float(r["open"]), high=float(r["high"]), low=float(r["low"]), close=float(r["close"]), volume=float(r.get("volume",0)))
-        await engine.on_new_bar(bar)
-        await asyncio.sleep(0.01)
-
 async def main():
     await init_db()
     eng=Engine()
-    await notify("Bot starting.")
+    await notify("Bot starting (real-time WS).")
     try:
-        await fake_feed(eng)  # Replace with real WS listener for production
+        await stream_kline_5m(eng.on_bar_close)
     finally:
         await eng.close()
 
