@@ -448,6 +448,7 @@ async def main():
             if not atr_guard_ok(states,sym): continue
             _=process_all_patterns(sym,"5m",states[sym].tfs["5m"],allowed_dir=trend)
 if __name__=="__main__":
+    telegram("ping")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
