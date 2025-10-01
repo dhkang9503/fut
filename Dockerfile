@@ -9,6 +9,4 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN cd /app
-
-CMD ["python", "-m", "bot/main"]
+CMD ["python", "-m", "bot.main"]
