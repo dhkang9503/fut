@@ -32,7 +32,7 @@ class Config:
     atr_guard_ratio:float=0.7; ema_slope_eps:float=0.0001
     telegram_bot_token:str=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
     telegram_chat_id:str=os.getenv("TELEGRAM_CHAT_ID","").strip()
-    telegram_parse_mode:str="Markdown"
+    telegram_parse_mode:str=""
 cfg=Config()
 
 @dataclass
