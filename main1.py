@@ -122,7 +122,7 @@ def klines_to_df(kl: List[list]) -> pd.DataFrame:
 def last_closed_index(df: pd.DataFrame) -> pd.Timestamp:
     """마지막으로 '종가 확정'된 캔들의 close_time 인덱스 반환(UTC)"""
     # Binance는 진행 중 캔들도 반환하므로, 현재 시각보다 close_time이 지난 것만 '확정'
-    utcnow = pd.Timestamp.utcnow().tz_localize("UTC")
+    utcnow = pd.Timestamp.utcnow()
     closed = df.index[df.index <= utcnow]
     if len(closed) == 0:
         return None
@@ -257,7 +257,7 @@ def main_loop():
                     last_alerted[key] = last15
 
         except Exception as e:
-            tg_send("[ERROR]", repr(e))
+            tg_send(f"[ERROR] {repr(e)}")
 
         # 폴링 간격 유지
         elapsed = time.time() - loop_start
