@@ -55,4 +55,6 @@ jobs:
               -e BITGET_API_KEY=${{ secrets.BITGET_API_KEY }} \
               -e BITGET_API_SECRET=${{ secrets.BITGET_API_SECRET }} \
               -e BITGET_API_PASSWORD=${{ secrets.BITGET_API_PASSWORD }} \
+              -e MODE=paper \
+              -e SMBOL=BTCUSDT \
               fut-bot

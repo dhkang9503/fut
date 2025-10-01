@@ -2,12 +2,15 @@ import numpy as np, pandas as pd
 from .config import ATR_LEN, SWING_K
 
 def ema(s, span): return s.ewm(span=span, adjust=False).mean()
+
 def atr(high, low, close, n=14):
-    h_l=high-low; h_pc=(high-close.shift()).abs(); l_pc=(low-close.shift()).abs()
+    h_l=high-low
+    h_pc=(high-close.shift()).abs()
+    l_pc=(low-close.shift()).abs()
     tr=pd.concat([h_l,h_pc,l_pc],axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
-def swings(df,k=SWING_K):
+def swings(df, k=SWING_K):
     n=len(df); sh=np.zeros(n,dtype=bool); sl=np.zeros(n,dtype=bool)
     for i in range(n):
         lo=max(0,i-k); hi=min(n-1,i+k)
@@ -17,44 +20,46 @@ def swings(df,k=SWING_K):
 
 def detect_fvg_ob(df):
     n=len(df)
-    bull=np.zeros(n,dtype=bool); bear=np.zeros(n,dtype=bool)
-    fvl=np.full(n,np.nan); fvh=np.full(n,np.nan)
+    bull_fvg=np.zeros(n,dtype=bool); bear_fvg=np.zeros(n,dtype=bool)
+    fvg_low=np.full(n,np.nan); fvg_high=np.full(n,np.nan)
     for i in range(2,n):
         c1h=df.loc[i-2,"high"]; c1l=df.loc[i-2,"low"]
         c3h=df.loc[i,"high"];   c3l=df.loc[i,"low"]
-        if c1h<c3l: bull[i]=True; fvl[i]=c1h; fvh[i]=c3l
-        elif c1l>c3h: bear[i]=True; fvl[i]=c3h; fvh[i]=c1l
-    df["bull_fvg"]=bull; df["bear_fvg"]=bear; df["fvg_low"]=fvl; df["fvg_high"]=fvh
+        if c1h<c3l: bull_fvg[i]=True; fvg_low[i]=c1h; fvg_high[i]=c3l
+        elif c1l>c3h: bear_fvg[i]=True; fvg_low[i]=c3h; fvg_high[i]=c1l
+    df["bull_fvg"]=bull_fvg; df["bear_fvg"]=bear_fvg; df["fvg_low"]=fvg_low; df["fvg_high"]=fvg_high
     abfl=np.full(n,np.nan); abfh=np.full(n,np.nan); abel=np.full(n,np.nan); abeh=np.full(n,np.nan)
-    last_b=(np.nan,np.nan); last_s=(np.nan,np.nan)
+    last_bull=(np.nan,np.nan); last_bear=(np.nan,np.nan)
     for i in range(n):
-        if not np.isnan(last_b[0]) and (df.loc[i,"low"]<=last_b[0]) and (df.loc[i,"high"]>=last_b[1]): last_b=(np.nan,np.nan)
-        if not np.isnan(last_s[0]) and (df.loc[i,"low"]<=last_s[0]) and (df.loc[i,"high"]>=last_s[1]): last_s=(np.nan,np.nan)
-        if df.loc[i,"bull_fvg"]: last_b=(df.loc[i,"fvg_low"],df.loc[i,"fvg_high"])
-        if df.loc[i,"bear_fvg"]: last_s=(df.loc[i,"fvg_low"],df.loc[i,"fvg_high"])
-        abfl[i],abfh[i]=last_b; abel[i],abeh[i]=last_s
+        if not np.isnan(last_bull[0]) and (df.loc[i,"low"]<=last_bull[0]) and (df.loc[i,"high"]>=last_bull[1]): last_bull=(np.nan,np.nan)
+        if not np.isnan(last_bear[0]) and (df.loc[i,"low"]<=last_bear[0]) and (df.loc[i,"high"]>=last_bear[1]): last_bear=(np.nan,np.nan)
+        if df.loc[i,"bull_fvg"]: last_bull=(df.loc[i,"fvg_low"],df.loc[i,"fvg_high"])
+        if df.loc[i,"bear_fvg"]: last_bear=(df.loc[i,"fvg_low"],df.loc[i,"fvg_high"])
+        abfl[i],abfh[i]=last_bull; abel[i],abeh[i]=last_bear
     df["active_bull_fvg_low"]=abfl; df["active_bull_fvg_high"]=abfh
     df["active_bear_fvg_low"]=abel; df["active_bear_fvg_high"]=abeh
     df["bull_ob_low"]=np.nan; df["bull_ob_high"]=np.nan; df["bear_ob_low"]=np.nan; df["bear_ob_high"]=np.nan
-    look=6
+    lookback=6
     sh,sl=swings(df)
     df["swing_high"]=sh; df["swing_low"]=sl
-    lsh=np.full(n,np.nan); lsl=np.full(n,np.nan); curh=np.nan; curl=np.nan
+    last_sh=np.full(n,np.nan); last_sl=np.full(n,np.nan); cur_sh=np.nan; cur_sl=np.nan
     for i in range(n):
-        if sh[i]: curh=df.loc[i,"high"]
-        if sl[i]: curl=df.loc[i,"low"]
-        lsh[i]=curh; lsl[i]=curl
-    df["last_swing_high_val"]=lsh; df["last_swing_low_val"]=lsl
-    for i in range(max(20,look+5),n):
-        ph=df.loc[i-1,"last_swing_high_val"]; pl=df.loc[i-1,"last_swing_low_val"]
-        if np.isnan(ph) or np.isnan(pl): continue
+        if sh[i]: cur_sh=df.loc[i,"high"]
+        if sl[i]: cur_sl=df.loc[i,"low"]
+        last_sh[i]=cur_sh; last_sl[i]=cur_sl
+    df["last_swing_high_val"]=last_sh; df["last_swing_low_val"]=last_sl
+    for i in range(max(20,lookback+5),n):
+        prev_h=df.loc[i-1,"last_swing_high_val"]; prev_l=df.loc[i-1,"last_swing_low_val"]
+        if np.isnan(prev_h) or np.isnan(prev_l): continue
         body=abs(df.loc[i,"close"]-df.loc[i,"open"]); atrv=df.loc[i,"atr"]
-        if (df.loc[i,"high"]>ph) and (body>atrv):
-            w=df.loc[i-look:i-1]; red=w[w["close"]<w["open"]]
-            if len(red): c=red.tail(1).iloc[0]; df.loc[i,"bull_ob_low"]=c["low"]; df.loc[i,"bull_ob_high"]=c["high"]
-        if (df.loc[i,"low"]<pl) and (body>atrv):
-            w=df.loc[i-look:i-1]; green=w[w["close"]>w["open"]]
-            if len(green): c=green.tail(1).iloc[0]; df.loc[i,"bear_ob_low"]=c["low"]; df.loc[i,"bear_ob_high"]=c["high"]
+        if (df.loc[i,"high"]>prev_h) and (body>atrv):
+            w=df.loc[i-lookback:i-1]; last_red=w[w["close"]<w["open"]]
+            if len(last_red):
+                c=last_red.tail(1).iloc[0]; df.loc[i,"bull_ob_low"]=c["low"]; df.loc[i,"bull_ob_high"]=c["high"]
+        if (df.loc[i,"low"]<prev_l) and (body>atrv):
+            w=df.loc[i-lookback:i-1]; last_green=w[w["close"]>w["open"]]
+            if len(last_green):
+                c=last_green.tail(1).iloc[0]; df.loc[i,"bear_ob_low"]=c["low"]; df.loc[i,"bear_ob_high"]=c["high"]
     abobl=np.full(n,np.nan); abobh=np.full(n,np.nan); aeobl=np.full(n,np.nan); aeobh=np.full(n,np.nan)
     bull=(np.nan,np.nan); bear=(np.nan,np.nan)
     for i in range(n):
@@ -80,7 +85,6 @@ def prepare_ohlcv(df):
     df=detect_fvg_ob(df); return df
 
 def overlap(a_low,a_high,b_low,b_high):
-    import pandas as pd
     for x in (a_low,a_high,b_low,b_high):
         if pd.isna(x): return False
     return max(a_low,b_low) < min(a_high,b_high)
