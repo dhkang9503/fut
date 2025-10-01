@@ -1,7 +1,7 @@
 import asyncio, json, random, time, websockets
 from typing import Callable, Awaitable, Dict, Any
 from .config import WS_PUBLIC, SYMBOL, TIMEFRAME
-from .telegram import notify
+from .telegram import notify_ws
 
 # WS stability knobs
 PING_INTERVAL = 25         # seconds between native ping frames
@@ -59,7 +59,7 @@ async def stream_kline_5m(on_bar_close: Callable[[Dict[str, Any]], Awaitable[Non
                 WS_PUBLIC, ping_interval=None, ping_timeout=None, close_timeout=30
             ) as ws:
                 await ws.send(json.dumps(sub))
-                await notify("WS connected and subscribed (V2).")
+                await notify_ws("WS connected and subscribed (V2).")
                 _last_msg_ts = time.time()
                 _last_pong_ts = _last_msg_ts
 
@@ -126,7 +126,7 @@ async def stream_kline_5m(on_bar_close: Callable[[Dict[str, Any]], Awaitable[Non
                 await asyncio.gather(_pinger(), _receiver(), _stale_watch())
 
         except Exception as e:
-            await notify(f"WS error, reconnecting: {e}")
+            await notify_ws(f"WS error, reconnecting: {e}")
             delay = min(backoff, MAX_BACKOFF) * (1 + random.uniform(-0.1, 0.1))
             await asyncio.sleep(delay)
             backoff = min(backoff * 2, MAX_BACKOFF)

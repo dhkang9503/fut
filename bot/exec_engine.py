@@ -4,7 +4,7 @@ from .config import MODE, SYMBOL, RR, TIMEOUT_BARS, TRAIL_ATR_MULT, PT1_SHARE
 from .indicators import prepare_ohlcv
 from .strategy import generate_signal_row
 from .risk import position_size_and_leverage
-from .telegram import notify
+from .telegram import notify, notify_exit
 from .rest_client import BitgetREST
 
 class Engine:
@@ -23,7 +23,8 @@ class Engine:
     async def seed_bars(self, bars):
         if not bars: return
         self.df = pd.concat([self.df, pd.DataFrame(bars)], ignore_index=True)
-        await notify(f"Warm-up loaded {len(bars)} bars. Ready for real-time.")
+        from .telegram import notify_system
+        await notify_system(f"Warm-up loaded {len(bars)} bars. Ready for real-time.")
         self.last_processed_ts = int(bars[-1]["time"])
 
     async def on_bar_close(self, bar: dict):
@@ -51,7 +52,7 @@ class Engine:
             self.open_positions.append(pos)
         else:
             resp=await self.rest.place_market_order(side, qty, reduce_only=False)
-            await notify(f"[LIVE] Market order resp: {resp}")
+            await notify(f"[LIVE] Market order resp: {resp}", event="order")
 
     async def _paper_manage(self, df, i):
         cur=df.iloc[i]; hi=cur["high"]; lo=cur["low"]; atr=cur["atr"]
@@ -91,4 +92,4 @@ class Engine:
 
     async def _paper_close(self, idx, R):
         pos=self.open_positions[idx]; pnl=R*pos["risk$"]; self.equity += pnl
-        await notify(f"[PAPER] Exit {pos['side']} R={R:.2f} PnL=${pnl:.2f} Equity=${self.equity:.2f}")
+        await notify_exit(f"[PAPER] Exit {pos['side']} R={R:.2f} PnL=${pnl:.2f} Equity=${self.equity:.2f}")
