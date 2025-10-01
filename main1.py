@@ -419,7 +419,9 @@ def process_all_patterns(sym,tf,st,allowed_dir):
     res=process_head_shoulders(sym,tf,st,allowed_dir)
     if res: return res
     return None
+    
 async def main():
+    await telegram("ping")
     start_msg=("🚀 Top-Down Multi-Pattern Bot started\n"
                f"• Symbols: {', '.join([s.upper() for s in SYMBOLS])}\n"
                f"• TFs: 5m(entry), 15m(filter), 1h(trend)\n"
@@ -448,7 +450,6 @@ async def main():
             if not atr_guard_ok(states,sym): continue
             _=process_all_patterns(sym,"5m",states[sym].tfs["5m"],allowed_dir=trend)
 if __name__=="__main__":
-    await telegram("ping")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
