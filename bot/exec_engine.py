@@ -1,3 +1,4 @@
+import asyncio, time
 import pandas as pd
 from .config import MODE, SYMBOL, RR, TIMEOUT_BARS, TRAIL_ATR_MULT, PT1_SHARE
 from .indicators import prepare_ohlcv
@@ -8,36 +9,49 @@ from .rest_client import BitgetREST
 
 class Engine:
     def __init__(self):
-        self.df=pd.DataFrame(columns=["time","open","high","low","close","volume"]).astype({"time":"int64","open":"float64","high":"float64","low":"float64","close":"float64","volume":"float64"})
-        self.equity=1000.0 if MODE=="paper" else None
-        self.open_positions=[]
-        self.rest=BitgetREST()
+        self.df = pd.DataFrame(columns=["time","open","high","low","close","volume"]).astype({
+            "time":"int64","open":"float64","high":"float64","low":"float64","close":"float64","volume":"float64"
+        })
+        self.equity = 1000.0 if MODE=="paper" else None
+        self.open_positions = []
+        self.rest = BitgetREST()
+        self.last_processed_ts = 0
 
-    async def close(self): await self.rest.close()
+    async def close(self):
+        await self.rest.close()
 
-    async def on_bar_close(self, bar:dict):
-        self.df=pd.concat([self.df,pd.DataFrame([bar])], ignore_index=True)
-        if len(self.df)<120: return
-        df=prepare_ohlcv(self.df.copy())
-        i=len(df)-1
-        if MODE=="paper":
-            await self._paper_manage(df,i)
-        sig=generate_signal_row(df,i-1)
-        if sig:
-            await self._handle_signal(sig, df, i)
+    async def seed_bars(self, bars):
+        if not bars: return
+        self.df = pd.concat([self.df, pd.DataFrame(bars)], ignore_index=True)
+        await notify(f"Warm-up loaded {len(bars)} bars. Ready for real-time.")
+        self.last_processed_ts = int(bars[-1]["time"])
 
-    async def _handle_signal(self, sig, df, i):
+    async def on_bar_close(self, bar: dict):
+        ts = int(bar["time"]); now=int(time.time()); interval=300
+        if ts < now - 2*interval: return
+        if ts <= self.last_processed_ts: return
+        self.last_processed_ts = ts
+
+        self.df = pd.concat([self.df, pd.DataFrame([bar])], ignore_index=True)
+        if len(self.df) < 120: return
+        df = prepare_ohlcv(self.df.copy()); i=len(df)-1
+        if MODE=="paper": await self._paper_manage(df,i)
+        sig = generate_signal_row(df, i-1)
+        if sig: await self._handle_signal(sig, df, i, ts)
+
+    async def _handle_signal(self, sig, df, i, ts):
         side=sig["side"]; entry=sig["entry"]; stop=sig["stop"]; target=sig["target"]; pt1=sig["pt1"]
         qty, lev=position_size_and_leverage(SYMBOL, entry, stop, self.equity or 1000.0)
         risk_d=0.01*(self.equity if self.equity is not None else 1000.0)
-        await notify(f"[SIGNAL] {side} e={entry:.2f} sl={stop:.2f} 2R={target:.2f} pt1={pt1:.2f} qty={qty} lev={lev:.1f} risk=${risk_d:.2f}")
+        ts_str=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts))
+        await notify(f"[SIGNAL] {side} @{ts_str} e={entry:.2f} sl={stop:.2f} 2R={target:.2f} pt1={pt1:.2f} qty={qty} lev={lev:.1f} risk=${risk_d:.2f}")
         if MODE=="paper":
-            pos={"side":side,"entry":entry,"stop":stop,"pt1":pt1,"target":target,"qty":qty,"risk$":risk_d,"entry_index":i,"hit_pt1":False,"trail":entry,"timeout":TIMEOUT_BARS,"lockedR":0.0}
+            pos={"side":side,"entry":entry,"stop":stop,"pt1":pt1,"target":target,"qty":qty,"risk$":risk_d,
+                 "entry_index":i,"entry_time":ts,"hit_pt1":False,"trail":entry,"timeout":TIMEOUT_BARS,"lockedR":0.0}
             self.open_positions.append(pos)
         else:
             resp=await self.rest.place_market_order(side, qty, reduce_only=False)
             await notify(f"[LIVE] Market order resp: {resp}")
-            # TODO: place stop/pt1/2R plan orders & update trail periodically
 
     async def _paper_manage(self, df, i):
         cur=df.iloc[i]; hi=cur["high"]; lo=cur["low"]; atr=cur["atr"]
