@@ -21,11 +21,11 @@ class Engine:
         await self.rest.close()
 
     def _trim_df(self):
-    try:
-        if len(self.df) > MAX_BARS:
-            self.df = self.df.iloc[-MAX_BARS:].reset_index(drop=True)
-    except Exception:
-        pass
+        try:
+            if len(self.df) > MAX_BARS:
+                self.df = self.df.iloc[-MAX_BARS:].reset_index(drop=True)
+        except Exception:
+            pass
 
     async def seed_bars(self, bars):
         if not bars: return
