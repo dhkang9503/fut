@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-SYMBOL = os.getenv("SYMBOL","BTCUSDT")
+SYMBOL = os.getenv("SYMBOL","XRPUSDT")
 PRODUCT_TYPE = os.getenv("PRODUCT_TYPE","umcbl")
 TIMEFRAME = os.getenv("TIMEFRAME","5m")
 MODE = os.getenv("MODE","live")
@@ -34,7 +34,10 @@ ATR_LEN=14
 REST_BASE="https://api.bitget.com"
 WS_PUBLIC = "wss://ws.bitget.com/v2/ws/public"  # V2 public
 
-SYMBOL_INFO={"BTCUSDT":{"price_tick":0.1,"size_step":0.001,"min_size":0.001,"max_leverage":100}}
+SYMBOL_INFO={
+    "BTCUSDT":{"price_tick":0.1,"size_step":0.001,"min_size":0.001,"max_leverage":100},
+    "XRPUSDT":{"price_tick":0.0001,"size_step":1,"min_size":1,"max_leverage":50},
+}
 
 BACKFILL_BARS = int(os.getenv('BACKFILL_BARS', '240'))
 

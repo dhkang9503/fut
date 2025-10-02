@@ -45,6 +45,17 @@ async def _req(method: str, path: str, params: Optional[Dict[str, Any]]=None, bo
 def _round_step(x: float, step: float) -> float:
     return math.floor(x / step) * step
 
+async def fetch_equity(symbol: str, product_type: str, margin_coin: str = "USDT") -> float:
+    product = product_type.replace("umcbl","USDT-FUTURES").upper()
+    params = {"symbol": symbol.upper(), "productType": product, "marginCoin": margin_coin.upper()}
+    js = await _req("GET", "/api/v2/mix/account/account", params=params)
+    data = js.get("data") or {}
+    val = data.get("usdtEquity") or data.get("accountEquity") or 0
+    try:
+        return float(val)
+    except Exception:
+        return 0.0
+
 async def compute_qty_and_leverage(entry: float, stop: float, equity: float) -> Dict[str, Any]:
     info = SYMBOL_INFO.get(SYMBOL, {"size_step": 0.001, "min_size": 0.001, "max_leverage": 100})
     risk_amount = equity * RISK_PCT
@@ -65,15 +76,14 @@ async def ensure_leverage(lev: float, hold_side: Optional[str] = None):
     return await _req("POST", "/api/v2/mix/account/set-leverage", body=body)
 
 async def open_with_server_sl(side: str, qty: float, preset_sl: Optional[float] = None):
-    """Market entry with exchange-managed SL; no server TP (PT1/Trail are local)."""
     product = PRODUCT_TYPE.replace("umcbl","USDT-FUTURES").upper()
     body = {
         "symbol": SYMBOL,
         "productType": product,
-        "marginMode": MARGIN_MODE,
-        "marginCoin": MARGIN_COIN,
+        "marginMode": "isolated",
+        "marginCoin": "USDT",
         "orderType": "market",
-        "side": side,  # 'buy' or 'sell'
+        "side": side,
         "size": f"{qty:.10f}",
     }
     if preset_sl is not None:
@@ -86,10 +96,10 @@ async def reduce_only(side: str, qty: float):
     body = {
         "symbol": SYMBOL,
         "productType": product,
-        "marginMode": MARGIN_MODE,
-        "marginCoin": MARGIN_COIN,
+        "marginMode": "isolated",
+        "marginCoin": "USDT",
         "orderType": "market",
-        "side": side,  # opposite of entry for one-way
+        "side": side,
         "size": f"{qty:.10f}",
         "reduceOnly": "YES"
     }
@@ -97,5 +107,4 @@ async def reduce_only(side: str, qty: float):
     return await _req("POST", "/api/v2/mix/order/place-order", body=body)
 
 def close_side_for(signal_side: str) -> str:
-    # signal_side: "LONG"/"SHORT"
     return "sell" if signal_side == "LONG" else "buy"
