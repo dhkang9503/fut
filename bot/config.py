@@ -5,7 +5,7 @@ load_dotenv()
 SYMBOL = os.getenv("SYMBOL","BTCUSDT")
 PRODUCT_TYPE = os.getenv("PRODUCT_TYPE","umcbl")
 TIMEFRAME = os.getenv("TIMEFRAME","5m")
-MODE = os.getenv("MODE","paper")
+MODE = os.getenv("MODE","live")
 
 BITGET_API_KEY=os.getenv("BITGET_API_KEY","")
 BITGET_API_SECRET=os.getenv("BITGET_API_SECRET","")
