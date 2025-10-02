@@ -1,6 +1,6 @@
 import asyncio, time
 import pandas as pd
-from .config import MODE, SYMBOL, RR, TIMEOUT_BARS, TRAIL_ATR_MULT, PT1_SHARE
+from .config import MODE, SYMBOL, RR, TIMEOUT_BARS, TRAIL_ATR_MULT, PT1_SHARE, MAX_BARS
 from .indicators import prepare_ohlcv
 from .strategy import generate_signal_row
 from .risk import position_size_and_leverage
@@ -20,6 +20,13 @@ class Engine:
     async def close(self):
         await self.rest.close()
 
+    def _trim_df(self):
+    try:
+        if len(self.df) > MAX_BARS:
+            self.df = self.df.iloc[-MAX_BARS:].reset_index(drop=True)
+    except Exception:
+        pass
+
     async def seed_bars(self, bars):
         if not bars: return
         self.df = pd.concat([self.df, pd.DataFrame(bars)], ignore_index=True)
@@ -34,6 +41,7 @@ class Engine:
         self.last_processed_ts = ts
 
         self.df = pd.concat([self.df, pd.DataFrame([bar])], ignore_index=True)
+        self._trim_df()
         if len(self.df) < 120: return
         df = prepare_ohlcv(self.df.copy()); i=len(df)-1
         if MODE=="paper": await self._paper_manage(df,i)
