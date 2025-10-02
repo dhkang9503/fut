@@ -67,7 +67,7 @@ async def compute_qty_and_leverage(entry: float, stop: float, equity: float) -> 
     notional = entry * qty
     alloc = max(1e-9, equity * MARGIN_PCT)
     lev = min(max(1.0, notional / alloc), info.get("max_leverage", 100))
-    return {"qty": qty, "lev": lev}
+    return {"qty": qty, "lev": int(lev)}
 
 async def ensure_leverage(lev: float, hold_side: Optional[str] = None):
     product = PRODUCT_TYPE.replace("umcbl","USDT-FUTURES").upper()
@@ -108,3 +108,25 @@ async def reduce_only(side: str, qty: float):
 
 def close_side_for(signal_side: str) -> str:
     return "sell" if signal_side == "LONG" else "buy"
+
+async def place_be_stop_loss(signal_side: str, entry_price: float, qty_for_sl: float):
+    """
+    Register a server-side Stop-Loss plan at the entry (break-even) price.
+    Uses: POST /api/v2/mix/order/place-tpsl-order (planType='loss_plan').
+    If exchange rejects due to existing preset SL, caller should rely on local BE as fallback.
+    """
+    product = PRODUCT_TYPE.replace("umcbl","USDT-FUTURES").upper()
+    hold = "long" if signal_side == "LONG" else "short"
+    body = {
+        "symbol": SYMBOL,
+        "productType": product,
+        "marginCoin": MARGIN_COIN,
+        "planType": "loss_plan",
+        "triggerPrice": f"{entry_price}",
+        "triggerType": "mark_price",
+        "holdSide": hold,
+        "size": f"{qty_for_sl:.10f}",
+        "executePrice": "0"  # market
+    }
+    body["clientOid"] = f"beSL#{int(time.time()*1000)}"
+    return await _req("POST", "/api/v2/mix/order/place-tpsl-order", body=body)

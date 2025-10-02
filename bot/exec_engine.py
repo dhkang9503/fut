@@ -39,7 +39,8 @@ class Engine:
         if (not force) and (now - self._last_equity_fetch_ts < EQUITY_REFRESH_SEC):
             return
         try:
-            eq = await live_broker.fetch_equity(SYMBOL, PRODUCT_TYPE, margin_coin="USDT")
+            # You'll need fetch_equity() present in live_broker used by your project
+            eq = await live_broker.fetch_equity(SYMBOL, PRODUCT_TYPE, margin_coin="USDT")  # noqa
             if eq and eq > 0:
                 self.equity = eq
                 await notify_system(f"[LIVE] equity updated: ${eq:.2f}")
@@ -67,8 +68,10 @@ class Engine:
         if len(self.df) < 120: return
         df = prepare_ohlcv(self.df.copy()); i=len(df)-1
 
-        # Always manage positions
         await self._manage_positions(df, i)
+
+        if any(p.get("qty_rem", 0) > 0 for p in self.open_positions):
+            return  # 이미 포지션 보유 → 새 진입 스킵
 
         sig = generate_signal_row(df, i-1)
         if sig:
@@ -91,7 +94,7 @@ class Engine:
             equity_used = self.equity or 1000.0
             sizing = await live_broker.compute_qty_and_leverage(entry, stop, equity_used)
             qty = sizing["qty"]; lev = sizing["lev"]
-            await notify(f"[SIGNAL] {side} @{ts_str} e={entry:.2f} sl={stop:.2f} 2R={target:.2f} pt1={pt1:.2f} qty={qty} lev=x{lev:.1f} eq=${equity_used:.2f}")
+            await notify(f"[SIGNAL] {side} @{ts_str} e={entry:.2f} sl={stop:.2f} 2R={target:.2f} pt1={pt1:.2f} qty={qty} lev={lev:.1f} eq=${equity_used:.2f}")
             if qty <= 0:
                 await notify_system("[LIVE] sizing produced qty<=0; skip")
                 return
@@ -108,6 +111,7 @@ class Engine:
         to_close=[]
         for idx,pos in enumerate(self.open_positions):
             life=i-pos["entry_index"]
+            # Timeout
             if life>pos["timeout"]:
                 if pos.get("live"):
                     if pos["qty_rem"]>0:
@@ -118,21 +122,34 @@ class Engine:
                     r=self._r_from_close(pos, cur["close"]); await self._paper_close(idx,r); to_close.append(idx); continue
 
             if pos["side"]=="LONG":
+                # Server SL assumed for LIVE
                 if lo<=pos["stop"]:
                     if pos.get("live"):
                         to_close.append(idx); continue
                     else:
                         r=-1.0 if not pos["hit_pt1"] else -0.5; await self._paper_close(idx,r); to_close.append(idx); continue
 
+                # PT1: partial reduce + BE upgrade (local & server)
                 if (not pos["hit_pt1"]) and hi>=pos["pt1"]:
                     if pos.get("live"):
                         qty_pt1 = pos["qty_total"]*PT1_SHARE
                         if qty_pt1>0:
                             await live_broker.reduce_only(live_broker.close_side_for("LONG"), qty_pt1)
                             pos["qty_rem"] = max(0.0, pos["qty_rem"] - qty_pt1)
-                    pos["hit_pt1"]=True; pos["lockedR"] += PT1_SHARE*1.0; pos["trail"]=max(pos["trail"], cur["close"]-TRAIL_ATR_MULT*atr)
+                        # --- upgrade SL to BE on server ---
+                        try:
+                            await live_broker.place_be_stop_loss("LONG", pos["entry"], pos["qty_rem"])
+                            await notify_system("[LIVE] server SL moved to BE")
+                        except Exception as e:
+                            await notify_system(f"[LIVE] server BE SL failed: {e}")
+                    # local BE protection
+                    pos["stop"] = pos["entry"]
+                    pos["hit_pt1"]=True; pos["lockedR"] += PT1_SHARE*1.0
+                    # clamp trail not below BE
+                    pos["trail"]=max(max(pos["trail"], cur["close"]-TRAIL_ATR_MULT*atr), pos["entry"])
 
                 if pos["hit_pt1"]:
+                    # trail hit
                     if lo<=pos["trail"]:
                         if pos.get("live"):
                             if pos["qty_rem"]>0:
@@ -140,6 +157,7 @@ class Engine:
                             to_close.append(idx); continue
                         else:
                             r=pos["lockedR"]; await self._paper_close(idx,r); to_close.append(idx); continue
+                    # 2R
                     if hi>=pos["target"]:
                         if pos.get("live"):
                             if pos["qty_rem"]>0:
@@ -147,9 +165,10 @@ class Engine:
                             to_close.append(idx); continue
                         else:
                             r=pos["lockedR"]+PT1_SHARE*RR; await self._paper_close(idx,r); to_close.append(idx); continue
-                    pos["trail"]=max(pos["trail"], cur["close"]-TRAIL_ATR_MULT*atr)
+                    # trail update (respect BE)
+                    pos["trail"]=max(max(pos["trail"], cur["close"]-TRAIL_ATR_MULT*atr), pos["entry"])
 
-            else:
+            else:  # SHORT
                 if hi>=pos["stop"]:
                     if pos.get("live"):
                         to_close.append(idx); continue
@@ -162,7 +181,16 @@ class Engine:
                         if qty_pt1>0:
                             await live_broker.reduce_only(live_broker.close_side_for("SHORT"), qty_pt1)
                             pos["qty_rem"] = max(0.0, pos["qty_rem"] - qty_pt1)
-                    pos["hit_pt1"]=True; pos["lockedR"] += PT1_SHARE*1.0; pos["trail"]=min(pos["trail"], cur["close"]+TRAIL_ATR_MULT*atr)
+                        try:
+                            await live_broker.place_be_stop_loss("SHORT", pos["entry"], pos["qty_rem"])
+                            await notify_system("[LIVE] server SL moved to BE")
+                        except Exception as e:
+                            await notify_system(f"[LIVE] server BE SL failed: {e}")
+                    # local BE
+                    pos["stop"] = pos["entry"]
+                    pos["hit_pt1"]=True; pos["lockedR"] += PT1_SHARE*1.0
+                    # clamp trail not above BE
+                    pos["trail"]=min(min(pos["trail"], cur["close"]+TRAIL_ATR_MULT*atr), pos["entry"])
 
                 if pos["hit_pt1"]:
                     if hi>=pos["trail"]:
@@ -179,7 +207,8 @@ class Engine:
                             to_close.append(idx); continue
                         else:
                             r=pos["lockedR"]+PT1_SHARE*RR; await self._paper_close(idx,r); to_close.append(idx); continue
-                    pos["trail"]=min(pos["trail"], cur["close"]+TRAIL_ATR_MULT*atr)
+                    # trail update (respect BE)
+                    pos["trail"]=min(min(pos["trail"], cur["close"]+TRAIL_ATR_MULT*atr), pos["entry"])
 
         for j in sorted(to_close, reverse=True):
             self.open_positions.pop(j)
