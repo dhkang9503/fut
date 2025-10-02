@@ -6,6 +6,9 @@ from .telegram import notify_system
 from .config import SYMBOL, BACKFILL_BARS
 from .bootstrap import warmup_engine
 
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
 async def main():
     await init_db()
     eng = Engine()
