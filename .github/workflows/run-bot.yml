@@ -1,4 +1,4 @@
-name: Run OKX Trading Bot
+name: Run Bitget Trading Bot
 
 on:
   push:
