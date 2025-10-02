@@ -12,9 +12,11 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 async def main():
     await init_db()
     eng = Engine()
+    print("Bot starting (real-time WS).")
     await notify_system("Bot starting (real-time WS).")
     try:
         loaded = await warmup_engine(eng, SYMBOL, BACKFILL_BARS)
+        print(f"Warm-up complete: {loaded} bars preloaded.")
         await notify_system(f"Warm-up complete: {loaded} bars preloaded.")
     except Exception as e:
         await notify_system(f"Warm-up fetch failed (continuing without it): {e}")
