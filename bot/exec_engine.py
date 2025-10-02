@@ -6,6 +6,7 @@ from .strategy import generate_signal_row
 from .risk import position_size_and_leverage
 from .telegram import notify, notify_exit
 from .rest_client import BitgetREST
+from . import live_broker
 
 class Engine:
     def __init__(self):
@@ -59,8 +60,16 @@ class Engine:
                  "entry_index":i,"entry_time":ts,"hit_pt1":False,"trail":entry,"timeout":TIMEOUT_BARS,"lockedR":0.0}
             self.open_positions.append(pos)
         else:
-            resp=await self.rest.place_market_order(side, qty, reduce_only=False)
+            # Compute qty/lev (same as paper sizing) and enter with server-side SL
+            sizing = await live_broker.compute_qty_and_leverage(entry, stop, (self.equity or 1000.0))
+            if sizing["qty"] <= 0:
+                return
+            await live_broker.ensure_leverage(sizing["lev"], hold_side=("long" if side=="LONG" else "short"))
+            resp = await live_broker.open_with_server_sl(("buy" if side=="LONG" else "sell"), sizing["qty"], preset_sl=stop)
             await notify(f"[LIVE] Market order resp: {resp}", event="order")
+            pos={"side":side,"entry":entry,"stop":stop,"pt1":pt1,"target":target,"qty":sizing["qty"],
+                 "entry_index":i,"entry_time":ts,"hit_pt1":False,"trail":entry,"timeout":TIMEOUT_BARS,"lockedR":0.0,"live":True}
+            self.open_positions.append(pos)
 
     async def _paper_manage(self, df, i):
         cur=df.iloc[i]; hi=cur["high"]; lo=cur["low"]; atr=cur["atr"]
@@ -71,24 +80,50 @@ class Engine:
                 r=self._r_from_close(pos, cur["close"]); await self._paper_close(idx,r); to_close.append(idx); continue
             if pos["side"]=="LONG":
                 if lo<=pos["stop"]:
+                    if pos.get("live"):
+                        to_close.append(idx); continue
                     r=-1.0 if not pos["hit_pt1"] else -0.5; await self._paper_close(idx,r); to_close.append(idx); continue
                 if (not pos["hit_pt1"]) and hi>=pos["pt1"]:
+                    if pos.get("live"):
+                        qty_pt1 = pos["qty"]*PT1_SHARE
+                        await live_broker.reduce_only(live_broker.close_side_for("LONG"), qty_pt1)
                     pos["hit_pt1"]=True; pos["lockedR"] += PT1_SHARE*1.0; pos["trail"]=max(pos["trail"], cur["close"]-TRAIL_ATR_MULT*atr)
                 if pos["hit_pt1"]:
                     if lo<=pos["trail"]:
+                        if pos.get("live"):
+                            qty_rem = pos["qty"]*(1-PT1_SHARE) if pos["hit_pt1"] else pos["qty"]
+                            await live_broker.reduce_only(live_broker.close_side_for("LONG"), qty_rem)
+                            to_close.append(idx); continue
                         r=pos["lockedR"]; await self._paper_close(idx,r); to_close.append(idx); continue
                     if hi>=pos["target"]:
+                        if pos.get("live"):
+                            qty_rem = pos["qty"]*(1-PT1_SHARE) if pos["hit_pt1"] else pos["qty"]
+                            await live_broker.reduce_only(live_broker.close_side_for("LONG"), qty_rem)
+                            to_close.append(idx); continue
                         r=pos["lockedR"]+PT1_SHARE*RR; await self._paper_close(idx,r); to_close.append(idx); continue
                     pos["trail"]=max(pos["trail"], cur["close"]-TRAIL_ATR_MULT*atr)
             else:
                 if hi>=pos["stop"]:
+                    if pos.get("live"):
+                        to_close.append(idx); continue
                     r=-1.0 if not pos["hit_pt1"] else -0.5; await self._paper_close(idx,r); to_close.append(idx); continue
                 if (not pos["hit_pt1"]) and lo<=pos["pt1"]:
+                    if pos.get("live"):
+                        qty_pt1 = pos["qty"]*PT1_SHARE
+                        await live_broker.reduce_only(live_broker.close_side_for("SHORT"), qty_pt1)
                     pos["hit_pt1"]=True; pos["lockedR"] += PT1_SHARE*1.0; pos["trail"]=min(pos["trail"], cur["close"]+TRAIL_ATR_MULT*atr)
                 if pos["hit_pt1"]:
                     if hi>=pos["trail"]:
+                        if pos.get("live"):
+                            qty_rem = pos["qty"]*(1-PT1_SHARE) if pos["hit_pt1"] else pos["qty"]
+                            await live_broker.reduce_only(live_broker.close_side_for("SHORT"), qty_rem)
+                            to_close.append(idx); continue
                         r=pos["lockedR"]; await self._paper_close(idx,r); to_close.append(idx); continue
                     if lo<=pos["target"]:
+                        if pos.get("live"):
+                            qty_rem = pos["qty"]*(1-PT1_SHARE) if pos["hit_pt1"] else pos["qty"]
+                            await live_broker.reduce_only(live_broker.close_side_for("SHORT"), qty_rem)
+                            to_close.append(idx); continue
                         r=pos["lockedR"]+PT1_SHARE*RR; await self._paper_close(idx,r); to_close.append(idx); continue
                     pos["trail"]=min(pos["trail"], cur["close"]+TRAIL_ATR_MULT*atr)
         for j in sorted(to_close, reverse=True):
