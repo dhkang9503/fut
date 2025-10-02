@@ -37,3 +37,6 @@ WS_PUBLIC = "wss://ws.bitget.com/v2/ws/public"  # V2 public
 SYMBOL_INFO={"BTCUSDT":{"price_tick":0.1,"size_step":0.001,"min_size":0.001,"max_leverage":100}}
 
 BACKFILL_BARS = int(os.getenv('BACKFILL_BARS', '240'))
+
+# Keep only the most recent N bars in memory
+MAX_BARS = int(os.getenv('MAX_BARS', '1200'))
