@@ -13,5 +13,5 @@ def position_size_and_leverage(symbol, entry, stop, equity):
     qty = max(qty, meta["min_size"])
     qty = round_to_step(qty, meta["size_step"])
     notional = entry*qty
-    lev = min(notional/max(1e-8,margin_alloc), meta["max_leverage"])
+    lev = min(int(notional/max(1e-8,margin_alloc)), meta["max_leverage"])
     return qty, lev

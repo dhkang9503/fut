@@ -91,7 +91,7 @@ class Engine:
             equity_used = self.equity or 1000.0
             sizing = await live_broker.compute_qty_and_leverage(entry, stop, equity_used)
             qty = sizing["qty"]; lev = sizing["lev"]
-            await notify(f"[SIGNAL] {side} @{ts_str} e={entry:.2f} sl={stop:.2f} 2R={target:.2f} pt1={pt1:.2f} qty={qty} lev={lev:.1f} eq=${equity_used:.2f}")
+            await notify(f"[SIGNAL] {side} @{ts_str} e={entry:.2f} sl={stop:.2f} 2R={target:.2f} pt1={pt1:.2f} qty={qty} lev=x{lev:.1f} eq=${equity_used:.2f}")
             if qty <= 0:
                 await notify_system("[LIVE] sizing produced qty<=0; skip")
                 return
