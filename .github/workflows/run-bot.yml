@@ -40,13 +40,13 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           script: |
-            curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/deleteWebhook"
-            cd ~/fut-bot
-            docker stop fut-bot
-            docker rm fut-bot
-            docker system prune -a -f
-            docker build -t fut-bot .
-            docker run --name fut-bot\
+            curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/deleteWebhook";
+            cd ~/fut-bot;
+            docker stop fut-bot || true;
+            docker rm fut-bot || true;
+            docker system prune -a -f || true;
+            docker build -t fut-bot .;
+            docker run -d --name fut-bot \
               -e OKX_API_KEY=${{ secrets.OKX_API_KEY }} \
               -e OKX_API_SECRET=${{ secrets.OKX_API_SECRET }} \
               -e OKX_API_PASSPHRASE=${{ secrets.OKX_API_PASSPHRASE }} \
