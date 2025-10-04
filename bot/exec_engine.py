@@ -5,11 +5,27 @@ try:
     from .config import EQUITY_REFRESH_SEC
 except Exception:
     EQUITY_REFRESH_SEC = 10
+try:
+    from .config import DIAG_MODE
+except Exception:
+    DIAG_MODE = True
+try:
+    from .config import DIAG_BAR_SUMMARY_EVERY
+except Exception:
+    DIAG_BAR_SUMMARY_EVERY = 12
+try:
+    from .config import DIAG_SIGNAL_LOG
+except Exception:
+    DIAG_SIGNAL_LOG = True
+try:
+    from .config import DIAG_SKIP_LOG
+except Exception:
+    DIAG_SKIP_LOG = True
 
 from .indicators import prepare_ohlcv
 from .strategy import generate_signal_row
 from .risk import position_size_and_leverage
-from .telegram import notify, notify_exit, notify_system, notify_order
+from .telegram import notify, notify_exit, notify_system
 from . import live_broker
 
 class Engine:
@@ -21,6 +37,12 @@ class Engine:
         self._last_equity_fetch_ts = 0
         self.open_positions = []
         self.last_processed_ts = 0
+
+        self._diag_bars = 0
+        self._diag_signals = 0
+        self._diag_entries = 0
+        self._diag_last_summary_ts = 0
+        self._diag_warned_warmup = False
 
     async def close(self):
         pass
@@ -39,16 +61,18 @@ class Engine:
         if (not force) and (now - self._last_equity_fetch_ts < EQUITY_REFRESH_SEC):
             return
         try:
-            # You'll need fetch_equity() present in live_broker used by your project
-            eq = await live_broker.fetch_equity(SYMBOL, PRODUCT_TYPE, margin_coin="USDT")  # noqa
+            eq = await live_broker.fetch_equity(SYMBOL, PRODUCT_TYPE, margin_coin="USDT")
             if eq and eq > 0:
                 self.equity = eq
-                await notify_system(f"[LIVE] equity updated: ${eq:.2f}")
+                if DIAG_MODE:
+                    await notify_system(f"[DIAG] equity updated: ${eq:.2f}")
             else:
-                await notify_system(f"[LIVE] equity fetch returned 0; keeping cache {self.equity}")
+                if DIAG_MODE and DIAG_SKIP_LOG:
+                    await notify_system(f"[DIAG] equity fetch 0; keep cache {self.equity}")
             self._last_equity_fetch_ts = now
         except Exception as e:
-            await notify_system(f"[LIVE] equity fetch failed: {e}; cache={self.equity}")
+            if DIAG_MODE and DIAG_SKIP_LOG:
+                await notify_system(f"[DIAG] equity fetch failed: {e}; cache={self.equity}")
 
     async def seed_bars(self, bars):
         if not bars: return
@@ -59,23 +83,39 @@ class Engine:
 
     async def on_bar_close(self, bar: dict):
         ts = int(bar["time"]); now=int(time.time()); interval=300
-        if ts < now - 2*interval: return
-        if ts <= self.last_processed_ts: return
+        if ts < now - 2*interval:
+            if DIAG_MODE and DIAG_SKIP_LOG:
+                await notify_system(f"[DIAG] stale bar skipped ts={ts}, now={now}")
+            return
+        if ts <= self.last_processed_ts:
+            return
         self.last_processed_ts = ts
 
         self.df = pd.concat([self.df, pd.DataFrame([bar])], ignore_index=True)
         self._trim_df()
-        if len(self.df) < 120: return
+        self._diag_bars += 1
+
+        if len(self.df) < 120:
+            if DIAG_MODE and not self._diag_warned_warmup:
+                await notify_system(f"[DIAG] warm-up in progress: df_len={len(self.df)}/120")
+                self._diag_warned_warmup = True
+            return
+
         df = prepare_ohlcv(self.df.copy()); i=len(df)-1
 
         await self._manage_positions(df, i)
 
-        if any(p.get("qty_rem", 0) > 0 for p in self.open_positions):
-            return  # 이미 포지션 보유 → 새 진입 스킵
-
         sig = generate_signal_row(df, i-1)
-        if sig:
+        if sig is None:
+            if DIAG_MODE and DIAG_SIGNAL_LOG:
+                await notify_system(f"[DIAG] no-signal on ts={ts}")
+        else:
+            self._diag_signals += 1
             await self._handle_signal(sig, df, i, ts)
+
+        if DIAG_MODE and DIAG_BAR_SUMMARY_EVERY>0 and (self._diag_bars % DIAG_BAR_SUMMARY_EVERY == 0):
+            c = df.iloc[-1]["close"]
+            await notify_system(f"[DIAG] summary bars={self._diag_bars} signals={self._diag_signals} entries={self._diag_entries} open_pos={len(self.open_positions)} last_price={c:.6f} mode={MODE} symbol={SYMBOL}")
 
     async def _handle_signal(self, sig, df, i, ts):
         side=sig["side"]; entry=sig["entry"]; stop=sig["stop"]; target=sig["target"]; pt1=sig["pt1"]
@@ -84,91 +124,82 @@ class Engine:
         if MODE=="paper":
             qty, lev=position_size_and_leverage(SYMBOL, entry, stop, self.equity or 1000.0)
             risk_d=0.01*(self.equity if self.equity is not None else 1000.0)
-            await notify(f"[SIGNAL] {side} @{ts_str} e={entry:.2f} sl={stop:.2f} 2R={target:.2f} pt1={pt1:.2f} qty={qty} lev={lev:.1f} risk=${risk_d:.2f}")
+            await notify(f"[SIGNAL] {side} @{ts_str} e={entry:.6f} sl={stop:.6f} 2R={target:.6f} pt1={pt1:.6f} qty={qty} lev={lev:.1f} risk=${risk_d:.2f}")
             pos={"side":side,"entry":entry,"stop":stop,"pt1":pt1,"target":target,
                  "qty_total":qty,"qty_rem":qty,"entry_index":i,"entry_time":ts,
                  "hit_pt1":False,"trail":entry,"timeout":TIMEOUT_BARS,"lockedR":0.0,"live":False}
             self.open_positions.append(pos)
+            self._diag_entries += 1
         else:
             await self._refresh_equity(force=True)
             equity_used = self.equity or 1000.0
             sizing = await live_broker.compute_qty_and_leverage(entry, stop, equity_used)
             qty = sizing["qty"]; lev = sizing["lev"]
-            await notify(f"[SIGNAL] {side} @{ts_str} e={entry:.2f} sl={stop:.2f} 2R={target:.2f} pt1={pt1:.2f} qty={qty} lev={lev:.1f} eq=${equity_used:.2f}")
             if qty <= 0:
-                await notify_system("[LIVE] sizing produced qty<=0; skip")
+                if DIAG_MODE and DIAG_SKIP_LOG:
+                    await notify_system(f"[DIAG] skip entry (qty<=0) @ts={ts} entry={entry} stop={stop} eq=${equity_used:.2f}")
                 return
             await live_broker.ensure_leverage(lev, hold_side=("long" if side=="LONG" else "short"))
             resp = await live_broker.open_with_server_sl(("buy" if side=="LONG" else "sell"), qty, preset_sl=stop)
+            await notify(f"[SIGNAL] {side} @{ts_str} e={entry:.6f} sl={stop:.6f} 2R={target:.6f} pt1={pt1:.6f} qty={qty} lev={lev:.1f} eq=${equity_used:.2f}")
             await notify(f"[LIVE] Market order resp: {resp}", event="order")
             pos={"side":side,"entry":entry,"stop":stop,"pt1":pt1,"target":target,
                  "qty_total":qty,"qty_rem":qty,"entry_index":i,"entry_time":ts,
                  "hit_pt1":False,"trail":entry,"timeout":TIMEOUT_BARS,"lockedR":0.0,"live":True}
             self.open_positions.append(pos)
+            self._diag_entries += 1
 
     async def _manage_positions(self, df: pd.DataFrame, i: int):
         cur=df.iloc[i]; hi=cur["high"]; lo=cur["low"]; atr=cur["atr"]
         to_close=[]
         for idx,pos in enumerate(self.open_positions):
             life=i-pos["entry_index"]
-            # Timeout
             if life>pos["timeout"]:
                 if pos.get("live"):
+                    from . import live_broker as lb
                     if pos["qty_rem"]>0:
-                        side_close = live_broker.close_side_for(pos["side"])
-                        await live_broker.reduce_only(side_close, pos["qty_rem"])
+                        side_close = lb.close_side_for(pos["side"])
+                        await lb.reduce_only(side_close, pos["qty_rem"])
                     to_close.append(idx); continue
                 else:
                     r=self._r_from_close(pos, cur["close"]); await self._paper_close(idx,r); to_close.append(idx); continue
 
             if pos["side"]=="LONG":
-                # Server SL assumed for LIVE
                 if lo<=pos["stop"]:
                     if pos.get("live"):
                         to_close.append(idx); continue
                     else:
                         r=-1.0 if not pos["hit_pt1"] else -0.5; await self._paper_close(idx,r); to_close.append(idx); continue
 
-                # PT1: partial reduce + BE upgrade (local & server)
                 if (not pos["hit_pt1"]) and hi>=pos["pt1"]:
                     if pos.get("live"):
+                        from . import live_broker as lb
                         qty_pt1 = pos["qty_total"]*PT1_SHARE
                         if qty_pt1>0:
-                            await live_broker.reduce_only(live_broker.close_side_for("LONG"), qty_pt1)
+                            await lb.reduce_only(lb.close_side_for("LONG"), qty_pt1)
                             pos["qty_rem"] = max(0.0, pos["qty_rem"] - qty_pt1)
-                        # --- upgrade SL to BE on server ---
-                        try:
-                            await live_broker.place_be_stop_loss("LONG", pos["entry"], pos["qty_rem"])
-                            await notify_system("[LIVE] server SL moved to BE")
-                        except Exception as e:
-                            await notify_system(f"[LIVE] server BE SL failed: {e}")
-                    # local BE protection
-                    pos["stop"] = pos["entry"]
-                    pos["hit_pt1"]=True; pos["lockedR"] += PT1_SHARE*1.0
-                    # clamp trail not below BE
-                    pos["trail"]=max(max(pos["trail"], cur["close"]-TRAIL_ATR_MULT*atr), pos["entry"])
+                    pos["hit_pt1"]=True; pos["lockedR"] += PT1_SHARE*1.0; pos["trail"]=max(pos["trail"], cur["close"]-TRAIL_ATR_MULT*atr)
 
                 if pos["hit_pt1"]:
-                    # trail hit
                     if lo<=pos["trail"]:
                         if pos.get("live"):
+                            from . import live_broker as lb
                             if pos["qty_rem"]>0:
-                                await live_broker.reduce_only(live_broker.close_side_for("LONG"), pos["qty_rem"])
+                                await lb.reduce_only(lb.close_side_for("LONG"), pos["qty_rem"])
                             to_close.append(idx); continue
                         else:
                             r=pos["lockedR"]; await self._paper_close(idx,r); to_close.append(idx); continue
-                    # 2R
                     if hi>=pos["target"]:
                         if pos.get("live"):
+                            from . import live_broker as lb
                             if pos["qty_rem"]>0:
-                                await live_broker.reduce_only(live_broker.close_side_for("LONG"), pos["qty_rem"])
+                                await lb.reduce_only(lb.close_side_for("LONG"), pos["qty_rem"])
                             to_close.append(idx); continue
                         else:
                             r=pos["lockedR"]+PT1_SHARE*RR; await self._paper_close(idx,r); to_close.append(idx); continue
-                    # trail update (respect BE)
-                    pos["trail"]=max(max(pos["trail"], cur["close"]-TRAIL_ATR_MULT*atr), pos["entry"])
+                    pos["trail"]=max(pos["trail"], cur["close"]-TRAIL_ATR_MULT*atr)
 
-            else:  # SHORT
+            else:
                 if hi>=pos["stop"]:
                     if pos.get("live"):
                         to_close.append(idx); continue
@@ -177,45 +208,38 @@ class Engine:
 
                 if (not pos["hit_pt1"]) and lo<=pos["pt1"]:
                     if pos.get("live"):
+                        from . import live_broker as lb
                         qty_pt1 = pos["qty_total"]*PT1_SHARE
                         if qty_pt1>0:
-                            await live_broker.reduce_only(live_broker.close_side_for("SHORT"), qty_pt1)
+                            await lb.reduce_only(lb.close_side_for("SHORT"), qty_pt1)
                             pos["qty_rem"] = max(0.0, pos["qty_rem"] - qty_pt1)
-                        try:
-                            await live_broker.place_be_stop_loss("SHORT", pos["entry"], pos["qty_rem"])
-                            await notify_system("[LIVE] server SL moved to BE")
-                        except Exception as e:
-                            await notify_system(f"[LIVE] server BE SL failed: {e}")
-                    # local BE
-                    pos["stop"] = pos["entry"]
-                    pos["hit_pt1"]=True; pos["lockedR"] += PT1_SHARE*1.0
-                    # clamp trail not above BE
-                    pos["trail"]=min(min(pos["trail"], cur["close"]+TRAIL_ATR_MULT*atr), pos["entry"])
+                    pos["hit_pt1"]=True; pos["lockedR"] += PT1_SHARE*1.0; pos["trail"]=min(pos["trail"], cur["close"]+TRAIL_ATR_MULT*atr)
 
                 if pos["hit_pt1"]:
                     if hi>=pos["trail"]:
                         if pos.get("live"):
+                            from . import live_broker as lb
                             if pos["qty_rem"]>0:
-                                await live_broker.reduce_only(live_broker.close_side_for("SHORT"), pos["qty_rem"])
+                                await lb.reduce_only(lb.close_side_for("SHORT"), pos["qty_rem"])
                             to_close.append(idx); continue
                         else:
                             r=pos["lockedR"]; await self._paper_close(idx,r); to_close.append(idx); continue
                     if lo<=pos["target"]:
                         if pos.get("live"):
+                            from . import live_broker as lb
                             if pos["qty_rem"]>0:
-                                await live_broker.reduce_only(live_broker.close_side_for("SHORT"), pos["qty_rem"])
+                                await lb.reduce_only(lb.close_side_for("SHORT"), pos["qty_rem"])
                             to_close.append(idx); continue
                         else:
                             r=pos["lockedR"]+PT1_SHARE*RR; await self._paper_close(idx,r); to_close.append(idx); continue
-                    # trail update (respect BE)
-                    pos["trail"]=min(min(pos["trail"], cur["close"]+TRAIL_ATR_MULT*atr), pos["entry"])
+                    pos["trail"]=min(pos["trail"], cur["close"]+TRAIL_ATR_MULT*atr)
 
         for j in sorted(to_close, reverse=True):
             self.open_positions.pop(j)
 
     def _r_from_close(self, pos, close):
         risk=abs(pos["entry"]-pos["stop"])
-        return (close-pos["entry"])/risk if pos["side"]=="LONG" else (pos["entry"]-close)/risk
+        return (close-pos["entry"]) / risk if pos["side"]=="LONG" else (pos["entry"]-close) / risk
 
     async def _paper_close(self, idx, R):
         pos=self.open_positions[idx]; risk_d=0.01*(self.equity if self.equity is not None else 1000.0)
