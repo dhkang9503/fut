@@ -83,15 +83,21 @@ class Engine:
 
     async def on_bar_close(self, bar: dict):
         ts = int(bar["time"])
-
-        # 1) ms → s 정규화 (WS가 ms 타임스탬프 줄 가능성 대비)
-        if ts > 1_000_000_000_000:
+        if ts > 1_000_000_000_000:  # ms → s
             ts //= 1000
 
-        # 2) 증분 처리만: 이전에 처리한 ts보다 커야만 진행
         if ts <= self.last_processed_ts:
+            # 이미 처리했거나 더 과거: 무시
             return
-            
+
+        # 업서트: 마지막 행이 같은 ts면 교체, 아니면 append
+        if len(self.df) and int(self.df.iloc[-1]["time"]) == ts:
+            self.df.iloc[-1] = bar  # 덮어쓰기
+        else:
+            self.df = pd.concat([self.df, pd.DataFrame([bar])], ignore_index=True)
+
+        self.last_processed_ts = ts
+
         self.df = pd.concat([self.df, pd.DataFrame([bar])], ignore_index=True)
         self._trim_df()
         self._diag_bars += 1
@@ -123,7 +129,7 @@ class Engine:
         ts_str=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts))
 
         if MODE=="paper":
-            qty, lev=position_size_and_leverage(SYMBOL, entry, stop, self.equity or 1000.0)
+            qty, lev        =position_size_and_leverage(SYMBOL, entry, stop, self.equity or 1000.0)
             risk_d=0.01*(self.equity if self.equity is not None else 1000.0)
             await notify(f"[SIGNAL] {side} @{ts_str} e={entry:.6f} sl={stop:.6f} 2R={target:.6f} pt1={pt1:.6f} qty={qty} lev={lev:.1f} risk=${risk_d:.2f}")
             pos={"side":side,"entry":entry,"stop":stop,"pt1":pt1,"target":target,
