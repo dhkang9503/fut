@@ -82,15 +82,16 @@ class Engine:
         await self._refresh_equity(force=True)
 
     async def on_bar_close(self, bar: dict):
-        ts = int(bar["time"]); now=int(time.time()); interval=300
-        if ts < now - 2*interval:
-            if DIAG_MODE and DIAG_SKIP_LOG:
-                await notify_system(f"[DIAG] stale bar skipped ts={ts}, now={now}")
-            return
+        ts = int(bar["time"])
+
+        # 1) ms → s 정규화 (WS가 ms 타임스탬프 줄 가능성 대비)
+        if ts > 1_000_000_000_000:
+            ts //= 1000
+
+        # 2) 증분 처리만: 이전에 처리한 ts보다 커야만 진행
         if ts <= self.last_processed_ts:
             return
-        self.last_processed_ts = ts
-
+            
         self.df = pd.concat([self.df, pd.DataFrame([bar])], ignore_index=True)
         self._trim_df()
         self._diag_bars += 1
