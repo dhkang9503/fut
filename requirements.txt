@@ -1,6 +1,5 @@
-httpx==0.27.0
-websockets==12.0
-pandas==2.2.2
-numpy==1.26.4
-python-dotenv==1.0.1
-aiosqlite==0.20.0
+python-telegram-bot==20.7
+ccxt
+pandas
+numpy
+
