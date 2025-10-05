@@ -161,6 +161,7 @@ def fvg_fill_pct(dirn, f_low, f_high, prices_max, prices_min):
 def tg_send_message(text: str):
     token = os.getenv(CONFIG["telegram_token_env"])
     chat_id = os.getenv(CONFIG["telegram_chat_env"])
+    print(token, chat_id)
     if not token or not chat_id:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars.")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -190,7 +191,6 @@ def main():
     since = int((utc_now() - timedelta(days=CONFIG["history_days"])).timestamp() * 1000)
     ohlcv = ex.fetch_ohlcv(symbol, timeframe="5m", since=since, limit=None)
     df = ohlcv_to_df(ohlcv)
-    print(CONFIG)
 
     tg_send_message(f"✅ Bot started for {symbol}\nSignal:45m / Confirm:10m+5m\nRisk:{int(CONFIG['risk_fraction']*100)}%  FVG invalid:{int(CONFIG['fvg_invalidation']*100)}%")
 
