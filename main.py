@@ -36,8 +36,8 @@ CONFIG = {
     "tp1_R": 1.5,
     "tp2_R": 3.0,
     "state_file": "bot_state.json",     # persistent state for dedup / counts
-    "telegram_token_env": "TELEGRAM_BOT_TOKEN",
-    "telegram_chat_env": "TELEGRAM_CHAT_ID"
+    "telegram_token_env": os.getenv("TELEGRAM_BOT_TOKEN"),
+    "telegram_chat_env": os.getenv("TELEGRAM_CHAT_ID")
 }
 
 # =========================
