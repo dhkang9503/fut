@@ -190,6 +190,7 @@ def main():
     since = int((utc_now() - timedelta(days=CONFIG["history_days"])).timestamp() * 1000)
     ohlcv = ex.fetch_ohlcv(symbol, timeframe="5m", since=since, limit=None)
     df = ohlcv_to_df(ohlcv)
+    print(CONFIG)
 
     tg_send_message(f"✅ Bot started for {symbol}\nSignal:45m / Confirm:10m+5m\nRisk:{int(CONFIG['risk_fraction']*100)}%  FVG invalid:{int(CONFIG['fvg_invalidation']*100)}%")
 
