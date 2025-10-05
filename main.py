@@ -34,8 +34,8 @@ CONFIG = {
     "tp2_R": 3.0,
     "state_file": "bot_state.json",     # 중복 방지 상태 저장
     # Telegram Bot API
-    "telegram_token_env": os.getenv("TELEGRAM_BOT_TOKEN"),
-    "telegram_chat_env": os.getenv("TELEGRAM_CHAT_ID"),
+    "telegram_token_env": "TELEGRAM_BOT_TOKEN",
+    "telegram_chat_env": "TELEGRAM_CHAT_ID",
     "telegram_timeout": 10,             # HTTP 타임아웃(초)
     "parse_mode": "Markdown"            # 또는 "MarkdownV2"
 }
