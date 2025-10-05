@@ -4,8 +4,16 @@
 # Data: Binance (USDT perpetual) via ccxt
 # Alerts: entry/stop/tp1/tp2/size/risk/leverage
 
-import os
-import time
+# 스크립트 최상단, import 전에
+import os, sys
+
+# 로컬 충돌 사전 차단
+here = os.path.dirname(os.path.abspath(__file__))
+if os.path.exists(os.path.join(here, "telegram.py")) or os.path.exists(os.path.join(here, "telegram")):
+    raise RuntimeError("Rename local 'telegram.py' or 'telegram/' folder. It shadows the python-telegram-bot package.")
+
+from telegram import Bot  # 이제 안전
+
 import json
 import math
 import asyncio
@@ -14,7 +22,6 @@ from datetime import datetime, timezone, timedelta
 import ccxt
 import pandas as pd
 import numpy as np
-from telegram import Bot
 
 # =========================
 # CONFIG
