@@ -19,7 +19,7 @@ import numpy as np
 # =========================
 CONFIG = {
     "exchange": "binanceusdm",          # Binance Futures (USDT-M)
-    "symbol": "XRP/USDT",
+    "symbol": "XRP/USDT:USDT",
     "poll_seconds": 60,                 # 폴링 주기
     "history_days": 7,                  # 초기 로드 일수(5m 기준)
     "signal_tf": "45T",                 # 45분
@@ -34,8 +34,8 @@ CONFIG = {
     "tp2_R": 3.0,
     "state_file": "bot_state.json",     # 중복 방지 상태 저장
     # Telegram Bot API
-    "telegram_token_env": "TELEGRAM_BOT_TOKEN",
-    "telegram_chat_env": "TELEGRAM_CHAT_ID",
+    "telegram_token_env": os.getenv("TELEGRAM_BOT_TOKEN"),
+    "telegram_chat_env": os.getenv("TELEGRAM_CHAT_ID"),
     "telegram_timeout": 10,             # HTTP 타임아웃(초)
     "parse_mode": "Markdown"            # 또는 "MarkdownV2"
 }
