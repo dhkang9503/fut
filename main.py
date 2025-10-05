@@ -1,22 +1,13 @@
-# ob_fvg_telegram_bot.py
-# --- Telegram alert bot for OB+FVG strategy (live) ---
-# Strategy: Signal 45m, Confirm 10m + sliding 5m, ATR×1.2, N_break=3, FVG invalidation 90%, max 3 entries per OB
-# Data: Binance (USDT perpetual) via ccxt
-# Alerts: entry/stop/tp1/tp2/size/risk/leverage
+# ob_fvg_telegram_http_bot.py
+# --- Telegram Bot API(HTTP)로 알림 보내는 OB+FVG 신호 봇 ---
+# Strategy: Signal 45m, Confirm 10m + sliding 5m, ATR×1.2, N_break=3, FVG invalidation 90%, max 3 entries/OB
+# Exchange: Binance USDT Perp via ccxt (read-only)
 
-# 스크립트 최상단, import 전에
-import os, sys
-
-# 로컬 충돌 사전 차단
-here = os.path.dirname(os.path.abspath(__file__))
-if os.path.exists(os.path.join(here, "telegram.py")) or os.path.exists(os.path.join(here, "telegram")):
-    raise RuntimeError("Rename local 'telegram.py' or 'telegram/' folder. It shadows the python-telegram-bot package.")
-
-from telegram import Bot  # 이제 안전
-
+import os
+import time
 import json
 import math
-import asyncio
+import requests
 from datetime import datetime, timezone, timedelta
 
 import ccxt
@@ -28,41 +19,46 @@ import numpy as np
 # =========================
 CONFIG = {
     "exchange": "binanceusdm",          # Binance Futures (USDT-M)
-    "symbol": "XRP/USDT",               # e.g. "BTC/USDT"
-    "base_tf": "5m",                    # raw pull tf (do not change)
-    "signal_tf": "45T",                 # 45 minutes (pandas offset)
-    "confirm_tf": "10T",                # 10 minutes (pandas offset)
-    "poll_seconds": 60,                 # loop frequency
-    "history_days": 7,                  # how many days of 5m candles to load
-    "risk_fraction": 0.05,              # risk per trade vs equity (5%)
-    "account_equity_usd": 1000.0,       # assumed equity to compute size/leverage
-    "max_reentries_per_ob": 3,          # per-OB reentries cap
-    "fvg_invalidation": 0.90,           # FVG fill threshold
+    "symbol": "XRP/USDT",
+    "poll_seconds": 60,                 # 폴링 주기
+    "history_days": 7,                  # 초기 로드 일수(5m 기준)
+    "signal_tf": "45T",                 # 45분
+    "confirm_tf": "10T",                # 10분
+    "risk_fraction": 0.05,              # 5% 리스크
+    "account_equity_usd": 1000.0,       # 사이징 기준 자본(추정)
+    "max_reentries_per_ob": 3,          # OB당 재진입 한도
+    "fvg_invalidation": 0.90,           # FVG 90% 메워지면 무효
     "atr_mult": 1.2,
     "n_break": 3,
     "tp1_R": 1.5,
     "tp2_R": 3.0,
-    "state_file": "bot_state.json",     # persistent state for dedup / counts
-    "telegram_token_env": os.getenv("TELEGRAM_BOT_TOKEN"),
-    "telegram_chat_env": os.getenv("TELEGRAM_CHAT_ID")
+    "state_file": "bot_state.json",     # 중복 방지 상태 저장
+    # Telegram Bot API
+    "telegram_token_env": "TELEGRAM_BOT_TOKEN",
+    "telegram_chat_env": "TELEGRAM_CHAT_ID",
+    "telegram_timeout": 10,             # HTTP 타임아웃(초)
+    "parse_mode": "Markdown"            # 또는 "MarkdownV2"
 }
 
 # =========================
-# Utilities
+# Utils
 # =========================
 def utc_now():
     return datetime.now(timezone.utc)
 
-def ms_to_utc(ms):
-    return datetime.fromtimestamp(ms/1000, tz=timezone.utc)
+def ohlcv_to_df(ohlcv):
+    df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    return df.set_index("timestamp").sort_index()
+
+def resample_ohlc(df, rule):
+    return df.resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
 
 def load_state(path):
     if os.path.exists(path):
         with open(path, "r") as f:
             return json.load(f)
     return {"seen_entries": {}, "ob_counts": {}}
-    # seen_entries: { "ob_key": [entry_times...] }
-    # ob_counts:    { "ob_key": count_int }
 
 def save_state(path, state):
     tmp = path + ".tmp"
@@ -70,33 +66,28 @@ def save_state(path, state):
         json.dump(state, f)
     os.replace(tmp, path)
 
-def ohlcv_to_df(ohlcv, columns=("timestamp","open","high","low","close","volume")):
-    df = pd.DataFrame(ohlcv, columns=columns)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.set_index("timestamp").sort_index()
-    return df
-
-def resample_ohlc(df, rule):
-    return df.resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+def fmt_ts(ts: pd.Timestamp) -> str:
+    # 텔레그램 알림은 KST로 보여주기
+    return ts.tz_convert("Asia/Seoul").strftime("%Y-%m-%d %H:%M:%S KST")
 
 # =========================
 # Strategy blocks
 # =========================
 def find_fvg(h: pd.DataFrame) -> pd.DataFrame:
-    idx = h.index
     rows = []
+    idx = h.index
     for i in range(len(h)-2):
         hi0 = h["high"].iloc[i]
         lo2 = h["low"].iloc[i+2]
-        if lo2 > hi0:
+        if lo2 > hi0:  # bullish FVG
             rows.append({"time": idx[i+2], "type":"bull", "low": hi0, "high": lo2, "origin_time": idx[i]})
         lo0 = h["low"].iloc[i]
         hi2 = h["high"].iloc[i+2]
-        if hi2 < lo0:
+        if hi2 < lo0:  # bearish FVG
             rows.append({"time": idx[i+2], "type":"bear", "low": hi2, "high": lo0, "origin_time": idx[i]})
     return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["time","type","low","high","origin_time"])
 
-def build_ob(h: pd.DataFrame, n_break=3, atr_mult=1.2) -> tuple[pd.DataFrame, pd.DataFrame]:
+def build_ob(h: pd.DataFrame, n_break=3, atr_mult=1.2):
     tr = h["high"] - h["low"]
     out = h.copy()
     out["atr"] = tr.rolling(14, min_periods=14).mean()
@@ -164,74 +155,73 @@ def fvg_fill_pct(dirn, f_low, f_high, prices_max, prices_min):
         filled = max(0.0, f_high - prices_min)
         return min(1.0, filled/height)
 
-def fmt_ts(ts: pd.Timestamp) -> str:
-    return ts.tz_convert("Asia/Seoul").strftime("%Y-%m-%d %H:%M:%S KST")
-
 # =========================
-# Telegram
+# Telegram (HTTP)
 # =========================
-def get_bot():
+def tg_send_message(text: str):
     token = os.getenv(CONFIG["telegram_token_env"])
     chat_id = os.getenv(CONFIG["telegram_chat_env"])
     if not token or not chat_id:
-        raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables.")
-    return Bot(token=token), chat_id
-
-async def send_alert(bot: Bot, chat_id: str, text: str, disable_preview=True):
-    await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=disable_preview)
+        raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars.")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": CONFIG["parse_mode"],
+        "disable_web_page_preview": True,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=CONFIG["telegram_timeout"])
+        if r.status_code != 200:
+            print("Telegram send error:", r.text)
+    except Exception as e:
+        print("Telegram send exception:", e)
 
 # =========================
-# Live loop
+# Main live loop
 # =========================
-async def main_loop():
-    bot, chat_id = get_bot()
+def main():
     ex = getattr(ccxt, CONFIG["exchange"])({"enableRateLimit": True})
     symbol = CONFIG["symbol"]
     poll_s = CONFIG["poll_seconds"]
 
     state = load_state(CONFIG["state_file"])
 
-    # initial warm-up: fetch N days of 5m candles
     since = int((utc_now() - timedelta(days=CONFIG["history_days"])).timestamp() * 1000)
     ohlcv = ex.fetch_ohlcv(symbol, timeframe="5m", since=since, limit=None)
     df = ohlcv_to_df(ohlcv)
 
-    last_fetch = df.index[-1] if len(df) else utc_now()
-
-    await send_alert(bot, chat_id, f"✅ Bot started for {symbol}\nSignal:45m / Confirm:10m+5m\nRisk:{int(CONFIG['risk_fraction']*100)}%  FVG invalid:{int(CONFIG['fvg_invalidation']*100)}%")
+    tg_send_message(f"✅ Bot started for {symbol}\nSignal:45m / Confirm:10m+5m\nRisk:{int(CONFIG['risk_fraction']*100)}%  FVG invalid:{int(CONFIG['fvg_invalidation']*100)}%")
 
     while True:
         try:
-            # fetch recent updates (2 hours back to cover gaps)
+            # 최근 2시간만 갱신
             since_ms = int((utc_now() - timedelta(hours=2)).timestamp() * 1000)
             new_ohlcv = ex.fetch_ohlcv(symbol, timeframe="5m", since=since_ms, limit=None)
             dfn = ohlcv_to_df(new_ohlcv)
             if len(dfn) > 0:
                 df = pd.concat([df[df.index < dfn.index[0]], dfn]).drop_duplicates().sort_index()
 
-            # resample
             m5  = df.copy()
             m10 = resample_ohlc(df, CONFIG["confirm_tf"])
             m45 = resample_ohlc(df, CONFIG["signal_tf"])
 
-            # structures on signal TF
             s45, ob45 = build_ob(m45, n_break=CONFIG["n_break"], atr_mult=CONFIG["atr_mult"])
             fvg45 = find_fvg(m45)
             pairs = pair_ob_fvg(ob45, fvg45)
             if pairs.empty:
-                await asyncio.sleep(poll_s); continue
+                time.sleep(poll_s); continue
 
-            # scan most recent few signal bars to reduce load
+            # 최근 24시간 신호만 스캔
             recent_pairs = pairs[pairs["time"] >= (m45.index[-1] - pd.Timedelta(hours=24))]
             for _, p in recent_pairs.iterrows():
                 dirn = p["dir"]
                 z_low, z_high = (min(p["ob_start"], p["ob_end"]), max(p["ob_start"], p["ob_end"]))
                 start_time = p["time"]
                 future = m45.loc[start_time + pd.Timedelta(minutes=45):]
-                if future.empty: 
+                if future.empty:
                     continue
 
-                # FVG fill tracking
                 max_seen, min_seen = -np.inf, np.inf
                 post_fvg = m45.loc[p["fvg_time"]:] if p["fvg_time"] in m45.index else future
 
@@ -240,8 +230,8 @@ async def main_loop():
                 if count >= CONFIG["max_reentries_per_ob"]:
                     continue
 
-                for t, bar in future.iloc[-4:].iterrows():  # only newest ~3 hours
-                    # invalidation?
+                # 가장 최신 3개(약 135분) 윈도를 검사
+                for t, bar in future.iloc[-4:].iterrows():
                     if t in post_fvg.index:
                         max_seen = max(max_seen, bar["high"])
                         min_seen = min(min_seen, bar["low"] if np.isfinite(min_seen) else bar["low"])
@@ -249,11 +239,10 @@ async def main_loop():
                     if fill >= CONFIG["fvg_invalidation"]:
                         break
 
-                    # touch?
                     if not touched_zone(bar["high"], bar["low"], z_low, z_high):
                         continue
 
-                    # confirm in 45m window using 10m OR sliding 5m
+                    # 10m OR 5m 슬라이딩 컨펌
                     win_start, win_end = t, t + pd.Timedelta(minutes=45)
                     seg10 = m10.loc[(m10.index >= win_start) & (m10.index < win_end)]
                     seg5  = m5.loc[(m5.index  >= win_start) & (m5.index  < win_end)]
@@ -276,36 +265,34 @@ async def main_loop():
                     if not confirm:
                         continue
 
-                    # compute entry/SL/TP
+                    # Entry/SL/TP/Size/Lev
                     if dirn == "bull":
                         entry, stop = z_high, z_low
-                        risk_per_unit = entry - stop
-                        tp1 = entry + CONFIG["tp1_R"]*risk_per_unit
-                        tp2 = entry + CONFIG["tp2_R"]*risk_per_unit
+                        rpu = entry - stop
+                        tp1 = entry + CONFIG["tp1_R"]*rpu
+                        tp2 = entry + CONFIG["tp2_R"]*rpu
                         side = "LONG"
                     else:
                         entry, stop = z_low, z_high
-                        risk_per_unit = stop - entry
-                        tp1 = entry - CONFIG["tp1_R"]*risk_per_unit
-                        tp2 = entry - CONFIG["tp2_R"]*risk_per_unit
+                        rpu = stop - entry
+                        tp1 = entry - CONFIG["tp1_R"]*rpu
+                        tp2 = entry - CONFIG["tp2_R"]*rpu
                         side = "SHORT"
 
-                    if risk_per_unit <= 0:
+                    if rpu <= 0:
                         continue
 
                     risk_usd = CONFIG["risk_fraction"] * CONFIG["account_equity_usd"]
-                    size_units = risk_usd / risk_per_unit
+                    size_units = risk_usd / rpu
                     notional = size_units * entry
                     implied_leverage = notional / CONFIG["account_equity_usd"]
 
-                    # dedup same entry within minutes
-                    seen = state["seen_entries"].get(ob_key, [])
-                    # entry uniqueness key (round price/time)
+                    # 중복 방지
                     uniq_key = f"{side}|{round(float(entry),5)}|{fmt_ts(t)}"
+                    seen = state["seen_entries"].get(ob_key, [])
                     if uniq_key in seen:
                         continue
 
-                    # record and notify
                     state["seen_entries"].setdefault(ob_key, []).append(uniq_key)
                     state["ob_counts"][ob_key] = state["ob_counts"].get(ob_key, 0) + 1
                     save_state(CONFIG["state_file"], state)
@@ -313,7 +300,7 @@ async def main_loop():
                     text = (
                         f"📣 *OB+FVG 진입 신호* ({CONFIG['symbol']})\n"
                         f"• 방향: *{side}*\n"
-                        f"• 시그널(45m) 생성: {fmt_ts(p['time'])}\n"
+                        f"• 시그널(45m): {fmt_ts(p['time'])}\n"
                         f"• OB 형성: {fmt_ts(p['ob_time'])}\n"
                         f"• 리테스트 감지: {fmt_ts(t)}\n"
                         f"\n"
@@ -326,19 +313,15 @@ async def main_loop():
                         f"• 포지션 수량: `{size_units:.2f}` {CONFIG['symbol'].split('/')[0]}\n"
                         f"• 추정 레버리지: `x{implied_leverage:.2f}`\n"
                         f"\n"
-                        f"_규칙: ATR×{CONFIG['atr_mult']}, N={CONFIG['n_break']}, FVG 무효 {int(CONFIG['fvg_invalidation']*100)}%, 재진입 최대 {CONFIG['max_reentries_per_ob']}회_"
+                        f"_ATR×{CONFIG['atr_mult']}, N={CONFIG['n_break']}, FVG 무효 {int(CONFIG['fvg_invalidation']*100)}%, 재진입 최대 {CONFIG['max_reentries_per_ob']}회_"
                     )
-                    await send_alert(bot, chat_id, text)
+                    tg_send_message(text)
 
-            await asyncio.sleep(poll_s)
+            time.sleep(poll_s)
 
         except Exception as e:
-            try:
-                await send_alert(bot, chat_id, f"⚠️ Bot 오류: {e}")
-            except Exception:
-                pass
+            tg_send_message(f"⚠️ Bot 오류: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
-    # Run the async loop
-    asyncio.run(main_loop())
+    main()
