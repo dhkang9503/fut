@@ -1,328 +1,639 @@
-# ob_fvg_telegram_http_bot.py
-# --- Telegram Bot API(HTTP)로 알림 보내는 OB+FVG 신호 봇 ---
-# Strategy: Signal 45m, Confirm 10m + sliding 5m, ATR×1.2, N_break=3, FVG invalidation 90%, max 3 entries/OB
-# Exchange: Binance USDT Perp via ccxt (read-only)
+# okx_live_trader_full.py
+# - Incremental OHLCV (fixed window)
+# - Feature engineering (내장)
+# - Train-or-load (force_load_model / retrain_on_start 지원)
+# - Consistency: min_confidence, cooldown, trigger-only logging
+# - Telegram notify
+# - OKX trading: single position, 10% balance notional, 25x leverage (config)
+# - Env var expansion in YAML (${VAR} / ${VAR:default})
 
-import os
-import time
-import json
-import math
-import requests
-from datetime import datetime, timezone, timedelta
+import os, re, csv, math, time, json, traceback
+from datetime import datetime, timezone
 
-import ccxt
-import pandas as pd
 import numpy as np
+import pandas as pd
+import requests
+import yaml
+import ccxt
+import joblib
+
+from lightgbm import LGBMClassifier
+from sklearn.exceptions import NotFittedError
+
+# ---------- OPTIONAL: .env 지원 ----------
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 # =========================
-# CONFIG
+# Utils & Config
 # =========================
-CONFIG = {
-    "exchange": "binanceusdm",          # Binance Futures (USDT-M)
-    "symbol": "XRP/USDT:USDT",
-    "poll_seconds": 60,                 # 폴링 주기
-    "history_days": 7,                  # 초기 로드 일수(5m 기준)
-    "signal_tf": "45T",                 # 45분
-    "confirm_tf": "10T",                # 10분
-    "risk_fraction": 0.05,              # 5% 리스크
-    "account_equity_usd": 1000.0,       # 사이징 기준 자본(추정)
-    "max_reentries_per_ob": 3,          # OB당 재진입 한도
-    "fvg_invalidation": 0.90,           # FVG 90% 메워지면 무효
-    "atr_mult": 1.2,
-    "n_break": 3,
-    "tp1_R": 1.5,
-    "tp2_R": 3.0,
-    "state_file": "bot_state.json",     # 중복 방지 상태 저장
-    # Telegram Bot API
-    "telegram_token_env": "TELEGRAM_BOT_TOKEN",
-    "telegram_chat_env": "TELEGRAM_CHAT_ID",
-    "telegram_timeout": 10,             # HTTP 타임아웃(초)
-    "parse_mode": "Markdown"            # 또는 "MarkdownV2"
-}
 
-# =========================
-# Utils
-# =========================
-def utc_now():
-    return datetime.now(timezone.utc)
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
-def ohlcv_to_df(ohlcv):
-    df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    return df.set_index("timestamp").sort_index()
+def ensure_dir(p):
+    if p:
+        os.makedirs(p, exist_ok=True)
 
-def resample_ohlc(df, rule):
-    return df.resample(rule).agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+def timeframe_to_millis(tf: str) -> int:
+    if tf.endswith("m"): return int(tf[:-1]) * 60_000
+    if tf.endswith("h"): return int(tf[:-1]) * 3_600_000
+    if tf.endswith("d"): return int(tf[:-1]) * 86_400_000
+    raise ValueError(f"Unsupported timeframe: {tf}")
 
-def load_state(path):
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
-    return {"seen_entries": {}, "ob_counts": {}}
+_ENV_RE = re.compile(r"\$\{([^}:]+)(?::([^}]*))?\}")  # ${VAR} or ${VAR:default}
 
-def save_state(path, state):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, path)
+def _expand_env(value):
+    if isinstance(value, str):
+        def repl(m):
+            var, default = m.group(1), m.group(2)
+            return os.environ.get(var, default if default is not None else "")
+        return _ENV_RE.sub(repl, value)
+    elif isinstance(value, dict):
+        return {k: _expand_env(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_expand_env(v) for v in value]
+    return value
 
-def fmt_ts(ts: pd.Timestamp) -> str:
-    # 텔레그램 알림은 KST로 보여주기
-    return ts.tz_convert("Asia/Seoul").strftime("%Y-%m-%d %H:%M:%S KST")
+def load_config(path="config_okx.yaml"):
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    return _expand_env(cfg)
 
 # =========================
-# Strategy blocks
+# Exchange helpers (OKX)
 # =========================
-def find_fvg(h: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    idx = h.index
-    for i in range(len(h)-2):
-        hi0 = h["high"].iloc[i]
-        lo2 = h["low"].iloc[i+2]
-        if lo2 > hi0:  # bullish FVG
-            rows.append({"time": idx[i+2], "type":"bull", "low": hi0, "high": lo2, "origin_time": idx[i]})
-        lo0 = h["low"].iloc[i]
-        hi2 = h["high"].iloc[i+2]
-        if hi2 < lo0:  # bearish FVG
-            rows.append({"time": idx[i+2], "type":"bear", "low": hi2, "high": lo0, "origin_time": idx[i]})
-    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["time","type","low","high","origin_time"])
 
-def build_ob(h: pd.DataFrame, n_break=3, atr_mult=1.2):
-    tr = h["high"] - h["low"]
-    out = h.copy()
-    out["atr"] = tr.rolling(14, min_periods=14).mean()
-    out["prior_max_high"] = out["high"].rolling(n_break).max().shift(1)
-    out["prior_min_low"]  = out["low"].rolling(n_break).min().shift(1)
-    out["is_bull_disp"] = (out["close"] > out["prior_max_high"]) & ((out["high"]-out["low"]) > atr_mult*out["atr"])
-    out["is_bear_disp"] = (out["close"] < out["prior_min_low"])  & ((out["high"]-out["low"]) > atr_mult*out["atr"])
+def create_okx(cfg):
+    ex_cfg = cfg.get("okx", {})
+    exchange = ccxt.okx({
+        "apiKey": ex_cfg.get("apiKey", ""),
+        "secret": ex_cfg.get("secret", ""),
+        "password": ex_cfg.get("password", ""),
+        "enableRateLimit": ex_cfg.get("enableRateLimit", True),
+        "options": ex_cfg.get("options", {"defaultType": "swap"}),
+    })
+    return exchange
 
-    rows = []
-    for i in range(1, len(out)):
-        t = out.index[i]
-        if out["is_bull_disp"].iloc[i]:
-            for k in [i-1, i-2]:
-                if k >= 0 and out["close"].iloc[k] < out["open"].iloc[k]:
-                    rows.append({"time": t, "dir":"bull",
-                                 "ob_start": out["low"].iloc[k],
-                                 "ob_end":   out["open"].iloc[k],
-                                 "ob_time":  out.index[k]})
-                    break
-        if out["is_bear_disp"].iloc[i]:
-            for k in [i-1, i-2]:
-                if k >= 0 and out["close"].iloc[k] > out["open"].iloc[k]:
-                    rows.append({"time": t, "dir":"bear",
-                                 "ob_start": out["open"].iloc[k],
-                                 "ob_end":   out["high"].iloc[k],
-                                 "ob_time":  out.index[k]})
-                    break
-    ob = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["time","dir","ob_start","ob_end","ob_time"])
-    return out, ob
-
-def pair_ob_fvg(ob: pd.DataFrame, fvg: pd.DataFrame) -> pd.DataFrame:
-    pairs = []
-    for _, r in ob.iterrows():
-        same = fvg[fvg["type"] == ("bull" if r["dir"]=="bull" else "bear")]
-        window = same[(same["time"] >= r["time"] - pd.Timedelta(hours=6)) & (same["time"] <= r["time"] + pd.Timedelta(hours=6))].copy()
-        if window.empty:
-            continue
-        if r["dir"]=="bull":
-            cands = window[window["low"] >= r["ob_end"]].copy()
-            if cands.empty: 
-                continue
-            cands["dist"] = cands["low"] - r["ob_end"]
-            chosen = cands.sort_values("dist").iloc[0]
-        else:
-            cands = window[window["high"] <= r["ob_start"]].copy()
-            if cands.empty:
-                continue
-            cands["dist"] = r["ob_start"] - cands["high"]
-            chosen = cands.sort_values("dist").iloc[0]
-        pairs.append({**r.to_dict(),
-                      "fvg_low": chosen["low"], "fvg_high": chosen["high"],
-                      "fvg_time": chosen["time"], "fvg_origin": chosen["origin_time"]})
-    return pd.DataFrame(pairs) if pairs else pd.DataFrame(columns=list(ob.columns)+["fvg_low","fvg_high","fvg_time","fvg_origin"])
-
-def touched_zone(bar_high, bar_low, z_low, z_high):
-    return (bar_low <= z_high) and (bar_high >= z_low)
-
-def fvg_fill_pct(dirn, f_low, f_high, prices_max, prices_min):
-    height = f_high - f_low
-    if height <= 0: return 1.0
-    if dirn == "bull":
-        filled = max(0.0, prices_max - f_low)
-        return min(1.0, filled/height)
-    else:
-        filled = max(0.0, f_high - prices_min)
-        return min(1.0, filled/height)
-
-# =========================
-# Telegram (HTTP)
-# =========================
-def tg_send_message(text: str):
-    token = os.getenv(CONFIG["telegram_token_env"])
-    chat_id = os.getenv(CONFIG["telegram_chat_env"])
-    print(token, chat_id)
-    if not token or not chat_id:
-        raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars.")
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": CONFIG["parse_mode"],
-        "disable_web_page_preview": True,
-    }
+def resolve_symbol(exchange, desired_symbol):
     try:
-        r = requests.post(url, json=payload, timeout=CONFIG["telegram_timeout"])
-        if r.status_code != 200:
-            print("Telegram send error:", r.text)
+        markets = exchange.load_markets()
+        if desired_symbol in markets:
+            return desired_symbol
+    except Exception:
+        pass
+    return desired_symbol
+
+def market_info(exchange, symbol):
+    m = exchange.market(symbol)
+    amount_prec = m.get("precision", {}).get("amount", None)  # int(소수 자릿수)일 때 多
+    price_prec  = m.get("precision", {}).get("price", None)
+    min_amt     = m.get("limits", {}).get("amount", {}).get("min", None)
+    min_cost    = m.get("limits", {}).get("cost", {}).get("min", None)
+    return amount_prec, price_prec, min_amt, min_cost, m
+
+def round_amount_by_prec(amount, amount_prec):
+    if amount_prec is None:
+        return float(amount)
+    if isinstance(amount_prec, int):
+        return float(f"{amount:.{amount_prec}f}")
+    # 틱/스텝 케이스는 보수적으로 내림
+    return math.floor(amount / amount_prec) * amount_prec
+
+def set_leverage_okx(exchange, symbol, lev=25, mgn_mode="cross"):
+    try:
+        exchange.set_leverage(lev, symbol, params={"mgnMode": mgn_mode, "posSide": "long"})
     except Exception as e:
-        print("Telegram send exception:", e)
+        print("[WARN] set_leverage long:", e)
+    try:
+        exchange.set_leverage(lev, symbol, params={"mgnMode": mgn_mode, "posSide": "short"})
+    except Exception as e:
+        print("[WARN] set_leverage short:", e)
+
+def get_free_usdt(exchange):
+    bal = exchange.fetch_balance()
+    # 통합 계정/선물 계정에서 모두 커버 시도
+    if "USDT" in bal and isinstance(bal["USDT"], dict):
+        if "free" in bal["USDT"]:
+            return float(bal["USDT"]["free"])
+        if "total" in bal["USDT"]:
+            total = float(bal["USDT"]["total"])
+            used  = float(bal["USDT"].get("used", 0))
+            return max(0.0, total - used)
+    if "free" in bal and "USDT" in bal["free"]:
+        return float(bal["free"]["USDT"])
+    return 0.0
+
+def fetch_net_position(exchange, symbol):
+    """
+    OKX linear swap + one-way(net) 가정.
+    return: ("LONG"/"SHORT"/"FLAT", size_base(float))
+    """
+    try:
+        positions = exchange.fetch_positions([symbol])
+        for p in positions:
+            if p.get("symbol") == symbol:
+                amt = float(p.get("contracts", 0) or p.get("amount", 0) or 0)
+                side = "LONG" if amt > 0 else ("SHORT" if amt < 0 else "FLAT")
+                return side, float(amt)
+    except Exception as e:
+        print("[WARN] fetch_positions:", e)
+    return "FLAT", 0.0
+
+def place_reduce_only_market(exchange, symbol, side, amount, amount_prec=None):
+    amt = round_amount_by_prec(amount, amount_prec)
+    params = {"reduceOnly": True, "tdMode": "cross"}
+    return exchange.create_order(symbol, "market", side, amt, None, params)
+
+def place_entry_with_tp_sl(exchange, symbol, direction, price, tp, sl,
+                           notional_target, amount_prec, inline_params=True):
+    """
+    direction: "LONG" / "SHORT"
+    notional_target: USDT 명목가 (잔고의 10% 등)
+    수량 = notional_target / price  (BTC 수량)
+    """
+    amount = max(1e-9, notional_target / max(price, 1e-9))
+    amount = round_amount_by_prec(amount, amount_prec)
+    side = "buy" if direction == "LONG" else "sell"
+
+    # 시도1) 인라인 TP/SL (계정 설정/상품에 따라 실패 가능)
+    if inline_params:
+        params = {
+            "reduceOnly": False,
+            "tdMode": "cross",
+            "tpTriggerPx": f"{tp}",
+            "tpOrdPx": "-1",  # market
+            "slTriggerPx": f"{sl}",
+            "slOrdPx": "-1",  # market
+        }
+        try:
+            order = exchange.create_order(symbol, "market", side, amount, None, params)
+            return {"entry": order, "tp": None, "sl": None}
+        except Exception as e:
+            print("[WARN] entry with inline TP/SL failed; fallback:", e)
+
+    # 시도2) 진입 후 separate reduceOnly 트리거 주문
+    entry = exchange.create_order(symbol, "market", side, amount, None, {"reduceOnly": False, "tdMode": "cross"})
+    try:
+        # NOTE: OKX 조건주문 파라미터는 계정/상품마다 상이 → 일반적 형태로 시도
+        # TP
+        tp_params = {"reduceOnly": True, "tdMode": "cross", "trigger": True, "stopPrice": tp}
+        exchange.create_order(symbol, "market", "sell" if direction == "LONG" else "buy", amount, None, tp_params)
+    except Exception as e:
+        print("[WARN] TP separate order failed:", e)
+    try:
+        # SL
+        sl_params = {"reduceOnly": True, "tdMode": "cross", "trigger": True, "stopPrice": sl}
+        exchange.create_order(symbol, "market", "sell" if direction == "LONG" else "buy", amount, None, sl_params)
+    except Exception as e:
+        print("[WARN] SL separate order failed:", e)
+    return {"entry": entry, "tp": None, "sl": None}
 
 # =========================
-# Main live loop
+# Telegram
 # =========================
+
+def send_telegram(token: str, chat_id: str, text: str):
+    if not token or not chat_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[WARN] Telegram send failed: {e}")
+
+# =========================
+# Feature Engineering (내장)
+# =========================
+import ta
+
+def _add_ta_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    df = df.copy()
+    rsi = ta.momentum.RSIIndicator(df["close"], window=14, fillna=True).rsi()
+    ema_fast = ta.trend.EMAIndicator(df["close"], window=12, fillna=True).ema_indicator()
+    ema_slow = ta.trend.EMAIndicator(df["close"], window=26, fillna=True).ema_indicator()
+    macd = ema_fast - ema_slow
+    bb = ta.volatility.BollingerBands(df["close"], window=20, fillna=True)
+    bb_h = bb.bollinger_hband()
+    bb_l = bb.bollinger_lband()
+    atr = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14, fillna=True).average_true_range()
+    adx = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14, fillna=True).adx()
+    obv = ta.volume.OnBalanceVolumeIndicator(df["close"], df["volume"], fillna=True).on_balance_volume()
+    vol_ratio = df["volume"] / (df["volume"].rolling(20, min_periods=1).mean())
+    body = (df["close"] - df["open"]).abs()
+    rng = (df["high"] - df["low"]).replace(0, np.nan)
+    upper_wick = (df["high"] - df[["open","close"]].max(axis=1)).clip(lower=0)
+    lower_wick = (df[["open","close"]].min(axis=1) - df["low"]).clip(lower=0)
+    shadow_ratio = (upper_wick + lower_wick) / (rng.replace(0, np.nan))
+
+    out = pd.DataFrame({
+        f"{prefix}_close": df["close"].astype(float),
+        f"{prefix}_volume": df["volume"].astype(float),
+        f"{prefix}_rsi": rsi.astype(float),
+        f"{prefix}_ema_fast": ema_fast.astype(float),
+        f"{prefix}_ema_slow": ema_slow.astype(float),
+        f"{prefix}_macd": macd.astype(float),
+        f"{prefix}_bb_h": bb_h.astype(float),
+        f"{prefix}_bb_l": bb_l.astype(float),
+        f"{prefix}_atr": atr.astype(float),
+        f"{prefix}_adx": adx.astype(float),
+        f"{prefix}_obv": obv.astype(float),
+        f"{prefix}_vol_ratio": vol_ratio.astype(float),
+        f"{prefix}_body": body.astype(float),
+        f"{prefix}_range": rng.astype(float),
+        f"{prefix}_shadow_ratio": shadow_ratio.astype(float),
+    }, index=df.index)
+    return out
+
+def _tf_seconds(tf: str) -> int:
+    if tf.endswith("m"): return int(tf[:-1]) * 60
+    if tf.endswith("h"): return int(tf[:-1]) * 3600
+    if tf.endswith("d"): return int(tf[:-1]) * 86400
+    raise ValueError("unsupported timeframe")
+
+def build_multitimeframe_features_asof(dfs_list: list[pd.DataFrame], prefixes: list[str], base_tf: str) -> pd.DataFrame:
+    """
+    dfs_list와 prefixes는 같은 순서(예: ["5m","15m"])로 전달.
+    """
+    proc = []
+    for df, pref in zip(dfs_list, prefixes):
+        df = df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
+        f = _add_ta_features(df, pref)
+        f["timestamp"] = df["timestamp"].values
+        proc.append(f.sort_values("timestamp"))
+
+    base = proc[0][["timestamp"]].drop_duplicates().copy()
+    out = base.rename(columns={"timestamp":"t_base"})
+    tol = pd.Timedelta(seconds=2 * _tf_seconds(base_tf))
+
+    for f in proc:
+        out = pd.merge_asof(
+            out.sort_values("t_base"),
+            f.sort_values("timestamp"),
+            left_on="t_base", right_on="timestamp",
+            direction="backward", tolerance=tol
+        )
+        out = out.drop(columns=["timestamp"])
+    out = out.rename(columns={"t_base":"timestamp"}).dropna().reset_index(drop=True)
+
+    # cross-TF simple interactions
+    if {"5m_close","15m_close"}.issubset(out.columns):
+        out["ratio_5m_15m_close"] = out["5m_close"] / out["15m_close"]
+    if {"5m_rsi","15m_rsi"}.issubset(out.columns):
+        out["delta_rsi_5m_15m"] = out["5m_rsi"] - out["15m_rsi"]
+
+    out = out.replace([np.inf,-np.inf],np.nan).dropna().reset_index(drop=True)
+    return out
+
+# =========================
+# Data Fetch (initial/incremental)
+# =========================
+
+def fetch_ohlcv_initial(exchange, symbol, timeframe, target_rows: int):
+    tf_ms = timeframe_to_millis(timeframe)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    limit = min(1000, target_rows)
+    rows = []
+    since = now_ms - tf_ms * limit
+    loops = 0
+    while len(rows) < target_rows and loops < 400:
+        batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+        if not batch:
+            break
+        rows.extend(batch)
+        oldest = batch[0][0]
+        since = oldest - tf_ms * limit
+        loops += 1
+    if not rows:
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+    df = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").tail(target_rows).reset_index(drop=True)
+    return df
+
+def fetch_ohlcv_incremental(exchange, symbol, timeframe, cache_df: pd.DataFrame | None, target_rows: int):
+    tf_ms = timeframe_to_millis(timeframe)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    limit = 1000
+    if cache_df is not None and len(cache_df) > 0:
+        since = int(cache_df["timestamp"].iloc[-1].timestamp() * 1000) + 1
+    else:
+        since = now_ms - tf_ms * (target_rows + 1)
+    data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+    if not data:
+        return cache_df if cache_df is not None else pd.DataFrame(columns=["timestamp","open","high","low","close","volume"]), 0
+    df_new = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
+    df_new["timestamp"] = pd.to_datetime(df_new["timestamp"], unit="ms", utc=True)
+    if cache_df is None:
+        df = df_new
+    else:
+        df = pd.concat([cache_df, df_new], ignore_index=True)
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+    df = df.tail(target_rows).reset_index(drop=True)
+    return df, len(df_new)
+
+# =========================
+# Model (train-or-load)
+# =========================
+
+def _labeling(cfg, feats, base_tf):
+    horizon = int(cfg["labeling"]["horizon"])
+    threshold = float(cfg["labeling"]["threshold"])
+    price_col = f"{base_tf}_close"
+
+    df = feats.copy()
+    if price_col not in df.columns:
+        raise ValueError(f"price_col {price_col} not in features")
+    df["future"] = df[price_col].shift(-horizon)
+    df.dropna(inplace=True)
+    df["ret"] = (df["future"] - df[price_col]) / df[price_col]
+    df["label"] = 1  # FLAT
+    df.loc[df["ret"] > threshold, "label"] = 2   # LONG
+    df.loc[df["ret"] < -threshold, "label"] = 0  # SHORT
+
+    X = df.drop(columns=["timestamp","future","ret","label"], errors="ignore")
+    y = df["label"].astype(int)
+    return X, y
+
+def train_model(cfg, feats, base_tf):
+    print("[INFO] Training LightGBM model...")
+    X, y = _labeling(cfg, feats, base_tf)
+    model = LGBMClassifier(
+        n_estimators=400,
+        learning_rate=0.02,
+        max_depth=-1,
+        num_leaves=64,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        n_jobs=-1
+    )
+    model.fit(X, y)
+    print(f"[INFO] Training complete on {len(X)} samples.")
+    return model
+
+def train_or_load_model(cfg, feats, base_tf):
+    model_path = cfg["model_path"]
+    force_load = bool(cfg.get("force_load_model", True))
+    retrain = bool(cfg.get("train", {}).get("retrain_on_start", False))
+    min_rows = int(cfg.get("min_train_rows", 1000))
+
+    if feats is None or len(feats) < min_rows:
+        raise SystemExit(f"[INFO] Not enough rows to train ({0 if feats is None else len(feats)}). Need >= {min_rows}")
+
+    # 로드 우선
+    if os.path.exists(model_path) and not retrain and force_load:
+        print(f"[INFO] loading model from {model_path}")
+        try:
+            return joblib.load(model_path)
+        except Exception as e:
+            print("[WARN] failed to load model, retraining:", e)
+
+    # 새 학습
+    print("[INFO] training new model...")
+    model = train_model(cfg, feats, base_tf)
+    ensure_dir(os.path.dirname(model_path))
+    joblib.dump(model, model_path)
+    print(f"[INFO] model saved to {model_path}")
+    return model
+
+# =========================
+# Logging (CSV)
+# =========================
+
+CSV_HEADERS = [
+    "timestamp","symbol","raw_direction","raw_confidence","price",
+    "enforced_direction","cooldown_remaining","tp","sl"
+]
+
+def ensure_logfile(path):
+    ensure_dir(os.path.dirname(path))
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(CSV_HEADERS)
+
+def read_last_state(path):
+    if not os.path.exists(path):
+        return {"enforced_direction": "FLAT", "cooldown_remaining": 0}
+    try:
+        last = None
+        with open(path, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                last = row
+        if last is None:
+            return {"enforced_direction": "FLAT", "cooldown_remaining": 0}
+        return {
+            "enforced_direction": last.get("enforced_direction", "FLAT"),
+            "cooldown_remaining": int(float(last.get("cooldown_remaining", "0") or 0)),
+        }
+    except Exception:
+        return {"enforced_direction": "FLAT", "cooldown_remaining": 0}
+
+def append_log_row(path, row: dict):
+    ensure_logfile(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=CSV_HEADERS).writerow(row)
+
+# =========================
+# Strategy helpers
+# =========================
+
+def predict_dir_conf(model, x_last: pd.DataFrame):
+    proba = model.predict_proba(x_last)[0]
+    idx2dir = {0: -1, 1: 0, 2: 1}  # label 매핑: SHORT(0), FLAT(1), LONG(2)
+    pred_dir = idx2dir[int(np.argmax(proba))]
+    conf = float(np.max(proba))
+    return pred_dir, conf
+
+def dir_to_str(d):
+    return "LONG" if d == 1 else "SHORT" if d == -1 else "FLAT"
+
+# =========================
+# Main
+# =========================
+
 def main():
-    ex = getattr(ccxt, CONFIG["exchange"])({"enableRateLimit": True})
-    symbol = CONFIG["symbol"]
-    poll_s = CONFIG["poll_seconds"]
+    cfg = load_config("config_okx.yaml")
 
-    state = load_state(CONFIG["state_file"])
+    # Signal policy
+    min_conf = float(cfg.get("signal", {}).get("min_confidence", 0.75))
+    cooldown_bars = int(cfg["signal"]["cooldown_bars"])
+    tf_list = cfg["timeframes"]
+    base_tf = tf_list[0]
+    price_col = f"{base_tf}_close"
+    take_profit = float(cfg["risk"]["take_profit"])   # 0.007
+    stop_loss   = float(cfg["risk"]["stop_loss"])     # 0.004
 
-    since = int((utc_now() - timedelta(days=CONFIG["history_days"])).timestamp() * 1000)
-    ohlcv = ex.fetch_ohlcv(symbol, timeframe="5m", since=since, limit=None)
-    df = ohlcv_to_df(ohlcv)
+    # Trading params
+    leverage = int(cfg.get("trading", {}).get("leverage", 25))  # 25x
+    position_risk_fraction = float(cfg.get("trading", {}).get("position_risk_fraction", 0.10))  # 잔고 10%
 
-    tg_send_message(f"✅ Bot started for {symbol}\nSignal:45m / Confirm:10m+5m\nRisk:{int(CONFIG['risk_fraction']*100)}%  FVG invalid:{int(CONFIG['fvg_invalidation']*100)}%")
+    # Telegram
+    tg_cfg = cfg.get("telegram", {})
+    tg_enabled = bool(tg_cfg.get("enabled", False))
+    tg_token = tg_cfg.get("bot_token", "")
+    tg_chat_id = tg_cfg.get("chat_id", "")
+
+    # Logs
+    log_path = cfg["log_path"]
+    ensure_logfile(log_path)
+    state = read_last_state(log_path)  # enforced_direction / cooldown_remaining
+
+    # Exchange / Market / Leverage
+    exchange = create_okx(cfg)
+    symbol = resolve_symbol(exchange, cfg["symbol"])
+    set_leverage_okx(exchange, symbol, leverage, mgn_mode="cross")
+    amount_prec, price_prec, min_amt, min_cost, market = market_info(exchange, symbol)
+
+    # Initial data fetch
+    cache = {}
+    for tf in tf_list:
+        n = int(cfg["window_rows"][tf])
+        df0 = fetch_ohlcv_initial(exchange, symbol, tf, n)
+        cache[tf] = df0
+        print(f"[INIT] {symbol} {tf} rows={len(df0)}  range={df0['timestamp'].min()} → {df0['timestamp'].max()}")
+
+    # Initial features
+    dfs_list = [cache[tf] for tf in tf_list]
+    feats = build_multitimeframe_features_asof(dfs_list, prefixes=tf_list, base_tf=base_tf)
+    if feats is None or len(feats) == 0:
+        raise SystemExit("[INFO] Not enough feature rows after initial build. Increase window_rows or check market/timeframes.")
+
+    # Train-or-Load model
+    model = train_or_load_model(cfg, feats, base_tf)
+
+    msg = "OKX LIVE Trader (Incremental + TrainOrLoad + TriggerOnly + Telegram) started. Ctrl+C to stop."
+    send_telegram(tg_token, tg_chat_id, msg)
 
     while True:
         try:
-            # 최근 2시간만 갱신
-            since_ms = int((utc_now() - timedelta(hours=2)).timestamp() * 1000)
-            new_ohlcv = ex.fetch_ohlcv(symbol, timeframe="5m", since=since_ms, limit=None)
-            dfn = ohlcv_to_df(new_ohlcv)
-            if len(dfn) > 0:
-                df = pd.concat([df[df.index < dfn.index[0]], dfn]).drop_duplicates().sort_index()
+            # Incremental updates
+            adds_msg, dfs_list = [], []
+            for tf in tf_list:
+                n = int(cfg["window_rows"][tf])
+                cache[tf], added = fetch_ohlcv_incremental(exchange, symbol, tf, cache[tf], n)
+                adds_msg.append(f"{tf}(+{added})")
+                dfs_list.append(cache[tf])
+            print(f"[INFO] incremental update: {', '.join(adds_msg)}")
 
-            m5  = df.copy()
-            m10 = resample_ohlc(df, CONFIG["confirm_tf"])
-            m45 = resample_ohlc(df, CONFIG["signal_tf"])
+            if len(dfs_list[0]) == 0:
+                time.sleep(int(cfg["poll_interval_sec"])); continue
 
-            s45, ob45 = build_ob(m45, n_break=CONFIG["n_break"], atr_mult=CONFIG["atr_mult"])
-            fvg45 = find_fvg(m45)
-            pairs = pair_ob_fvg(ob45, fvg45)
-            if pairs.empty:
-                time.sleep(poll_s); continue
+            feats = build_multitimeframe_features_asof(dfs_list, prefixes=tf_list, base_tf=base_tf)
+            if len(feats) == 0:
+                time.sleep(int(cfg["poll_interval_sec"])); continue
 
-            # 최근 24시간 신호만 스캔
-            recent_pairs = pairs[pairs["time"] >= (m45.index[-1] - pd.Timedelta(hours=24))]
-            for _, p in recent_pairs.iterrows():
-                dirn = p["dir"]
-                z_low, z_high = (min(p["ob_start"], p["ob_end"]), max(p["ob_start"], p["ob_end"]))
-                start_time = p["time"]
-                future = m45.loc[start_time + pd.Timedelta(minutes=45):]
-                if future.empty:
-                    continue
+            X = feats.drop(columns=["timestamp"], errors="ignore")
+            x_last = X.iloc[[-1]]
 
-                max_seen, min_seen = -np.inf, np.inf
-                post_fvg = m45.loc[p["fvg_time"]:] if p["fvg_time"] in m45.index else future
+            # Price
+            ticker = exchange.fetch_ticker(symbol)
+            live_price = float(ticker["last"])
 
-                ob_key = f"{symbol}|{fmt_ts(p['ob_time'])}|{dirn}"
-                count = state["ob_counts"].get(ob_key, 0)
-                if count >= CONFIG["max_reentries_per_ob"]:
-                    continue
+            # Predict
+            raw_dir, raw_conf = predict_dir_conf(model, x_last)
 
-                # 가장 최신 3개(약 135분) 윈도를 검사
-                for t, bar in future.iloc[-4:].iterrows():
-                    if t in post_fvg.index:
-                        max_seen = max(max_seen, bar["high"])
-                        min_seen = min(min_seen, bar["low"] if np.isfinite(min_seen) else bar["low"])
-                    fill = fvg_fill_pct(dirn, p["fvg_low"], p["fvg_high"], max_seen, min_seen) if np.isfinite(max_seen) and np.isfinite(min_seen) else 0.0
-                    if fill >= CONFIG["fvg_invalidation"]:
-                        break
+            # Consistency / cooldown
+            prev_dir = state.get("enforced_direction", "FLAT")
+            cd_remain = int(state.get("cooldown_remaining", 0))
+            final_dir = prev_dir
 
-                    if not touched_zone(bar["high"], bar["low"], z_low, z_high):
-                        continue
-
-                    # 10m OR 5m 슬라이딩 컨펌
-                    win_start, win_end = t, t + pd.Timedelta(minutes=45)
-                    seg10 = m10.loc[(m10.index >= win_start) & (m10.index < win_end)]
-                    seg5  = m5.loc[(m5.index  >= win_start) & (m5.index  < win_end)]
-                    confirm = False
-
-                    if len(seg10) > 0:
-                        rng10 = (seg10["high"] - seg10["low"]).replace(0, np.nan)
-                        if dirn == "bull":
-                            strong10 = seg10[(seg10["close"] > seg10["open"]) & ((seg10["close"] - seg10["low"]) > 0.75*rng10)]
-                        else:
-                            strong10 = seg10[(seg10["close"] < seg10["open"]) & ((seg10["high"] - seg10["close"]) > 0.75*rng10)]
-                        confirm = len(strong10) > 0
-                    if not confirm and len(seg5) > 0:
-                        rng5 = (seg5["high"] - seg5["low"]).replace(0, np.nan)
-                        if dirn == "bull":
-                            strong5 = seg5[(seg5["close"] > seg5["open"]) & ((seg5["close"] - seg5["low"]) > 0.75*rng5)]
-                        else:
-                            strong5 = seg5[(seg5["close"] < seg5["open"]) & ((seg5["high"] - seg5["close"]) > 0.75*rng5)]
-                        confirm = len(strong5) > 0
-                    if not confirm:
-                        continue
-
-                    # Entry/SL/TP/Size/Lev
-                    if dirn == "bull":
-                        entry, stop = z_high, z_low
-                        rpu = entry - stop
-                        tp1 = entry + CONFIG["tp1_R"]*rpu
-                        tp2 = entry + CONFIG["tp2_R"]*rpu
-                        side = "LONG"
+            if cd_remain > 0:
+                cd_remain -= 1
+            else:
+                if raw_conf >= min_conf:
+                    if prev_dir == "FLAT":
+                        if raw_dir == 1:
+                            final_dir = "LONG"; cd_remain = cooldown_bars
+                        elif raw_dir == -1:
+                            final_dir = "SHORT"; cd_remain = cooldown_bars
                     else:
-                        entry, stop = z_low, z_high
-                        rpu = stop - entry
-                        tp1 = entry - CONFIG["tp1_R"]*rpu
-                        tp2 = entry - CONFIG["tp2_R"]*rpu
-                        side = "SHORT"
+                        if (prev_dir == "LONG" and raw_dir == -1) or (prev_dir == "SHORT" and raw_dir == 1):
+                            final_dir = "LONG" if raw_dir == 1 else "SHORT"
+                            cd_remain = cooldown_bars
 
-                    if rpu <= 0:
-                        continue
+            # Trigger-only: ENF 변경시에만 실행(주문/로그/텔레그램)
+            if final_dir != prev_dir:
+                # TP/SL 계산 (정보/주문용)
+                if final_dir == "LONG":
+                    tp = live_price * (1 + take_profit)
+                    sl = live_price * (1 - stop_loss)
+                elif final_dir == "SHORT":
+                    tp = live_price * (1 - take_profit)
+                    sl = live_price * (1 + stop_loss)
+                else:
+                    tp = None; sl = None
 
-                    risk_usd = CONFIG["risk_fraction"] * CONFIG["account_equity_usd"]
-                    size_units = risk_usd / rpu
-                    notional = size_units * entry
-                    implied_leverage = notional / CONFIG["account_equity_usd"]
+                # 1) 기존 포지션 정리
+                cur_side, cur_amt = fetch_net_position(exchange, symbol)
+                if cur_side != "FLAT":
+                    side_to_close = "sell" if cur_side == "LONG" else "buy"
+                    amt_to_close = abs(cur_amt)
+                    try:
+                        place_reduce_only_market(exchange, symbol, side_to_close, amt_to_close, amount_prec=amount_prec)
+                        print(f"[TRADE] Closed existing position {cur_side} amt={amt_to_close}")
+                    except Exception as e:
+                        print("[ERROR] close position failed:", e)
 
-                    # 중복 방지
-                    uniq_key = f"{side}|{round(float(entry),5)}|{fmt_ts(t)}"
-                    seen = state["seen_entries"].get(ob_key, [])
-                    if uniq_key in seen:
-                        continue
+                # 2) 새 포지션 진입
+                if final_dir in ("LONG", "SHORT"):
+                    free_usdt = get_free_usdt(exchange)
+                    if free_usdt <= 0:
+                        print("[WARN] No free USDT to enter.")
+                    else:
+                        notional_target = free_usdt * position_risk_fraction  # 잔고 10%
+                        try:
+                            res = place_entry_with_tp_sl(
+                                exchange, symbol, final_dir, live_price, tp, sl,
+                                notional_target, amount_prec, inline_params=True
+                            )
+                            print(f"[TRADE] Enter {final_dir} notional≈{notional_target:.2f} USDT @~{live_price:.2f}")
+                        except Exception as e:
+                            print("[ERROR] entry failed:", e)
 
-                    state["seen_entries"].setdefault(ob_key, []).append(uniq_key)
-                    state["ob_counts"][ob_key] = state["ob_counts"].get(ob_key, 0) + 1
-                    save_state(CONFIG["state_file"], state)
+                # 3) 로그 & 텔레그램
+                msg = (
+                    f"{now_iso()}  {symbol:>12}  TRADE_TRIGGER  "
+                    f"RAW={dir_to_str(raw_dir):>5} p={raw_conf:.2f}  "
+                    f"→ ENF={final_dir:<5}  cd={cd_remain:2d}  price={live_price:.4f}"
+                )
+                print(msg)
+                append_log_row(cfg["log_path"], {
+                    "timestamp": now_iso(),
+                    "symbol": symbol,
+                    "raw_direction": dir_to_str(raw_dir),
+                    "raw_confidence": f"{raw_conf:.6f}",
+                    "price": f"{live_price:.6f}",
+                    "enforced_direction": final_dir,
+                    "cooldown_remaining": cd_remain,
+                    "tp": f"{tp:.6f}" if tp is not None else "",
+                    "sl": f"{sl:.6f}" if sl is not None else "",
+                })
+                if tg_enabled:
+                    send_telegram(tg_token, tg_chat_id, msg)
 
-                    text = (
-                        f"📣 *OB+FVG 진입 신호* ({CONFIG['symbol']})\n"
-                        f"• 방향: *{side}*\n"
-                        f"• 시그널(45m): {fmt_ts(p['time'])}\n"
-                        f"• OB 형성: {fmt_ts(p['ob_time'])}\n"
-                        f"• 리테스트 감지: {fmt_ts(t)}\n"
-                        f"\n"
-                        f"• 진입가: `{entry:.5f}`\n"
-                        f"• 손절가: `{stop:.5f}`\n"
-                        f"• 익절1(1.5R): `{tp1:.5f}`\n"
-                        f"• 익절2(3.0R): `{tp2:.5f}`\n"
-                        f"\n"
-                        f"• 계좌위험: `{risk_usd:.2f} USDT` ({int(CONFIG['risk_fraction']*100)}%)\n"
-                        f"• 포지션 수량: `{size_units:.2f}` {CONFIG['symbol'].split('/')[0]}\n"
-                        f"• 추정 레버리지: `x{implied_leverage:.2f}`\n"
-                        f"\n"
-                        f"_ATR×{CONFIG['atr_mult']}, N={CONFIG['n_break']}, FVG 무효 {int(CONFIG['fvg_invalidation']*100)}%, 재진입 최대 {CONFIG['max_reentries_per_ob']}회_"
-                    )
-                    tg_send_message(text)
+            # 상태 저장
+            state = {"enforced_direction": final_dir, "cooldown_remaining": cd_remain}
 
-            time.sleep(poll_s)
-
+            time.sleep(int(cfg["poll_interval_sec"]))
+        except KeyboardInterrupt:
+            print("\nStopped by user.")
+            break
+        except NotFittedError:
+            print("[WARN] model not fitted. Training...")
+            model = train_or_load_model(cfg, feats, base_tf)
         except Exception as e:
-            tg_send_message(f"⚠️ Bot 오류: {e}")
-            time.sleep(5)
+            print("Loop error:", e)
+            traceback.print_exc()
+            time.sleep(int(cfg["poll_interval_sec"]))
 
 if __name__ == "__main__":
     main()
