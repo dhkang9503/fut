@@ -522,7 +522,7 @@ def main():
                 cache[tf], added = fetch_ohlcv_incremental(exchange, symbol, tf, cache[tf], n)
                 adds_msg.append(f"{tf}(+{added})")
                 dfs_list.append(cache[tf])
-            print(f"[INFO] incremental update: {', '.join(adds_msg)}")
+            # print(f"[INFO] incremental update: {', '.join(adds_msg)}")
 
             if len(dfs_list[0]) == 0:
                 time.sleep(int(cfg["poll_interval_sec"])); continue
