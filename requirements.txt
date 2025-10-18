@@ -1,10 +1,4 @@
-ccxt
+python-binance
 pandas
 numpy
-ta
-lightgbm
-scikit-learn
-joblib
-PyYAML
 requests
-python-dotenv
