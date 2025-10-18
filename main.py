@@ -10,7 +10,8 @@ TZ = "Asia/Seoul"
 K = 2.0
 THR_MIN, THR_MAX = 0.002, 0.03       # 0.2%~3%
 ATR_LEN, ATR_WIN = 14, 30
-TELEGRAM_BOT=os.getenv('TELEGRAM_BOT_TOKEN'), CHAT_ID=os.getenv('TELEGRAM_CHAT_ID')          # 선택
+TELEGRAM_BOT = os.getenv('TELEGRAM_BOT_TOKEN')
+CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')          # 선택
 
 # ---- 상태 변수 ----
 direction = 0       # +1 up-leg, -1 down-leg, 0 init
