@@ -7,23 +7,31 @@ OKX USDT Perpetual Futures (BTC/USDT:USDT) 자동매매 봇
 전략 요약:
 - 차트: 5분봉
 - 지표: MA50, MA200 (종가 기준 단순이동평균)
+
 - 진입 (롱만):
-    1) MA50 < MA200
+    1) MA50 < MA200  (중기 하락 구간)
     2) MA50(i) > MA50(i-1)  → MA50 우상향
     3) 종가(i) > MA50(i)
     4) 포지션 없음
-   → 다음 틱에서 시장가 롱 진입
+   → 위 조건이 "막 닫힌 5분봉"에서 성립하면, 다음에 시장가 롱 진입
+
+- 포지션 크기:
+    - 계좌 USDT Equity 100% 기준
+    - 레버리지 6배 고정
+    - notional = equity_total * 6
+    - amount = notional / entry_price
 
 - 손절:
-    - 진입가 기준 -0.5% (STOP_PCT = 0.005)
-    - 레버리지 6배 → 계좌 기준 약 -3% 손실
+    - 진입가 기준 -0.5% 미만 (entry_price * 0.995 이하)에서
+      시장가 전량 손절
 
 - 익절:
-    - MA50이 MA200을 골든크로스하는 시점에 전량 시장가 청산
+    - MA50이 MA200을 골든크로스 (위로 돌파)하면
+      시장가 전량 익절
 
 ⚠️ 주의:
-- 반드시 OKX demo / 소액으로 먼저 테스트
-- 코드 로직, 리스크 계산을 충분히 이해한 뒤 실전에 사용
+- 반드시 OKX Demo(샌드박스) / 소액으로 먼저 테스트
+- API 키는 Demo/실계정 환경에 맞게 별도 발급해야 함
 """
 
 import os
@@ -51,8 +59,8 @@ MA_SHORT = 50
 MA_LONG = 200
 
 STOP_PCT = 0.005      # 0.5% 손절
-LEVERAGE = 6          # 6배 레버리지 → 계좌 기준 약 3% 리스크
-LOOP_INTERVAL = 5     # 몇 초마다 루프 돌릴지
+LEVERAGE = 6          # 6배 레버리지 고정
+LOOP_INTERVAL = 5     # 몇 초마다 루프 돌릴지 (초 단위)
 
 # 로깅 설정
 logging.basicConfig(
@@ -74,10 +82,10 @@ def init_exchange():
         },
     })
 
-    # 샌드박스(모의거래) 모드 사용하려면 주석 해제
+    # 🔹 데모 트레이딩(모의 거래) 사용할 때는 sandbox 모드를 켜야 함
     exchange.set_sandbox_mode(True)
 
-    # 포지션 모드: net (롱/숏 합산, posSide 안 써도 됨)
+    # 포지션 모드: net (롱/숏 합산 모드)
     try:
         exchange.set_position_mode(hedged=False)
         logging.info("포지션 모드: net 설정 완료")
@@ -132,9 +140,9 @@ def get_last_closed_candles(df: pd.DataFrame):
 
 def fetch_futures_equity(exchange):
     """
-    선물(스왑) 계좌에서 USDT equity 추정.
-    OKX는 계정 구조가 복잡하지만, 여기서는 단순히
-    fetch_balance()['USDT']['total'] 로 사용.
+    선물(USDT-M) 계좌에서 USDT equity 추정.
+    단순화: fetch_balance()['USDT']['total'] 사용.
+    실제로는 account 유형에 따라 세부 조정 필요할 수 있음.
     """
     balance = exchange.fetch_balance()
     usdt = balance.get("USDT", {})
@@ -145,9 +153,17 @@ def fetch_futures_equity(exchange):
 
 def compute_order_size_futures(entry_price, equity_total):
     """
-    레버리지 6배, 손절 -0.5% 기준으로:
-    - 포지션 notional = equity_total * LEVERAGE
-    - 가격이 0.5% 반대로 가면 equity 약 3% 손실
+    계좌 equity 100%를 기준으로 6배 레버리지 포지션 크기 계산.
+
+    notional = equity_total * LEVERAGE
+    amount = notional / entry_price
+
+    예)
+    - equity_total = 1000 USDT
+    - LEVERAGE = 6
+    - notional = 6000 USDT
+    - entry_price = 60000 USDT라면,
+      amount = 6000 / 60000 = 0.1 BTC
     """
     if entry_price <= 0 or equity_total <= 0:
         return 0.0
@@ -155,7 +171,7 @@ def compute_order_size_futures(entry_price, equity_total):
     notional = equity_total * LEVERAGE
     amount = notional / entry_price
 
-    # 수량 소수점 자리 조정 (BTC 선물은 보통 0.001 단위 이상 가능)
+    # BTC 수량 소수점 자리 조정 (OKX 규칙에 맞게 0.001 단위로 내림)
     amount = math.floor(amount * 1000) / 1000
     return max(amount, 0.0)
 
@@ -165,7 +181,6 @@ def get_current_price(exchange, symbol):
     ticker = exchange.fetch_ticker(symbol)
     last = ticker.get("last")
     if last is None:
-        # fallback: 종가 사용
         last = ticker.get("close")
     return float(last)
 
@@ -214,7 +229,7 @@ def main():
     position_size = 0.0
     stop_price = None
     entry_time = None
-    last_signal_candle_ts = None  # 같은 캔들에서 중복 진입 방지용
+    last_signal_candle_ts = None  # 같은 캔들 재진입 방지용
 
     while True:
         try:
@@ -236,7 +251,7 @@ def main():
 
             # ---------------- 포지션 있는 경우: 손절 / 익절 ---------------- #
             if in_position:
-                # 1) 손절: 현재가가 stop_price 아래면 시장가 전량 청산
+                # 1) 손절: 현재가가 stop_price 이하이면 시장가 전량 청산
                 if stop_price is not None and current_price <= stop_price:
                     logging.info(
                         f"[STOP] 현재가 {current_price:.2f} <= 스탑 {stop_price:.2f} → 시장가 손절"
@@ -289,8 +304,8 @@ def main():
 
             # ---------------- 포지션 없는 경우: 진입 신호 체크 ---------------- #
             else:
-                # 같은 캔들에서 중복 진입 방지
                 if last_signal_candle_ts is not None and curr_ts == last_signal_candle_ts:
+                    # 이미 이 캔들에서 처리함
                     pass
                 else:
                     if check_entry_signal(prev, curr):
@@ -312,20 +327,23 @@ def main():
                                     amount=amount,
                                     params={
                                         "tdMode": "cross",   # 교차 마진
-                                        # net 모드라 posSide 생략
                                     },
                                 )
                                 logging.info(f"진입 주문 체결: {order}")
 
-                                entry_price = est_entry_price  # 단순 close 기준
+                                # 실제 체결 평균가를 쓰고 싶다면:
+                                # entry_price = float(order.get("average", est_entry_price))
+                                entry_price = est_entry_price
                                 position_size = amount
                                 in_position = True
                                 entry_time = datetime.now(timezone.utc)
 
+                                # 진입가 기준 -0.5% 손절
                                 stop_price = entry_price * (1.0 - STOP_PCT)
                                 logging.info(
                                     f"진입가={entry_price:.2f}, 수량={position_size}, "
-                                    f"스탑로스={stop_price:.2f} (레버리지 {LEVERAGE}x, 계좌 리스크 ~3%)"
+                                    f"스탑로스={stop_price:.2f} (레버리지 {LEVERAGE}x, "
+                                    f"계좌 100% 기준 진입)"
                                 )
 
                                 last_signal_candle_ts = curr_ts
