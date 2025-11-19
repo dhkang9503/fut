@@ -56,7 +56,7 @@ def init_exchange():
     })
 
     # 데모 트레이딩이면 켜기
-    # exchange.set_sandbox_mode(True)
+    exchange.set_sandbox_mode(True)
 
     try:
         exchange.set_position_mode(hedged=False)
