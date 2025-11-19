@@ -1,4 +1,2 @@
-python-binance
+ccxt
 pandas
-numpy
-requests
