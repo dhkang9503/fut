@@ -67,7 +67,7 @@ STOP_PCT = 0.005      # 0.5% 손절
 LEVERAGE = 6          # 6배 레버리지
 LOOP_INTERVAL = 5     # 루프 주기(초)
 
-POSITION_USAGE = 0.95
+POSITION_USAGE = 0.92
 
 logging.basicConfig(
     level=logging.INFO,
