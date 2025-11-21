@@ -243,16 +243,16 @@ def check_long_tp(prev, curr):
     """롱 익절: MA50 / MA200 골든크로스."""
     if any(pd.isna([prev["ma50"], prev["ma200"], curr["ma50"], curr["ma200"]])):
         return False
-    # return (prev["ma50"] <= prev["ma200"]) and (curr["ma50"] > curr["ma200"])
-    return curr["ma50"] > curr["ma200"]
+    return (prev["ma50"] <= prev["ma200"]) and (curr["ma50"] > curr["ma200"])
+    # return curr["ma50"] > curr["ma200"]
 
 
 def check_short_tp(prev, curr):
     """숏 익절: MA50 / MA200 데드크로스."""
     if any(pd.isna([prev["ma50"], prev["ma200"], curr["ma50"], curr["ma200"]])):
         return False
-    # return (prev["ma50"] >= prev["ma200"]) and (curr["ma50"] < curr["ma200"])
-    return curr["ma50"] < curr["ma200"]
+    return (prev["ma50"] >= prev["ma200"]) and (curr["ma50"] < curr["ma200"])
+    # return curr["ma50"] < curr["ma200"]
 
 
 # ============== 메인 루프 ============== #
