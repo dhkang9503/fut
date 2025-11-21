@@ -67,6 +67,8 @@ STOP_PCT = 0.005      # 0.5% 손절
 LEVERAGE = 6          # 6배 레버리지
 LOOP_INTERVAL = 5     # 루프 주기(초)
 
+POSITION_USAGE = 0.95
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -150,7 +152,7 @@ def compute_order_size_futures(entry_price, equity_total):
     if entry_price <= 0 or equity_total <= 0:
         return 0.0
 
-    notional = equity_total * LEVERAGE
+    notional = equity_total * LEVERAGE * POSITION_USAGE
     amount = notional / entry_price
 
     # 수량 소수점 자리 조정 (0.001 단위 내림)
