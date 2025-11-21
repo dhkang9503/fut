@@ -13,8 +13,8 @@ import pandas as pd
 # 설정
 # ======================
 API_KEY = os.getenv("OKX_API_KEY", "YOUR_API_KEY")
-SECRET = os.getenv("OKX_SECRET", "YOUR_SECRET")
-PASSWORD = os.getenv("OKX_PASSWORD", "YOUR_PASSWORD")  # OKX passphrase
+SECRET = os.getenv("OKX_API_SECRET", "YOUR_SECRET")
+PASSWORD = os.getenv("OKX_API_PASSPHRASE", "YOUR_PASSWORD")  # OKX passphrase
 
 # 데모 / 실계정 선택
 USE_TESTNET = True  # 데모 트레이딩이면 True
