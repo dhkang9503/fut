@@ -31,7 +31,7 @@ MA_SLOW = 200
 
 LEVERAGE = 6          # 고정 레버리지
 STOP_PCT = 0.005      # -0.5% 가격 움직임에 손절 (진입가 기준)
-POLL_INTERVAL = 10    # 초
+POLL_INTERVAL = 5    # 초
 
 logging.basicConfig(
     level=logging.INFO,
