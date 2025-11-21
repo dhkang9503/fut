@@ -175,7 +175,7 @@ def open_position_and_set_sl(
         return
 
     # 풀시드 기준: 계좌 equity 전부 × 레버리지
-    notional = total * LEVERAGE
+    notional = total * LEVERAGE * 0.92
     ticker = ex.fetch_ticker(symbol)
     price = ticker["last"]
     amount = notional / price
