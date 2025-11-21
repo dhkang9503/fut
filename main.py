@@ -1,44 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-OKX USDT Perpetual Futures 자동매매 봇 (멀티심볼: BTC + XRP + DOGE)
-
-전략 요약:
-
-[공통 환경]
-- 거래소: OKX
-- 심볼: BTC/USDT:USDT, XRP/USDT:USDT, DOGE/USDT:USDT (USDT 무기한)
-- 타임프레임: 5분봉
-- 포지션: 세 심볼 통틀어 항상 1개만 보유
-- 포지션 크기: 손절 도달 시 계좌의 약 3% 손실로 고정 (ma_gap 기반 동적 스탑)
-
-[롱 전략]
-- 조건 (최근 닫힌 캔들 기준):
-    1) MA50 < MA200
-    2) MA50(i) > MA50(i-1)  (MA50 우상향)
-    3) close(i) > MA50(i)
-- 진입: 위 조건 만족 & 무포지션일 때, 다음 봉 시가에 시장가 롱 진입
-- 손절: ma_gap = |MA50 - MA200| / close (진입 직전 캔들 기준, 0.3%~2%로 조정)
-         stop_pct = ma_gap, stop = "실제 진입가" * (1 - stop_pct)
-         포지션 크기는 stop까지 손실이 계좌의 3%가 되도록 계산
-- 익절: MA50이 MA200을 위로 골든크로스할 때 시장가 전량 익절
-
-[숏 전략 - LH 필터]
-- 조건:
-    1) MA50 > MA200
-    2) MA50(i) < MA50(i-1)  (MA50 우하향)
-    3) close(i) < MA50(i)
-    4) Lower High (LH) 필터:
-       - high(i) < high(i-1)
-       - high(i-1) > high(i-2)
-- 진입: 위 조건 만족 & 무포지션일 때, 다음 봉 시가에 시장가 숏 진입
-- 손절: ma_gap = |MA50 - MA200| / close (진입 직전 캔들 기준, 0.3%~2%로 조정)
-         stop_pct = ma_gap, stop = "실제 진입가" * (1 + stop_pct)
-         포지션 크기는 stop까지 손실이 계좌의 3%가 되도록 계산
-- 익절: MA50이 MA200을 아래로 데드크로스할 때 시장가 전량 익절
-"""
-
 import os
 import time
 import math
@@ -80,7 +39,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-
 # ============== OKX 초기화 ============== #
 
 def init_exchange():
@@ -111,14 +69,12 @@ def init_exchange():
     # 심볼별 레버리지 / 마진모드 설정
     for sym in SYMBOLS:
         try:
-            # 여기서 설정하는 레버리지는 '최대 허용 레버리지' 느낌으로 사용
             exchange.set_leverage(MAX_LEVERAGE, sym, params={"mgnMode": "cross"})
             logging.info(f"{sym} 레버리지 {MAX_LEVERAGE}배, cross 마진 설정 완료")
         except Exception as e:
             logging.warning(f"{sym} 레버리지/마진 설정 실패 (무시 가능): {e}")
 
     return exchange
-
 
 # ============== 유틸 함수들 ============== #
 
@@ -135,14 +91,12 @@ def fetch_ohlcv_df(exchange, symbol, timeframe, limit=300):
     df.set_index("dt", inplace=True)
     return df
 
-
 def calculate_indicators(df: pd.DataFrame):
     """MA50, MA200 및 ma_gap 계산."""
     df["ma50"] = df["close"].rolling(MA_SHORT).mean()
     df["ma200"] = df["close"].rolling(MA_LONG).mean()
     df["ma_gap"] = (df["ma50"] - df["ma200"]).abs() / df["close"]
     return df
-
 
 def fetch_futures_equity(exchange):
     """선물(USDT-M) 계좌에서 USDT equity 추정."""
@@ -151,7 +105,6 @@ def fetch_futures_equity(exchange):
     total = float(usdt.get("total", 0.0))
     free = float(usdt.get("free", 0.0))
     return free, total
-
 
 def calc_ma_gap_pct_from_row(row):
     """
@@ -170,7 +123,6 @@ def calc_ma_gap_pct_from_row(row):
         return 0.01
 
     return max(MIN_STOP_PCT, min(MAX_STOP_PCT, float(gap)))
-
 
 def compute_order_size_risk_based(exchange, symbol, entry_price, equity_total, stop_pct):
     """
@@ -210,20 +162,36 @@ def compute_order_size_risk_based(exchange, symbol, entry_price, equity_total, s
     effective_leverage = (amount * notional_per_contract) / equity_total
     return amount, effective_leverage
 
-
-def sync_position(exchange, symbols):
+def sync_positions(exchange, symbols):
     """
     OKX 선물 포지션 조회.
-    세 심볼 중 하나라도 포지션이 있을 경우:
-    - 리턴: (has_position, symbol, side, size, entry_price)
+    각 심볼별 포지션 상태를 딕셔너리로 반환.
+    리턴: {
+        symbol: {
+            "has_position": bool,
+            "side": "long"/"short"/None,
+            "size": float,
+            "entry_price": float 또는 None,
+        },
+        ...
+    }
     """
+    result = {
+        sym: {
+            "has_position": False,
+            "side": None,
+            "size": 0.0,
+            "entry_price": None,
+        }
+        for sym in symbols
+    }
+
     try:
         positions = exchange.fetch_positions()
     except Exception as e:
         logging.warning(f"포지션 조회 실패: {e}")
-        return False, None, None, 0.0, None
+        return result
 
-    active = []
     for p in positions:
         sym = p.get("symbol")
         if sym not in symbols:
@@ -233,15 +201,14 @@ def sync_position(exchange, symbols):
             continue
         side = "long" if contracts > 0 else "short"
         entry_price = float(p.get("entryPrice") or 0)
-        active.append((sym, side, abs(contracts), entry_price))
+        result[sym] = {
+            "has_position": True,
+            "side": side,
+            "size": abs(contracts),
+            "entry_price": entry_price if entry_price > 0 else None,
+        }
 
-    if len(active) == 0:
-        return False, None, None, 0.0, None
-    if len(active) > 1:
-        logging.warning(f"여러 심볼에 동시에 포지션이 있습니다: {active} (전략은 1포지션만 가정)")
-    sym, side, size, entry_price = active[0]
-    return True, sym, side, size, entry_price
-
+    return result
 
 # ============== 전략 조건 함수들 ============== #
 
@@ -254,7 +221,6 @@ def check_long_entry(prev, curr):
         (curr["ma50"] > prev["ma50"]) and
         (curr["close"] > curr["ma50"])
     )
-
 
 def check_short_entry_lh(prev2, prev, curr):
     """숏 진입 조건 + Lower High 필터."""
@@ -271,13 +237,11 @@ def check_short_entry_lh(prev2, prev, curr):
 
     return base and lh
 
-
 def check_long_tp(prev, curr):
     """롱 익절: MA50 / MA200 골든크로스 이후 구간."""
     if any(pd.isna([prev["ma50"], prev["ma200"], curr["ma50"], curr["ma200"]])):
         return False
     return curr["ma50"] > curr["ma200"]
-
 
 def check_short_tp(prev, curr):
     """숏 익절: MA50 / MA200 데드크로스 이후 구간."""
@@ -285,21 +249,25 @@ def check_short_tp(prev, curr):
         return False
     return curr["ma50"] < curr["ma200"]
 
-
 # ============== 메인 루프 ============== #
 
 def main():
     exchange = init_exchange()
-    logging.info("OKX BTC+XRP+DOGE 롱/숏 자동매매 봇 시작 (ma_gap 기반 + 리스크 3% 고정)")
+    logging.info("OKX BTC+XRP+DOGE 롱/숏 자동매매 봇 시작 (ma_gap 기반 + 리스크 3% 고정, 심볼별 포지션 허용)")
 
-    in_position = False
-    pos_symbol = None
-    pos_side = None          # "long" or "short"
-    entry_price = None
-    position_size = 0.0
-    stop_price = None
-    stop_order_id = None
-    entry_time = None
+    # 심볼별 포지션 상태 관리용
+    pos_state = {
+        sym: {
+            "side": None,           # "long" or "short"
+            "size": 0.0,
+            "entry_price": None,
+            "stop_price": None,
+            "stop_order_id": None,
+            "entry_time": None,
+        }
+        for sym in SYMBOLS
+    }
+
     last_signal_candle_ts = {}  # 심볼별 마지막 신호 캔들 ts
 
     while True:
@@ -325,243 +293,265 @@ def main():
                 time.sleep(LOOP_INTERVAL)
                 continue
 
-            # --- 실제 포지션 상태 동기화 --- #
-            has_pos, exch_sym, exch_side, exch_size, exch_entry = sync_position(exchange, SYMBOLS)
+            # --- 실제 포지션 상태 동기화 (심볼별) --- #
+            exch_positions = sync_positions(exchange, SYMBOLS)
 
-            if not has_pos:
-                if in_position:
-                    logging.info("거래소 포지션이 사라짐 → 로컬 상태 초기화 (스탑로스 or 수동 청산)")
-                in_position = False
-                pos_symbol = None
-                pos_side = None
-                position_size = 0.0
-                entry_price = None
-                stop_price = None
-                stop_order_id = None
-            else:
-                in_position = True
-                pos_symbol = exch_sym
-                pos_side = exch_side
-                position_size = exch_size
-                if exch_entry > 0:
-                    entry_price = exch_entry
+            for sym in SYMBOLS:
+                exch_pos = exch_positions.get(sym, {})
+                has_pos = exch_pos.get("has_position", False)
 
-            # ---------------- 포지션 있는 경우: 익절만 관리 ---------------- #
-            if in_position:
-                if pos_symbol not in data:
-                    logging.warning(f"{pos_symbol} 데이터가 없어 익절 체크 불가. 대기.")
+                if not has_pos:
+                    # 거래소 포지션이 사라졌는데 로컬 상태에는 남아 있으면, 스탑로스/수동청산 등으로 봄
+                    if pos_state[sym]["side"] is not None and pos_state[sym]["size"] > 0:
+                        logging.info(f"[{sym}] 거래소 포지션이 사라짐 → 로컬 상태 초기화 (스탑로스 or 수동 청산)")
+                    pos_state[sym]["side"] = None
+                    pos_state[sym]["size"] = 0.0
+                    pos_state[sym]["entry_price"] = None
+                    pos_state[sym]["stop_price"] = None
+                    pos_state[sym]["stop_order_id"] = None
+                    pos_state[sym]["entry_time"] = None
                 else:
-                    _, prev2, prev, curr = data[pos_symbol]
-                    if pos_side == "long":
-                        if check_long_tp(prev, curr):
-                            logging.info(f"[TP LONG] {pos_symbol} 골든크로스 → 시장가 롱 익절")
-                            try:
-                                order = exchange.create_order(
-                                    pos_symbol,
-                                    type="market",
-                                    side="sell",
-                                    amount=position_size,
-                                    params={
-                                        "tdMode": "cross",
-                                        "reduceOnly": True,
-                                    },
-                                )
-                                logging.info(f"{pos_symbol} 롱 익절 주문 체결: {order}")
-                            except Exception as e:
-                                logging.error(f"{pos_symbol} 롱 익절 주문 실패: {e}")
+                    # 거래소 포지션이 있는 경우 로컬 상태 갱신
+                    pos_state[sym]["side"] = exch_pos.get("side")
+                    pos_state[sym]["size"] = exch_pos.get("size", 0.0)
+                    entry_price = exch_pos.get("entry_price")
+                    if entry_price and entry_price > 0:
+                        pos_state[sym]["entry_price"] = entry_price
 
-                            if stop_order_id is not None:
-                                try:
-                                    exchange.cancel_order(stop_order_id, pos_symbol)
-                                    logging.info(f"{pos_symbol} 롱 스탑 주문 취소: {stop_order_id}")
-                                except Exception as e:
-                                    logging.warning(f"{pos_symbol} 롱 스탑 취소 실패(이미 체결/취소됐을 수 있음): {e}")
+            # ---------------- 포지션 있는 심볼들: 익절 관리 ---------------- #
+            for sym in SYMBOLS:
+                if sym not in data:
+                    continue
 
-                            in_position = False
-                            pos_symbol = None
-                            pos_side = None
-                            position_size = 0.0
-                            entry_price = None
-                            stop_price = None
-                            stop_order_id = None
-                            entry_time = None
+                side = pos_state[sym]["side"]
+                size = pos_state[sym]["size"]
 
-                    elif pos_side == "short":
-                        if check_short_tp(prev, curr):
-                            logging.info(f"[TP SHORT] {pos_symbol} 데드크로스 → 시장가 숏 익절")
-                            try:
-                                order = exchange.create_order(
-                                    pos_symbol,
-                                    type="market",
-                                    side="buy",
-                                    amount=position_size,
-                                    params={
-                                        "tdMode": "cross",
-                                        "reduceOnly": True,
-                                    },
-                                )
-                                logging.info(f"{pos_symbol} 숏 익절 주문 체결: {order}")
-                            except Exception as e:
-                                logging.error(f"{pos_symbol} 숏 익절 주문 실패: {e}")
+                if side is None or size <= 0:
+                    continue  # 이 심볼은 포지션 없음
 
-                            if stop_order_id is not None:
-                                try:
-                                    exchange.cancel_order(stop_order_id, pos_symbol)
-                                    logging.info(f"{pos_symbol} 숏 스탑 주문 취소: {stop_order_id}")
-                                except Exception as e:
-                                    logging.warning(f"{pos_symbol} 숏 스탑 취소 실패(이미 체결/취소됐을 수 있음): {e}")
+                _, prev2, prev, curr = data[sym]
 
-                            in_position = False
-                            pos_symbol = None
-                            pos_side = None
-                            position_size = 0.0
-                            entry_price = None
-                            stop_price = None
-                            stop_order_id = None
-                            entry_time = None
-
-            # ---------------- 포지션 없는 경우: 각 심볼 신호 체크 후 하나만 진입 ---------------- #
-            else:
-                # 심볼 순서: BTC → XRP → DOGE
-                for sym in SYMBOLS:
-                    if sym not in data:
-                        continue
-                    df_sym, prev2, prev, curr = data[sym]
-                    curr_ts = int(curr["ts"])
-
-                    # 같은 심볼의 같은 캔들에서 중복 진입 방지
-                    if sym in last_signal_candle_ts and last_signal_candle_ts[sym] == curr_ts:
-                        continue
-
-                    long_signal = check_long_entry(prev, curr)
-                    short_signal = check_short_entry_lh(prev2, prev, curr)
-
-                    if not (long_signal or short_signal):
-                        continue
-
-                    free_eq, total_eq = fetch_futures_equity(exchange)
-                    logging.info(f"[{sym}] USDT Equity (free={free_eq}, total={total_eq})")
-
-                    if total_eq <= 0:
-                        logging.warning(f"[{sym}] equity가 0 이하입니다. 진입 스킵.")
-                        continue
-
-                    est_entry_price = float(curr["close"])
-                    if est_entry_price <= 0:
-                        logging.warning(f"[{sym}] 유효하지 않은 추정 진입가입니다. 진입 스킵.")
-                        continue
-
-                    # ma_gap 기반 stop_pct 계산
-                    ma_gap_pct = calc_ma_gap_pct_from_row(curr)
-
-                    # 리스크 3% 기반 포지션 크기 계산
-                    amount, eff_lev = compute_order_size_risk_based(
-                        exchange,
-                        sym,
-                        est_entry_price,
-                        total_eq,
-                        ma_gap_pct
-                    )
-                    if amount <= 0:
-                        logging.warning(f"[{sym}] 포지션 수량이 0입니다. 진입 스킵.")
-                        continue
-
-                    try:
-                        if long_signal:
-                            side = "buy"
-                            pos_side = "long"
-                            log_side = "LONG"
-                        else:
-                            side = "sell"
-                            pos_side = "short"
-                            log_side = "SHORT"
-
-                        logging.info(
-                            f"[ENTRY {log_side}] {sym} 진입 신호 발생 / stop_pct={ma_gap_pct*100:.3f}%%, "
-                            f"target_lev≈{RISK_PER_TRADE/ma_gap_pct:.2f}x, eff_lev≈{eff_lev:.2f}x"
-                        )
-
-                        order = exchange.create_order(
-                            sym,
-                            type="market",
-                            side=side,
-                            amount=amount,
-                            params={
-                                "tdMode": "cross",
-                            },
-                        )
-                        logging.info(f"[{sym}] {log_side} 진입 주문 체결: {order}")
-
-                        # 🔹 실제 포지션 진입가/사이즈를 다시 조회해서 SL 기준으로 사용
-                        actual_entry_price = est_entry_price
-                        actual_size = amount
-
-                        # 체결 반영 기다렸다가 포지션 조회 (최대 5번 재시도)
-                        time.sleep(0.5)
-                        for _ in range(5):
-                            has_pos2, sym2, side2, size2, entry2 = sync_position(exchange, SYMBOLS)
-                            if has_pos2 and sym2 == sym and size2 > 0 and entry2 and entry2 > 0:
-                                actual_entry_price = entry2
-                                actual_size = size2
-                                pos_side = side2  # 거래소 기준으로 덮어쓰기
-                                break
-                            time.sleep(0.3)
-
-                        in_position = True
-                        pos_symbol = sym
-                        position_size = actual_size
-                        entry_time = datetime.now(timezone.utc)
-                        entry_price = actual_entry_price
-
-                        # 손절 가격 계산 (실제 진입가 기준, ma_gap_pct 사용)
-                        if pos_side == "long":
-                            stop_price = entry_price * (1.0 - ma_gap_pct)
-                            sl_side = "sell"
-                        else:
-                            stop_price = entry_price * (1.0 + ma_gap_pct)
-                            sl_side = "buy"
-
-                        # 조건부 스탑마켓 주문 (reduceOnly)
+                if side == "long":
+                    if check_long_tp(prev, curr):
+                        logging.info(f"[TP LONG] {sym} 골든크로스 → 시장가 롱 익절")
                         try:
-                            sl_order = exchange.create_order(
+                            order = exchange.create_order(
                                 sym,
                                 type="market",
-                                side=sl_side,
-                                amount=position_size,
+                                side="sell",
+                                amount=size,
                                 params={
                                     "tdMode": "cross",
                                     "reduceOnly": True,
-                                    "stopLossPrice": stop_price,
                                 },
                             )
-                            stop_order_id = sl_order.get("id")
-                            logging.info(
-                                f"[{sym}] {log_side} 스탑로스 주문 생성: id={stop_order_id}, "
-                                f"트리거 가격={stop_price:.6f}, stop_pct={ma_gap_pct*100:.3f}%%"
-                            )
+                            logging.info(f"{sym} 롱 익절 주문 체결: {order}")
                         except Exception as e:
-                            logging.error(f"[{sym}] {log_side} 스탑로스 주문 생성 실패! 수동 확인 필요: {e}")
-                            stop_order_id = None
+                            logging.error(f"{sym} 롱 익절 주문 실패: {e}")
 
-                        logging.info(
-                            f"[{sym}] {log_side} 실제 진입가={entry_price:.6f}, 수량={position_size}, "
-                            f"스탑로스={stop_price:.6f} (stop_pct={ma_gap_pct*100:.3f}%%)"
+                        stop_order_id = pos_state[sym]["stop_order_id"]
+                        if stop_order_id is not None:
+                            try:
+                                exchange.cancel_order(stop_order_id, sym)
+                                logging.info(f"{sym} 롱 스탑 주문 취소: {stop_order_id}")
+                            except Exception as e:
+                                logging.warning(f"{sym} 롱 스탑 취소 실패(이미 체결/취소됐을 수 있음): {e}")
+
+                        # 이 심볼 포지션 상태 리셋
+                        pos_state[sym]["side"] = None
+                        pos_state[sym]["size"] = 0.0
+                        pos_state[sym]["entry_price"] = None
+                        pos_state[sym]["stop_price"] = None
+                        pos_state[sym]["stop_order_id"] = None
+                        pos_state[sym]["entry_time"] = None
+
+                elif side == "short":
+                    if check_short_tp(prev, curr):
+                        logging.info(f"[TP SHORT] {sym} 데드크로스 → 시장가 숏 익절")
+                        try:
+                            order = exchange.create_order(
+                                sym,
+                                type="market",
+                                side="buy",
+                                amount=size,
+                                params={
+                                    "tdMode": "cross",
+                                    "reduceOnly": True,
+                                },
+                            )
+                            logging.info(f"{sym} 숏 익절 주문 체결: {order}")
+                        except Exception as e:
+                            logging.error(f"{sym} 숏 익절 주문 실패: {e}")
+
+                        stop_order_id = pos_state[sym]["stop_order_id"]
+                        if stop_order_id is not None:
+                            try:
+                                exchange.cancel_order(stop_order_id, sym)
+                                logging.info(f"{sym} 숏 스탑 주문 취소: {stop_order_id}")
+                            except Exception as e:
+                                logging.warning(f"{sym} 숏 스탑 취소 실패(이미 체결/취소됐을 수 있음): {e}")
+
+                        # 이 심볼 포지션 상태 리셋
+                        pos_state[sym]["side"] = None
+                        pos_state[sym]["size"] = 0.0
+                        pos_state[sym]["entry_price"] = None
+                        pos_state[sym]["stop_price"] = None
+                        pos_state[sym]["stop_order_id"] = None
+                        pos_state[sym]["entry_time"] = None
+
+            # ---------------- 포지션 없는 심볼들: 각 심볼 신호 체크 후 진입 ---------------- #
+            for sym in SYMBOLS:
+                # 데이터 없는 심볼은 스킵
+                if sym not in data:
+                    continue
+
+                # 이미 포지션 있으면 이 심볼은 신규 진입 안 함
+                if pos_state[sym]["side"] is not None and pos_state[sym]["size"] > 0:
+                    continue
+
+                df_sym, prev2, prev, curr = data[sym]
+                curr_ts = int(curr["ts"])
+
+                # 같은 심볼의 같은 캔들에서 중복 진입 방지
+                if sym in last_signal_candle_ts and last_signal_candle_ts[sym] == curr_ts:
+                    continue
+
+                long_signal = check_long_entry(prev, curr)
+                short_signal = check_short_entry_lh(prev2, prev, curr)
+
+                if not (long_signal or short_signal):
+                    continue
+
+                free_eq, total_eq = fetch_futures_equity(exchange)
+                logging.info(f"[{sym}] USDT Equity (free={free_eq}, total={total_eq})")
+
+                if total_eq <= 0:
+                    logging.warning(f"[{sym}] equity가 0 이하입니다. 진입 스킵.")
+                    continue
+
+                est_entry_price = float(curr["close"])
+                if est_entry_price <= 0:
+                    logging.warning(f"[{sym}] 유효하지 않은 추정 진입가입니다. 진입 스킵.")
+                    continue
+
+                # ma_gap 기반 stop_pct 계산
+                ma_gap_pct = calc_ma_gap_pct_from_row(curr)
+
+                # 리스크 3% 기반 포지션 크기 계산
+                amount, eff_lev = compute_order_size_risk_based(
+                    exchange,
+                    sym,
+                    est_entry_price,
+                    total_eq,
+                    ma_gap_pct
+                )
+                if amount <= 0:
+                    logging.warning(f"[{sym}] 포지션 수량이 0입니다. 진입 스킵.")
+                    continue
+
+                try:
+                    if long_signal:
+                        side = "buy"
+                        pos_side = "long"
+                        log_side = "LONG"
+                    else:
+                        side = "sell"
+                        pos_side = "short"
+                        log_side = "SHORT"
+
+                    logging.info(
+                        f"[ENTRY {log_side}] {sym} 진입 신호 발생 / "
+                        f"stop_pct={ma_gap_pct*100:.3f}%%, "
+                        f"target_lev≈{RISK_PER_TRADE/ma_gap_pct:.2f}x, eff_lev≈{eff_lev:.2f}x"
+                    )
+
+                    order = exchange.create_order(
+                        sym,
+                        type="market",
+                        side=side,
+                        amount=amount,
+                        params={
+                            "tdMode": "cross",
+                        },
+                    )
+                    logging.info(f"[{sym}] {log_side} 진입 주문 체결: {order}")
+
+                    # 🔹 실제 포지션 진입가/사이즈를 다시 조회해서 SL 기준으로 사용
+                    actual_entry_price = est_entry_price
+                    actual_size = amount
+
+                    # 체결 반영 기다렸다가 포지션 조회 (최대 5번 재시도)
+                    time.sleep(0.5)
+                    for _ in range(5):
+                        exch_positions_after = sync_positions(exchange, SYMBOLS)
+                        p = exch_positions_after.get(sym, {})
+                        if p.get("has_position") and p.get("size", 0) > 0 and p.get("entry_price"):
+                            actual_entry_price = p["entry_price"]
+                            actual_size = p["size"]
+                            pos_side = p["side"]  # 거래소 기준으로 덮어쓰기
+                            break
+                        time.sleep(0.3)
+
+                    # 이 심볼의 로컬 포지션 상태 갱신
+                    pos_state[sym]["side"] = pos_side
+                    pos_state[sym]["size"] = actual_size
+                    pos_state[sym]["entry_price"] = actual_entry_price
+                    pos_state[sym]["entry_time"] = datetime.now(timezone.utc)
+
+                    entry_price = actual_entry_price
+
+                    # 손절 가격 계산 (실제 진입가 기준, ma_gap_pct 사용)
+                    if pos_side == "long":
+                        stop_price = entry_price * (1.0 - ma_gap_pct)
+                        sl_side = "sell"
+                    else:
+                        stop_price = entry_price * (1.0 + ma_gap_pct)
+                        sl_side = "buy"
+
+                    pos_state[sym]["stop_price"] = stop_price
+
+                    # 조건부 스탑마켓 주문 (reduceOnly)
+                    stop_order_id = None
+                    try:
+                        sl_order = exchange.create_order(
+                            sym,
+                            type="market",
+                            side=sl_side,
+                            amount=actual_size,
+                            params={
+                                "tdMode": "cross",
+                                "reduceOnly": True,
+                                "stopLossPrice": stop_price,
+                            },
                         )
-
-                        last_signal_candle_ts[sym] = curr_ts
-
-                        # 포지션 하나만 들고가므로, 진입 후 다른 심볼은 이번 턴에 보지 않음
-                        break
-
+                        stop_order_id = sl_order.get("id")
+                        pos_state[sym]["stop_order_id"] = stop_order_id
+                        logging.info(
+                            f"[{sym}] {log_side} 스탑로스 주문 생성: id={stop_order_id}, "
+                            f"트리거 가격={stop_price:.6f}, stop_pct={ma_gap_pct*100:.3f}%%"
+                        )
                     except Exception as e:
-                        logging.error(f"[{sym}] {log_side} 진입 주문 실패: {e}")
+                        logging.error(f"[{sym}] {log_side} 스탑로스 주문 생성 실패! 수동 확인 필요: {e}")
+                        pos_state[sym]["stop_order_id"] = None
+
+                    logging.info(
+                        f"[{sym}] {log_side} 실제 진입가={entry_price:.6f}, 수량={actual_size}, "
+                        f"스탑로스={stop_price:.6f} (stop_pct={ma_gap_pct*100:.3f}%%)"
+                    )
+
+                    last_signal_candle_ts[sym] = curr_ts
+
+                    # 이제는 멀티심볼 포지션 허용이므로 break 하지 않음
+                    # (다른 심볼도 계속 탐색)
+
+                except Exception as e:
+                    logging.error(f"[{sym}] {log_side} 진입 주문 실패: {e}")
 
             time.sleep(LOOP_INTERVAL)
 
         except Exception as e:
             logging.error(f"메인 루프 에러: {e}")
             time.sleep(LOOP_INTERVAL)
-
 
 if __name__ == "__main__":
     main()
