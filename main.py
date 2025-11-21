@@ -12,7 +12,7 @@ OKX USDT Perpetual Futures 자동매매 봇 (멀티심볼: BTC + XRP)
 - 타임프레임: 5분봉
 - 레버리지: 6배 (cross, net 모드)
 - 포지션: 두 심볼 통틀어 항상 1개만 보유
-- 포지션 크기: 계좌 USDT equity 100% 기준 × 레버리지 6배 노출
+- 포지션 크기: 계좌 USDT equity 100% * POSITION_USAGE * 레버리지 만큼 USDT 노출
 
 [롱 전략]
 - 조건 (최근 닫힌 캔들 기준):
@@ -34,8 +34,6 @@ OKX USDT Perpetual Futures 자동매매 봇 (멀티심볼: BTC + XRP)
 - 진입: 위 조건 만족 & 무포지션일 때, 다음 봉 시가에 시장가 숏 진입
 - 손절: 진입가 +0.5% (조건부 스탑마켓, reduceOnly)
 - 익절: MA50이 MA200을 아래로 데드크로스할 때 시장가 전량 익절
-
-⚠️ 반드시 OKX Demo(샌드박스) 환경에서 먼저 테스트할 것!
 """
 
 import os
@@ -47,7 +45,6 @@ from datetime import datetime, timezone
 import ccxt
 import pandas as pd
 
-
 # ============== 설정값 ============== #
 
 API_KEY = os.getenv("OKX_API_KEY", "")
@@ -57,18 +54,18 @@ API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "")
 SYMBOLS = [
     "BTC/USDT:USDT",
     "XRP/USDT:USDT",
-    "DOGE/USDT:USDT"
+    "DOGE/USDT:USDT",
 ]
+
 TIMEFRAME = "5m"
 
 MA_SHORT = 50
 MA_LONG = 200
 
-STOP_PCT = 0.005      # 0.5% 손절
-LEVERAGE = 6          # 6배 레버리지
-LOOP_INTERVAL = 5     # 루프 주기(초)
-
-POSITION_USAGE = 0.92
+STOP_PCT = 0.005        # 0.5% 손절
+LEVERAGE = 6            # 6배 레버리지
+POSITION_USAGE = 0.92   # 계좌 equity의 92%만 증거금 베이스로 사용
+LOOP_INTERVAL = 5       # 루프 주기(초)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,8 +87,11 @@ def init_exchange():
         },
     })
 
-    # 🔹 Demo(모의거래) 환경이면 꼭 켜기
+    # 🔹 데모(모의거래)면 켜기
     exchange.set_sandbox_mode(True)
+
+    # 마켓 정보 미리 로드
+    exchange.load_markets()
 
     # 포지션 모드: net
     try:
@@ -143,21 +143,38 @@ def fetch_futures_equity(exchange):
     return free, total
 
 
-def compute_order_size_futures(entry_price, equity_total):
+def compute_order_size_futures(exchange, symbol, entry_price, equity_total, usage=POSITION_USAGE):
     """
-    계좌 equity 100%를 기준으로 6배 레버리지 포지션 크기 계산.
-
-    notional = equity_total * LEVERAGE
-    amount = notional / entry_price
+    선물 포지션 크기 계산:
+    - 목표 USDT 노출: equity_total * usage * LEVERAGE
+    - 심볼별 contractSize 고려해서 '계약 수(amount)' 계산
     """
     if entry_price <= 0 or equity_total <= 0:
         return 0.0
 
-    notional = equity_total * LEVERAGE * POSITION_USAGE
-    amount = notional / entry_price
+    # 목표 노출액 (USDT 기준)
+    notional = equity_total * usage * LEVERAGE
 
-    # 수량 소수점 자리 조정 (0.001 단위 내림)
-    amount = math.floor(amount * 1000) / 1000
+    # 심볼별 contractSize
+    market = exchange.market(symbol)
+    contract_size = market.get("contractSize")
+    if contract_size is None:
+        info = market.get("info", {})
+        # OKX 선물: ctVal이 계약 단위(예: 0.001 BTC, 10 XRP 등)
+        contract_size = float(info.get("ctVal", 1))
+
+    # 1 계약당 USDT 노출 = price * contract_size
+    notional_per_contract = entry_price * contract_size
+
+    if notional_per_contract <= 0:
+        return 0.0
+
+    # 필요한 계약 수
+    amount = notional / notional_per_contract
+
+    # 대부분 선물은 정수 계약 수이므로 내림
+    amount = math.floor(amount)
+
     return max(amount, 0.0)
 
 
@@ -189,7 +206,6 @@ def sync_position(exchange, symbols):
         return False, None, None, 0.0, None
     if len(active) > 1:
         logging.warning(f"여러 심볼에 동시에 포지션이 있습니다: {active} (전략은 1포지션만 가정)")
-    # 일단 첫 번째 포지션만 관리
     sym, side, size, entry_price = active[0]
     return True, sym, side, size, entry_price
 
@@ -373,7 +389,7 @@ def main():
 
             # ---------------- 포지션 없는 경우: 각 심볼 신호 체크 후 하나만 진입 ---------------- #
             else:
-                # 심볼 순회 순서: BTC 먼저, 그 다음 XRP
+                # 심볼 순서: BTC 먼저, 그 다음 XRP
                 for sym in SYMBOLS:
                     if sym not in data:
                         continue
@@ -390,12 +406,11 @@ def main():
                     if not (long_signal or short_signal):
                         continue
 
-                    # 여기서 하나라도 신호 뜨면 이 심볼로 진입하고 다른 심볼은 이번 턴 스킵
                     free_eq, total_eq = fetch_futures_equity(exchange)
                     logging.info(f"[{sym}] USDT Equity (free={free_eq}, total={total_eq})")
 
                     est_entry_price = float(curr["close"])
-                    amount = compute_order_size_futures(est_entry_price, total_eq)
+                    amount = compute_order_size_futures(exchange, sym, est_entry_price, total_eq, usage=POSITION_USAGE)
                     if amount <= 0:
                         logging.warning(f"[{sym}] 포지션 수량이 0 이하입니다. 진입 스킵.")
                         continue
@@ -452,15 +467,15 @@ def main():
                             stop_order_id = sl_order.get("id")
                             logging.info(
                                 f"[{sym}] {log_side} 스탑로스 주문 생성: id={stop_order_id}, "
-                                f"트리거 가격={stop_price:.4f}"
+                                f"트리거 가격={stop_price:.6f}"
                             )
                         except Exception as e:
                             logging.error(f"[{sym}] {log_side} 스탑로스 주문 생성 실패! 수동 확인 필요: {e}")
                             stop_order_id = None
 
                         logging.info(
-                            f"[{sym}] {log_side} 진입가={entry_price:.4f}, 수량={position_size}, "
-                            f"스탑로스={stop_price:.4f} (레버리지 {LEVERAGE}x, 풀시드)"
+                            f"[{sym}] {log_side} 진입가={entry_price:.6f}, 수량={position_size}, "
+                            f"스탑로스={stop_price:.6f} (레버리지 {LEVERAGE}x, usage={POSITION_USAGE})"
                         )
 
                         last_signal_candle_ts[sym] = curr_ts
