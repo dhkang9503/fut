@@ -56,8 +56,8 @@ API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "")
 
 SYMBOLS = [
     "BTC/USDT:USDT",
-    # "XRP/USDT:USDT",
-    # "DOGE/USDT:USDT",
+    "XRP/USDT:USDT",
+    "DOGE/USDT:USDT",
 ]
 
 TIMEFRAME = "5m"
@@ -70,8 +70,8 @@ RISK_PER_TRADE = 0.03      # 손절 도달 시 계좌의 3% 손실 목표
 MAX_LEVERAGE   = 10        # 최대 레버리지(실제 포지션 노출 / equity 상한)
 
 # ma_gap 기반 최소/최대 손절 폭 (비율)
-MIN_STOP_PCT = 0.003       # 0.3%
-MAX_STOP_PCT = 0.02        # 2.0%
+MIN_STOP_PCT = 0.01        # 1.0%
+MAX_STOP_PCT = 0.03        # 3.0%
 
 LOOP_INTERVAL = 5          # 루프 주기(초)
 
