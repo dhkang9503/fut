@@ -57,6 +57,7 @@ API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "")
 SYMBOLS = [
     "BTC/USDT:USDT",
     "XRP/USDT:USDT",
+    "DOGE/USDT:USDT"
 ]
 TIMEFRAME = "5m"
 
