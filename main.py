@@ -10,9 +10,8 @@ OKX USDT Perpetual Futures 자동매매 봇 (멀티심볼: BTC + XRP + DOGE)
 - 거래소: OKX
 - 심볼: BTC/USDT:USDT, XRP/USDT:USDT, DOGE/USDT:USDT (USDT 무기한)
 - 타임프레임: 5분봉
-- 레버리지: 6배 (cross, net 모드)
 - 포지션: 세 심볼 통틀어 항상 1개만 보유
-- 포지션 크기: 계좌 USDT equity 100% * POSITION_USAGE * 레버리지 만큼 USDT 노출
+- 포지션 크기: 손절 도달 시 계좌의 약 3% 손실로 고정 (ma_gap 기반 동적 스탑)
 
 [롱 전략]
 - 조건 (최근 닫힌 캔들 기준):
@@ -20,7 +19,9 @@ OKX USDT Perpetual Futures 자동매매 봇 (멀티심볼: BTC + XRP + DOGE)
     2) MA50(i) > MA50(i-1)  (MA50 우상향)
     3) close(i) > MA50(i)
 - 진입: 위 조건 만족 & 무포지션일 때, 다음 봉 시가에 시장가 롱 진입
-- 손절: "실제 진입가" -0.5% (조건부 스탑마켓, reduceOnly)
+- 손절: ma_gap = |MA50 - MA200| / close (진입 직전 캔들 기준, 0.3%~2%로 조정)
+         stop_pct = ma_gap, stop = "실제 진입가" * (1 - stop_pct)
+         포지션 크기는 stop까지 손실이 계좌의 3%가 되도록 계산
 - 익절: MA50이 MA200을 위로 골든크로스할 때 시장가 전량 익절
 
 [숏 전략 - LH 필터]
@@ -32,7 +33,9 @@ OKX USDT Perpetual Futures 자동매매 봇 (멀티심볼: BTC + XRP + DOGE)
        - high(i) < high(i-1)
        - high(i-1) > high(i-2)
 - 진입: 위 조건 만족 & 무포지션일 때, 다음 봉 시가에 시장가 숏 진입
-- 손절: "실제 진입가" +0.5% (조건부 스탑마켓, reduceOnly)
+- 손절: ma_gap = |MA50 - MA200| / close (진입 직전 캔들 기준, 0.3%~2%로 조정)
+         stop_pct = ma_gap, stop = "실제 진입가" * (1 + stop_pct)
+         포지션 크기는 stop까지 손실이 계좌의 3%가 되도록 계산
 - 익절: MA50이 MA200을 아래로 데드크로스할 때 시장가 전량 익절
 """
 
@@ -62,10 +65,15 @@ TIMEFRAME = "5m"
 MA_SHORT = 50
 MA_LONG = 200
 
-STOP_PCT = 0.005        # 0.5% 손절 (진입가 기준)
-LEVERAGE = 6            # 6배 레버리지
-POSITION_USAGE = 0.92   # 계좌 equity의 92%만 증거금 베이스로 사용
-LOOP_INTERVAL = 5       # 루프 주기(초)
+# 리스크 및 레버리지 관련
+RISK_PER_TRADE = 0.03      # 손절 도달 시 계좌의 3% 손실 목표
+MAX_LEVERAGE   = 10        # 최대 레버리지(실제 포지션 노출 / equity 상한)
+
+# ma_gap 기반 최소/최대 손절 폭 (비율)
+MIN_STOP_PCT = 0.003       # 0.3%
+MAX_STOP_PCT = 0.02        # 2.0%
+
+LOOP_INTERVAL = 5          # 루프 주기(초)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,8 +111,9 @@ def init_exchange():
     # 심볼별 레버리지 / 마진모드 설정
     for sym in SYMBOLS:
         try:
-            exchange.set_leverage(LEVERAGE, sym, params={"mgnMode": "cross"})
-            logging.info(f"{sym} 레버리지 {LEVERAGE}배, cross 마진 설정 완료")
+            # 여기서 설정하는 레버리지는 '최대 허용 레버리지' 느낌으로 사용
+            exchange.set_leverage(MAX_LEVERAGE, sym, params={"mgnMode": "cross"})
+            logging.info(f"{sym} 레버리지 {MAX_LEVERAGE}배, cross 마진 설정 완료")
         except Exception as e:
             logging.warning(f"{sym} 레버리지/마진 설정 실패 (무시 가능): {e}")
 
@@ -128,9 +137,10 @@ def fetch_ohlcv_df(exchange, symbol, timeframe, limit=300):
 
 
 def calculate_indicators(df: pd.DataFrame):
-    """MA50, MA200 계산."""
+    """MA50, MA200 및 ma_gap 계산."""
     df["ma50"] = df["close"].rolling(MA_SHORT).mean()
     df["ma200"] = df["close"].rolling(MA_LONG).mean()
+    df["ma_gap"] = (df["ma50"] - df["ma200"]).abs() / df["close"]
     return df
 
 
@@ -143,39 +153,62 @@ def fetch_futures_equity(exchange):
     return free, total
 
 
-def compute_order_size_futures(exchange, symbol, entry_price, equity_total, usage=POSITION_USAGE):
+def calc_ma_gap_pct_from_row(row):
     """
-    선물 포지션 크기 계산:
-    - 목표 USDT 노출: equity_total * usage * LEVERAGE
-    - 심볼별 contractSize 고려해서 '계약 수(amount)' 계산
+    ma_gap = |MA50 - MA200| / close
+    MIN_STOP_PCT ~ MAX_STOP_PCT 사이로 클리핑.
+    NaN/이상치면 기본값 1% 사용.
     """
-    if entry_price <= 0 or equity_total <= 0:
-        return 0.0
+    ma50 = row.get("ma50")
+    ma200 = row.get("ma200")
+    close = row.get("close")
+    if any(pd.isna([ma50, ma200, close])) or close <= 0:
+        return 0.01
 
-    # 목표 노출액 (USDT 기준)
-    notional = equity_total * usage * LEVERAGE
+    gap = abs(ma50 - ma200) / close
+    if not math.isfinite(gap) or gap <= 0:
+        return 0.01
 
-    # 심볼별 contractSize
+    return max(MIN_STOP_PCT, min(MAX_STOP_PCT, float(gap)))
+
+
+def compute_order_size_risk_based(exchange, symbol, entry_price, equity_total, stop_pct):
+    """
+    리스크 3% 고정 포지션 크기 계산.
+
+    - risk_value      = equity_total * RISK_PER_TRADE
+    - target_notional = risk_value / stop_pct
+    - max_notional    = equity_total * MAX_LEVERAGE
+    - notional        = min(target_notional, max_notional)
+    - amount(contracts) = floor( notional / (entry_price * contract_size) )
+    """
+    if entry_price <= 0 or equity_total <= 0 or stop_pct <= 0:
+        return 0.0, 0.0  # amount, effective_leverage
+
+    risk_value = equity_total * RISK_PER_TRADE
+    target_notional = risk_value / stop_pct
+    max_notional = equity_total * MAX_LEVERAGE
+
+    notional = min(target_notional, max_notional)
+
     market = exchange.market(symbol)
     contract_size = market.get("contractSize")
     if contract_size is None:
         info = market.get("info", {})
-        # OKX 선물: ctVal이 계약 단위(예: 0.001 BTC, 10 XRP 등)
         contract_size = float(info.get("ctVal", 1))
 
-    # 1 계약당 USDT 노출 = price * contract_size
     notional_per_contract = entry_price * contract_size
-
     if notional_per_contract <= 0:
-        return 0.0
+        return 0.0, 0.0
 
-    # 필요한 계약 수
     amount = notional / notional_per_contract
+    amount = math.floor(amount)  # 정수 계약 수
 
-    # 대부분 선물은 정수 계약 수이므로 내림
-    amount = math.floor(amount)
+    if amount <= 0:
+        return 0.0, 0.0
 
-    return max(amount, 0.0)
+    effective_leverage = (amount * notional_per_contract) / equity_total
+    return amount, effective_leverage
 
 
 def sync_position(exchange, symbols):
@@ -243,8 +276,6 @@ def check_long_tp(prev, curr):
     """롱 익절: MA50 / MA200 골든크로스 이후 구간."""
     if any(pd.isna([prev["ma50"], prev["ma200"], curr["ma50"], curr["ma200"]])):
         return False
-    # 교차 순간만 보려면 prev<=, curr> 조건을 쓰고,
-    # 실전 안전성을 위해 "MA50 > MA200 상태" 전체를 TP 구간으로 사용.
     return curr["ma50"] > curr["ma200"]
 
 
@@ -259,7 +290,7 @@ def check_short_tp(prev, curr):
 
 def main():
     exchange = init_exchange()
-    logging.info("OKX BTC+XRP+DOGE 롱/숏 자동매매 봇 시작")
+    logging.info("OKX BTC+XRP+DOGE 롱/숏 자동매매 봇 시작 (ma_gap 기반 + 리스크 3% 고정)")
 
     in_position = False
     pos_symbol = None
@@ -395,7 +426,7 @@ def main():
                 for sym in SYMBOLS:
                     if sym not in data:
                         continue
-                    df, prev2, prev, curr = data[sym]
+                    df_sym, prev2, prev, curr = data[sym]
                     curr_ts = int(curr["ts"])
 
                     # 같은 심볼의 같은 캔들에서 중복 진입 방지
@@ -411,10 +442,28 @@ def main():
                     free_eq, total_eq = fetch_futures_equity(exchange)
                     logging.info(f"[{sym}] USDT Equity (free={free_eq}, total={total_eq})")
 
+                    if total_eq <= 0:
+                        logging.warning(f"[{sym}] equity가 0 이하입니다. 진입 스킵.")
+                        continue
+
                     est_entry_price = float(curr["close"])
-                    amount = compute_order_size_futures(exchange, sym, est_entry_price, total_eq, usage=POSITION_USAGE)
+                    if est_entry_price <= 0:
+                        logging.warning(f"[{sym}] 유효하지 않은 추정 진입가입니다. 진입 스킵.")
+                        continue
+
+                    # ma_gap 기반 stop_pct 계산
+                    ma_gap_pct = calc_ma_gap_pct_from_row(curr)
+
+                    # 리스크 3% 기반 포지션 크기 계산
+                    amount, eff_lev = compute_order_size_risk_based(
+                        exchange,
+                        sym,
+                        est_entry_price,
+                        total_eq,
+                        ma_gap_pct
+                    )
                     if amount <= 0:
-                        logging.warning(f"[{sym}] 포지션 수량이 0 이하입니다. 진입 스킵.")
+                        logging.warning(f"[{sym}] 포지션 수량이 0입니다. 진입 스킵.")
                         continue
 
                     try:
@@ -427,7 +476,11 @@ def main():
                             pos_side = "short"
                             log_side = "SHORT"
 
-                        logging.info(f"[ENTRY {log_side}] {sym} 진입 신호 발생")
+                        logging.info(
+                            f"[ENTRY {log_side}] {sym} 진입 신호 발생 / stop_pct={ma_gap_pct*100:.3f}%%, "
+                            f"target_lev≈{RISK_PER_TRADE/ma_gap_pct:.2f}x, eff_lev≈{eff_lev:.2f}x"
+                        )
+
                         order = exchange.create_order(
                             sym,
                             type="market",
@@ -460,12 +513,12 @@ def main():
                         entry_time = datetime.now(timezone.utc)
                         entry_price = actual_entry_price
 
-                        # 손절 가격 계산 (실제 진입가 기준)
+                        # 손절 가격 계산 (실제 진입가 기준, ma_gap_pct 사용)
                         if pos_side == "long":
-                            stop_price = entry_price * (1.0 - STOP_PCT)
+                            stop_price = entry_price * (1.0 - ma_gap_pct)
                             sl_side = "sell"
                         else:
-                            stop_price = entry_price * (1.0 + STOP_PCT)
+                            stop_price = entry_price * (1.0 + ma_gap_pct)
                             sl_side = "buy"
 
                         # 조건부 스탑마켓 주문 (reduceOnly)
@@ -484,7 +537,7 @@ def main():
                             stop_order_id = sl_order.get("id")
                             logging.info(
                                 f"[{sym}] {log_side} 스탑로스 주문 생성: id={stop_order_id}, "
-                                f"트리거 가격={stop_price:.6f}"
+                                f"트리거 가격={stop_price:.6f}, stop_pct={ma_gap_pct*100:.3f}%%"
                             )
                         except Exception as e:
                             logging.error(f"[{sym}] {log_side} 스탑로스 주문 생성 실패! 수동 확인 필요: {e}")
@@ -492,7 +545,7 @@ def main():
 
                         logging.info(
                             f"[{sym}] {log_side} 실제 진입가={entry_price:.6f}, 수량={position_size}, "
-                            f"스탑로스={stop_price:.6f} (레버리지 {LEVERAGE}x, usage={POSITION_USAGE})"
+                            f"스탑로스={stop_price:.6f} (stop_pct={ma_gap_pct*100:.3f}%%)"
                         )
 
                         last_signal_candle_ts[sym] = curr_ts
