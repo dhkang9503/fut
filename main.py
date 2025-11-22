@@ -346,23 +346,35 @@ def main():
                         pos_state[sym]["stop_order_id"] = None
                         pos_state[sym]["stop_price"] = None
 
-                        # 2) 그 다음 시장가 청산 (reduceOnly 유지)
+                        # 2) 방금 시점의 실제 포지션 사이즈 다시 조회
+                        exch_positions_now = sync_positions(exchange, SYMBOLS)
+                        p_now = exch_positions_now.get(sym, {})
+                        if (not p_now.get("has_position")) or p_now.get("size", 0) <= 0:
+                            logging.info(f"[{sym}] TP LONG 시점에 이미 포지션이 없습니다. 상태만 리셋.")
+                            pos_state[sym]["side"] = None
+                            pos_state[sym]["size"] = 0.0
+                            pos_state[sym]["entry_price"] = None
+                            pos_state[sym]["entry_time"] = None
+                            continue
+
+                        current_size = p_now["size"]
+
+                        # 3) reduceOnly 없이 시장가 청산 (net 모드라 사이즈만큼이면 그냥 청산)
                         try:
                             order = exchange.create_order(
                                 sym,
                                 type="market",
                                 side="sell",
-                                amount=size,
+                                amount=current_size,
                                 params={
                                     "tdMode": "cross",
-                                    "reduceOnly": True,
                                 },
                             )
                             logging.info(f"{sym} 롱 익절 주문 체결: {order}")
                         except Exception as e:
                             logging.error(f"{sym} 롱 익절 주문 실패: {e}")
 
-                        # 3) 이 심볼 포지션 상태 리셋
+                        # 4) 이 심볼 포지션 상태 리셋
                         pos_state[sym]["side"] = None
                         pos_state[sym]["size"] = 0.0
                         pos_state[sym]["entry_price"] = None
@@ -385,23 +397,35 @@ def main():
                         pos_state[sym]["stop_order_id"] = None
                         pos_state[sym]["stop_price"] = None
 
-                        # 2) 그 다음 시장가 청산
+                        # 2) 방금 시점의 실제 포지션 사이즈 다시 조회
+                        exch_positions_now = sync_positions(exchange, SYMBOLS)
+                        p_now = exch_positions_now.get(sym, {})
+                        if (not p_now.get("has_position")) or p_now.get("size", 0) <= 0:
+                            logging.info(f"[{sym}] TP SHORT 시점에 이미 포지션이 없습니다. 상태만 리셋.")
+                            pos_state[sym]["side"] = None
+                            pos_state[sym]["size"] = 0.0
+                            pos_state[sym]["entry_price"] = None
+                            pos_state[sym]["entry_time"] = None
+                            continue
+
+                        current_size = p_now["size"]
+
+                        # 3) reduceOnly 없이 시장가 청산
                         try:
                             order = exchange.create_order(
                                 sym,
                                 type="market",
                                 side="buy",
-                                amount=size,
+                                amount=current_size,
                                 params={
                                     "tdMode": "cross",
-                                    "reduceOnly": True,
                                 },
                             )
                             logging.info(f"{sym} 숏 익절 주문 체결: {order}")
                         except Exception as e:
                             logging.error(f"{sym} 숏 익절 주문 실패: {e}")
 
-                        # 3) 이 심볼 포지션 상태 리셋
+                        # 4) 이 심볼 포지션 상태 리셋
                         pos_state[sym]["side"] = None
                         pos_state[sym]["size"] = 0.0
                         pos_state[sym]["entry_price"] = None
@@ -550,8 +574,6 @@ def main():
                     )
 
                     last_signal_candle_ts[sym] = curr_ts
-
-                    # 멀티심볼 포지션 허용이므로 break 하지 않음
 
                 except Exception as e:
                     logging.error(f"[{sym}] {log_side} 진입 주문 실패: {e}")
