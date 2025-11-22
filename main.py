@@ -334,6 +334,19 @@ def main():
                 if side == "long":
                     if check_long_tp(prev, curr):
                         logging.info(f"[TP LONG] {sym} 골든크로스 → 시장가 롱 익절")
+
+                        # 1) 먼저 스탑로스 주문 취소
+                        stop_order_id = pos_state[sym]["stop_order_id"]
+                        if stop_order_id is not None:
+                            try:
+                                exchange.cancel_order(stop_order_id, sym)
+                                logging.info(f"{sym} 롱 스탑 주문 취소: {stop_order_id}")
+                            except Exception as e:
+                                logging.warning(f"{sym} 롱 스탑 취소 실패(이미 체결/취소됐을 수 있음): {e}")
+                        pos_state[sym]["stop_order_id"] = None
+                        pos_state[sym]["stop_price"] = None
+
+                        # 2) 그 다음 시장가 청산 (reduceOnly 유지)
                         try:
                             order = exchange.create_order(
                                 sym,
@@ -349,15 +362,7 @@ def main():
                         except Exception as e:
                             logging.error(f"{sym} 롱 익절 주문 실패: {e}")
 
-                        stop_order_id = pos_state[sym]["stop_order_id"]
-                        if stop_order_id is not None:
-                            try:
-                                exchange.cancel_order(stop_order_id, sym)
-                                logging.info(f"{sym} 롱 스탑 주문 취소: {stop_order_id}")
-                            except Exception as e:
-                                logging.warning(f"{sym} 롱 스탑 취소 실패(이미 체결/취소됐을 수 있음): {e}")
-
-                        # 이 심볼 포지션 상태 리셋
+                        # 3) 이 심볼 포지션 상태 리셋
                         pos_state[sym]["side"] = None
                         pos_state[sym]["size"] = 0.0
                         pos_state[sym]["entry_price"] = None
@@ -368,6 +373,19 @@ def main():
                 elif side == "short":
                     if check_short_tp(prev, curr):
                         logging.info(f"[TP SHORT] {sym} 데드크로스 → 시장가 숏 익절")
+
+                        # 1) 먼저 스탑로스 주문 취소
+                        stop_order_id = pos_state[sym]["stop_order_id"]
+                        if stop_order_id is not None:
+                            try:
+                                exchange.cancel_order(stop_order_id, sym)
+                                logging.info(f"{sym} 숏 스탑 주문 취소: {stop_order_id}")
+                            except Exception as e:
+                                logging.warning(f"{sym} 숏 스탑 취소 실패(이미 체결/취소됐을 수 있음): {e}")
+                        pos_state[sym]["stop_order_id"] = None
+                        pos_state[sym]["stop_price"] = None
+
+                        # 2) 그 다음 시장가 청산
                         try:
                             order = exchange.create_order(
                                 sym,
@@ -383,15 +401,7 @@ def main():
                         except Exception as e:
                             logging.error(f"{sym} 숏 익절 주문 실패: {e}")
 
-                        stop_order_id = pos_state[sym]["stop_order_id"]
-                        if stop_order_id is not None:
-                            try:
-                                exchange.cancel_order(stop_order_id, sym)
-                                logging.info(f"{sym} 숏 스탑 주문 취소: {stop_order_id}")
-                            except Exception as e:
-                                logging.warning(f"{sym} 숏 스탑 취소 실패(이미 체결/취소됐을 수 있음): {e}")
-
-                        # 이 심볼 포지션 상태 리셋
+                        # 3) 이 심볼 포지션 상태 리셋
                         pos_state[sym]["side"] = None
                         pos_state[sym]["size"] = 0.0
                         pos_state[sym]["entry_price"] = None
@@ -541,8 +551,7 @@ def main():
 
                     last_signal_candle_ts[sym] = curr_ts
 
-                    # 이제는 멀티심볼 포지션 허용이므로 break 하지 않음
-                    # (다른 심볼도 계속 탐색)
+                    # 멀티심볼 포지션 허용이므로 break 하지 않음
 
                 except Exception as e:
                     logging.error(f"[{sym}] {log_side} 진입 주문 실패: {e}")
