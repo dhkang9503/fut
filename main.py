@@ -162,6 +162,7 @@ def compute_order_size_risk_based(exchange, symbol, entry_price, equity_total, s
     effective_leverage = (amount * notional_per_contract) / equity_total
     return amount, effective_leverage
 
+
 def sync_positions(exchange, symbols):
     """
     OKX 선물 포지션 조회.
@@ -196,15 +197,27 @@ def sync_positions(exchange, symbols):
         sym = p.get("symbol")
         if sym not in symbols:
             continue
+
+        # ccxt가 제공하는 side 우선 사용
+        side = (p.get("side") or "").lower()
         contracts = float(p.get("contracts") or 0)
-        if abs(contracts) <= 0:
+
+        # side 정보가 없으면 contracts 부호로 추론
+        if not side:
+            if abs(contracts) <= 0:
+                continue
+            side = "long" if contracts > 0 else "short"
+
+        size = abs(contracts)
+        if size <= 0:
             continue
-        side = "long" if contracts > 0 else "short"
+
         entry_price = float(p.get("entryPrice") or 0)
+
         result[sym] = {
             "has_position": True,
             "side": side,
-            "size": abs(contracts),
+            "size": size,
             "entry_price": entry_price if entry_price > 0 else None,
         }
 
@@ -522,7 +535,7 @@ def main():
                         if p.get("has_position") and p.get("size", 0) > 0 and p.get("entry_price"):
                             actual_entry_price = p["entry_price"]
                             actual_size = p["size"]
-                            pos_side = p["side"]  # 거래소 기준으로 덮어쓰기
+                            # pos_side는 우리가 결정한 값 유지
                             break
                         time.sleep(0.3)
 
