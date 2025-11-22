@@ -232,7 +232,8 @@ def check_long_entry(prev, curr):
     return (
         (curr["ma50"] < curr["ma200"]) and
         (curr["ma50"] > prev["ma50"]) and
-        (curr["close"] > curr["ma50"])
+        (curr["close"] > curr["ma50"]) and
+        (curr["close"] < curr["ma200"])
     )
 
 def check_short_entry_lh(prev2, prev, curr):
@@ -243,7 +244,8 @@ def check_short_entry_lh(prev2, prev, curr):
     base = (
         (curr["ma50"] > curr["ma200"]) and
         (curr["ma50"] < prev["ma50"]) and
-        (curr["close"] < curr["ma50"])
+        (curr["close"] < curr["ma50"]) and
+        (curr["close"] > curr["ma200"])
     )
 
     lh = (curr["high"] < prev["high"]) and (prev["high"] > prev2["high"])
