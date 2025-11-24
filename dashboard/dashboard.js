@@ -32,20 +32,13 @@ function renderEntryRestriction(entryRestrict) {
 
 // 심볼별 차트 생성
 function initChartForSymbol(sym) {
-    if (typeof LightweightCharts === "undefined") {
-        // 라이브러리 로딩 실패하면 차트는 포기
-        return;
-    }
-
     const containerId = CHART_IDS[sym];
     const el = document.getElementById(containerId);
     if (!el) return;
 
-    // 🔹 높이는 고정 220px, width만 컨테이너 기준
-    const rect = el.getBoundingClientRect();
     const chart = LightweightCharts.createChart(el, {
-        width: rect.width || el.clientWidth || 600,
-        height: 220,
+        width: el.clientWidth,
+        height: el.clientHeight,
         layout: {
             background: { color: "#111827" },
             textColor: "#e5e7eb",
@@ -86,10 +79,10 @@ function initChartForSymbol(sym) {
     stopLines[sym] = stop;
     tpLines[sym] = tp;
 
-    // 리사이즈 시 width만 맞춰주기
+    // 간단한 리사이즈 대응
     window.addEventListener("resize", () => {
-        const r = el.getBoundingClientRect();
-        chart.applyOptions({ width: r.width || el.clientWidth || 600, height: 220 });
+        const rect = el.getBoundingClientRect();
+        chart.applyOptions({ width: rect.width, height: rect.height });
     });
 }
 
@@ -113,17 +106,17 @@ function updateDashboard(state) {
         let raw = ohlcv[sym];
         if (!raw) continue;
 
-        const candlesArr = Array.isArray(raw) ? raw : Object.values(raw);
-        if (!candlesArr || candlesArr.length === 0) continue;
+        // 배열이 아니더라도 values 로 바꿔서 사용
+        const candles = Array.isArray(raw) ? raw : Object.values(raw);
+        if (!candles || candles.length === 0) continue;
 
         if (!charts[sym]) {
             initChartForSymbol(sym);
-            if (!charts[sym]) continue;  // 생성 실패 시 스킵
         }
 
         // time 은 초 단위 숫자여야 함
-        const mapped = candlesArr.map(c => ({
-            time: Number(c.time),
+        const mapped = candles.map(c => ({
+            time: Number(c.time),   // 초단위
             open: Number(c.open),
             high: Number(c.high),
             low: Number(c.low),
