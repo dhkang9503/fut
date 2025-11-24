@@ -4,7 +4,7 @@ import asyncio
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
-STATE_PATH = "/home/ubuntu/bot_state.json"
+STATE_PATH = "/app/bot_state.json"
 
 app = FastAPI()
 
