@@ -2,14 +2,17 @@
 <html lang="ko">
 <head>
   <meta charset="UTF-8" />
-  <title>자동매매 대시보드</title>
+  <title>자동매매 실시간 대시보드</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <!-- Tailwind -->
   <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Lightweight Charts -->
   <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 
 <body class="bg-gray-900 text-white">
-
-  <div class="max-w-6xl mx-auto p-6">
+  <div class="max-w-6xl mx-auto p-4 sm:p-6">
     <h1 class="text-2xl font-bold mb-4">📈 자동매매 실시간 대시보드</h1>
 
     <!-- Equity -->
@@ -20,20 +23,45 @@
 
     <!-- Entry Restriction -->
     <div class="bg-gray-800 p-4 rounded-lg mb-4">
-      <h2 class="text-xl font-semibold">Entry Restriction</h2>
-      <p id="entry_restrict" class="text-yellow-400 text-xl">-</p>
+      <h2 class="text-xl font-semibold mb-1">Entry Restriction</h2>
+      <pre id="entry_restrict" class="whitespace-pre-wrap text-sm text-yellow-300">-</pre>
     </div>
 
-    <!-- Chart -->
+    <!-- 실시간 차트 (3개 심볼 1h) -->
     <div class="bg-gray-800 p-4 rounded-lg mb-4">
-      <h2 class="text-xl font-semibold mb-2">📊 실시간 차트 (현재 포지션 심볼만)</h2>
-      <div id="chart" class="w-full h-[400px]"></div>
+      <h2 class="text-xl font-semibold mb-2">📊 실시간 차트 (1h, 심볼별)</h2>
+      <div class="space-y-4">
+        <div>
+          <div class="text-sm text-gray-300 mb-1">BTC/USDT:USDT</div>
+          <div id="chart-btc" class="w-full h-[220px] bg-gray-900 rounded-md"></div>
+        </div>
+        <div>
+          <div class="text-sm text-gray-300 mb-1">XRP/USDT:USDT</div>
+          <div id="chart-xrp" class="w-full h-[220px] bg-gray-900 rounded-md"></div>
+        </div>
+        <div>
+          <div class="text-sm text-gray-300 mb-1">DOGE/USDT:USDT</div>
+          <div id="chart-doge" class="w-full h-[220px] bg-gray-900 rounded-md"></div>
+        </div>
+      </div>
     </div>
 
-    <!-- Position State -->
+    <!-- 현재 포지션 -->
     <div class="bg-gray-800 p-4 rounded-lg mb-4">
-      <h2 class="text-xl font-semibold">현재 포지션</h2>
-      <pre id="position" class="whitespace-pre-wrap"></pre>
+      <h2 class="text-xl font-semibold mb-2">현재 포지션</h2>
+      <pre id="position" class="whitespace-pre-wrap text-xs sm:text-sm"></pre>
+    </div>
+
+    <!-- 최근 로그 (last_signal 그대로 표시) -->
+    <div class="bg-gray-800 p-4 rounded-lg mb-4">
+      <h2 class="text-xl font-semibold mb-2">최근 로그</h2>
+      <pre id="logs" class="whitespace-pre-wrap text-xs sm:text-sm h-[160px] overflow-y-auto"></pre>
+    </div>
+  </div>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
     </div>
 
     <!-- Logs -->
