@@ -2,48 +2,70 @@
 // 기본 설정
 // =====================
 
+// 심볼 리스트
 const SYMBOLS = ["BTC/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"];
 
+// 심볼 → canvas ID 매핑 (HTML의 <canvas id="...">와 맞춰야 함)
 const CHART_IDS = {
     "BTC/USDT:USDT": "chart-btc",
     "XRP/USDT:USDT": "chart-xrp",
     "DOGE/USDT:USDT": "chart-doge",
 };
 
+// 차트 인스턴스 저장
 const charts = {};
 
+// DOM 엘리먼트
 const equityEl = document.getElementById("equity");
 const entryRestrictEl = document.getElementById("entry_restrict");
 const posEl = document.getElementById("position");
 const logsEl = document.getElementById("logs");
 
-
 // =====================
-// 유틸
+// 유틸 함수
 // =====================
 
-function fmtNum(v, d = 3) {
-    return (v === null || v === undefined || isNaN(v)) ? "-" : Number(v).toFixed(d);
+// 숫자를 소수 n째 자리까지 포맷
+function fmtNum(value, digits = 3) {
+    if (value === null || value === undefined || isNaN(value)) return "-";
+    return Number(value).toFixed(digits);
 }
 
-function fmtUSDT(v) {
-    return (v === null || v === undefined || isNaN(v)) ? "-" : `${Number(v).toFixed(3)} USDT`;
+// USDT 표시
+function fmtUSDT(value) {
+    if (value === null || value === undefined || isNaN(value)) return "-";
+    return `${Number(value).toFixed(3)} USDT`;
 }
 
-
 // =====================
-// render 포맷
+// Entry Restriction 출력
 // =====================
-
 function renderEntryRestriction(entryRestrict) {
-    if (!entryRestrict) { entryRestrictEl.textContent = "-"; return; }
-    const lines = SYMBOLS.map(sym => `${sym}: ${entryRestrict[sym] ?? "-"}`);
+    if (!entryRestrictEl) return;
+    if (!entryRestrict) {
+        entryRestrictEl.textContent = "-";
+        return;
+    }
+
+    const lines = SYMBOLS.map(sym => {
+        const v = entryRestrict[sym];
+        return `${sym}:  ${v ? v : "-"}`;
+    });
+
     entryRestrictEl.textContent = lines.join("\n");
 }
 
+// =====================
+// 현재 포지션 출력
+// =====================
 function renderPosition(posState) {
-    if (!posState) return posEl.textContent = "{}";
+    if (!posEl) return;
+    if (!posState) {
+        posEl.textContent = "{}";
+        return;
+    }
 
+    // 예쁘게 포맷해서 보여주기
     const formatted = {};
     for (const sym of SYMBOLS) {
         const p = posState[sym] || {};
@@ -52,221 +74,310 @@ function renderPosition(posState) {
             size: p.size || 0,
             entry_price: p.entry_price || null,
             stop_price: p.stop_price || null,
-            tp_price: p.tp_price || null,
-            entry_candle_ts: p.entry_candle_ts || null,
+            tp_price: p.tp_price || null,          // ★ TP 표시 추가
             stop_order_id: p.stop_order_id || null,
             entry_time: p.entry_time || null,
         };
     }
+
     posEl.textContent = JSON.stringify(formatted, null, 2);
 }
 
+// =====================
+// 로그 출력 (지금은 last_signal이나 나중에 확장용)
+// =====================
 function renderLogs(state) {
     if (!logsEl) return;
-    logsEl.textContent = JSON.stringify(state.last_signal || {}, null, 2);
+    const lastSignal = state.last_signal || {};
+    if (Object.keys(lastSignal).length === 0) {
+        logsEl.textContent = "{}";
+        return;
+    }
+    logsEl.textContent = JSON.stringify(lastSignal, null, 2);
 }
 
-
 // =====================
-// Chart.js
+// Chart.js 캔들 차트 생성/업데이트
 // =====================
 
-function mapCandle(raw) {
+// Chart.js candlestick가 기대하는 포맷:
+// { x: Date(or ms), o: number, h: number, l: number, c: number }
+
+// 백엔드의 ohlcv 한 개를 위 포맷으로 변환
+function mapCandleForChart(raw) {
     if (!raw) return null;
+
+    // bot_state.json의 time은 "초 단위 Unix timestamp" 이므로 ms로 변환
     const t = raw.time ? raw.time * 1000 : null;
     if (!t) return null;
 
+    const o = Number(raw.open);
+    const h = Number(raw.high);
+    const l = Number(raw.low);
+    const c = Number(raw.close);
+
+    if ([o, h, l, c].some(v => isNaN(v))) return null;
+
     return {
         x: new Date(t),
-        o: Number(raw.open),
-        h: Number(raw.high),
-        l: Number(raw.low),
-        c: Number(raw.close),
+        o,
+        h,
+        l,
+        c,
     };
 }
 
+// 차트 초기화
 function initChart(symbol) {
-    const canvas = document.getElementById(CHART_IDS[symbol]);
-    if (!canvas) return null;
+    const canvasId = CHART_IDS[symbol];
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) {
+        console.warn("Canvas element not found for", symbol, canvasId);
+        return null;
+    }
 
     const ctx = canvas.getContext("2d");
 
     const chart = new Chart(ctx, {
-        type: "candlestick",
+        type: "candlestick", // chartjs-chart-financial 플러그인 기준
         data: {
             datasets: [
                 {
+                    // 0: 캔들
                     label: symbol,
                     type: "candlestick",
                     data: [],
+                    barThickness: 4,
+                    barPercentage: 0.6,
                 },
                 {
+                    // 1: 진입가 라인
                     label: "Entry",
                     type: "line",
-                    borderColor: "gray",
+                    data: [],
                     borderWidth: 1,
                     borderDash: [4, 2],
                     pointRadius: 0,
-                    data: [],
                 },
                 {
+                    // 2: TP 라인
                     label: "TP",
                     type: "line",
-                    borderColor: "blue",
+                    data: [],
                     borderWidth: 1,
                     borderDash: [2, 2],
                     pointRadius: 0,
-                    data: [],
                 },
                 {
+                    // 3: SL 라인
                     label: "SL",
                     type: "line",
-                    borderColor: "red",
+                    data: [],
                     borderWidth: 1,
                     borderDash: [2, 4],
                     pointRadius: 0,
-                    data: [],
-                },
-                {
-                    label: "Entry Marker",
-                    type: "scatter",
-                    data: [],
-                    pointStyle: [], // 각 점별로 style 지정
-                    pointRadius: 8,
-                    showLine: false,
                 },
             ],
         },
         options: {
-            parsing: false,
+            parsing: false, // 우리가 직접 {x,o,h,l,c}/{x,y} 포맷으로 넣을 거라서
             responsive: true,
             maintainAspectRatio: false,
             scales: {
-                x: { type: "time" },
-                y: { position: "right" },
+                x: {
+                    type: "time",
+                    time: {
+                        tooltipFormat: "yyyy-MM-dd HH:mm",
+                    },
+                    ticks: {
+                        source: "auto",
+                    },
+                },
+                y: {
+                    position: "right",
+                },
             },
             plugins: {
-                legend: { display: false },
+                legend: {
+                    display: false,
+                },
+                tooltip: {
+                    callbacks: {
+                        label: (ctx) => {
+                            const v = ctx.raw;
+                            if (!v) return "";
+                            // 캔들일 때
+                            if (v.o !== undefined) {
+                                return `O:${v.o} H:${v.h} L:${v.l} C:${v.c}`;
+                            }
+                            // 라인일 때
+                            if (v.y !== undefined) {
+                                return `Price: ${v.y}`;
+                            }
+                            return "";
+                        },
+                    },
+                },
             },
         },
     });
+
     charts[symbol] = chart;
     return chart;
 }
 
+// 차트 데이터 갱신 + 진입/TP/SL 라인 표시
+function updateChart(symbol, rawCandles, posStateForSymbol) {
+    if (!Array.isArray(rawCandles)) return;
 
-// ========== 차트 업데이트 ==========
-
-function updateChart(symbol, rawCandles, pos) {
     let chart = charts[symbol];
-    if (!chart) chart = initChart(symbol);
+    if (!chart) {
+        chart = initChart(symbol);
+        if (!chart) return;
+    }
 
-    const mapped = rawCandles.map(mapCandle).filter(v => v);
+    // rawCandles → {x,o,h,l,c} 배열로 변환
+    const mapped = rawCandles
+        .map(mapCandleForChart)
+        .filter(c => c !== null);
 
-    // 캔들
+    // 0번 dataset: 캔들
     chart.data.datasets[0].data = mapped;
 
-    const hasPos = pos && pos.side && pos.size > 0;
-
-    let entryLine = [], tpLine = [], slLine = [], markerData = [], markerStyles = [];
+    // 진입 / TP / SL 라인 데이터 세팅
+    const hasPos = posStateForSymbol && posStateForSymbol.side && posStateForSymbol.size > 0;
+    let entryLineData = [];
+    let tpLineData = [];
+    let slLineData = [];
 
     if (hasPos && mapped.length > 0) {
         const firstX = mapped[0].x;
         const lastX = mapped[mapped.length - 1].x;
 
-        const entry = pos.entry_price;
-        const stop  = pos.stop_price;
-        const tp    = pos.tp_price;
-        const ts    = pos.entry_candle_ts;
+        const entryPrice = Number(posStateForSymbol.entry_price);
+        const tpPrice = Number(posStateForSymbol.tp_price);
+        const slPrice = Number(posStateForSymbol.stop_price);
 
-        if (entry > 0) {
-            entryLine = [
-                { x: firstX, y: entry },
-                { x: lastX, y: entry },
-            ];
-        }
-        if (tp > 0) {
-            tpLine = [
-                { x: firstX, y: tp },
-                { x: lastX, y: tp },
-            ];
-        }
-        if (stop > 0) {
-            slLine = [
-                { x: firstX, y: stop },
-                { x: lastX, y: stop },
+        if (!isNaN(entryPrice) && entryPrice > 0) {
+            entryLineData = [
+                { x: firstX, y: entryPrice },
+                { x: lastX, y: entryPrice },
             ];
         }
 
-        // ======== 삼각형 마커 표시 ========
-        if (ts) {
-            const candle = mapped.find(c => c.x.getTime() === ts * 1000);
-            if (candle) {
-                let y, style;
+        if (!isNaN(tpPrice) && tpPrice > 0) {
+            tpLineData = [
+                { x: firstX, y: tpPrice },
+                { x: lastX, y: tpPrice },
+            ];
+        }
 
-                if (pos.side === "short") {
-                    y = candle.h * 1.0015;
-                    style = "triangle-down";
-                } else {
-                    y = candle.l * 0.9985;
-                    style = "triangle";
-                }
-
-                markerData.push({ x: candle.x, y });
-                markerStyles.push(style);
-            }
+        if (!isNaN(slPrice) && slPrice > 0) {
+            slLineData = [
+                { x: firstX, y: slPrice },
+                { x: lastX, y: slPrice },
+            ];
         }
     }
 
-    // 라인 및 마커 반영
-    chart.data.datasets[1].data = entryLine;
-    chart.data.datasets[2].data = tpLine;
-    chart.data.datasets[3].data = slLine;
-    chart.data.datasets[4].data = markerData;
-    chart.data.datasets[4].pointStyle = markerStyles;
+    // 1: Entry, 2: TP, 3: SL
+    if (chart.data.datasets[1]) {
+        chart.data.datasets[1].data = entryLineData;
+    }
+    if (chart.data.datasets[2]) {
+        chart.data.datasets[2].data = tpLineData;
+    }
+    if (chart.data.datasets[3]) {
+        chart.data.datasets[3].data = slLineData;
+    }
 
     chart.update();
 }
 
-
 // =====================
-// WebSocket
+// WebSocket 연결
 // =====================
 
-let ws;
-function connectWS() {
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const wsUrl = `${proto}://${location.host}/ws`;
+let ws = null;
+let reconnectTimer = null;
+
+function connectWebSocket() {
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+    const wsUrl = `${protocol}://${window.location.host}/ws`;
+
     ws = new WebSocket(wsUrl);
 
-    ws.onmessage = e => {
-        const state = JSON.parse(e.data);
-        renderState(state);
+    ws.onopen = () => {
+        console.log("WebSocket connected:", wsUrl);
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
     };
 
-    ws.onclose = () => setTimeout(connectWS, 2000);
-}
-function renderState(state) {
-    if (equityEl) equityEl.textContent = fmtUSDT(state.equity);
+    ws.onclose = () => {
+        console.warn("WebSocket closed. Reconnecting in 3s...");
+        if (!reconnectTimer) {
+            reconnectTimer = setTimeout(connectWebSocket, 3000);
+        }
+    };
 
+    ws.onerror = (err) => {
+        console.error("WebSocket error:", err);
+        ws.close();
+    };
+
+    ws.onmessage = (event) => {
+        try {
+            const state = JSON.parse(event.data);
+            handleStateUpdate(state);
+        } catch (e) {
+            console.error("Failed to parse WS message:", e);
+        }
+    };
+}
+
+// =====================
+// 상태 업데이트 핸들러
+// =====================
+function handleStateUpdate(state) {
+    if (!state) return;
+
+    // 1) Equity
+    if (equityEl) {
+        equityEl.textContent = fmtUSDT(state.equity);
+    }
+
+    // 2) Entry Restriction
     renderEntryRestriction(state.entry_restrict);
-    renderPosition(state.pos_state);
+
+    // 3) Position
+    const posState = state.pos_state || {};
+    renderPosition(posState);
+
+    // 4) Logs / last_signal
     renderLogs(state);
 
+    // 5) 캔들 차트 (state.ohlcv + pos_state 사용)
     const ohlcv = state.ohlcv || {};
     for (const sym of SYMBOLS) {
         const candles = ohlcv[sym];
-        if (!candles) continue;
-        const p = (state.pos_state || {})[sym] || null;
+        if (!Array.isArray(candles) || candles.length === 0) {
+            continue;
+        }
+        const p = posState[sym] || null;
         updateChart(sym, candles, p);
     }
 }
 
-
 // =====================
 // 초기 실행
 // =====================
+
 window.addEventListener("load", () => {
-    SYMBOLS.forEach(initChart);
-    connectWS();
+    // 차트 먼저 초기화 (데이터 없어도 canvas 생성)
+    SYMBOLS.forEach(sym => initChart(sym));
+
+    // WebSocket 연결 시작
+    connectWebSocket();
 });
