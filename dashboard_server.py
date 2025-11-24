@@ -33,7 +33,8 @@ async def index():
 def get_state():
     try:
         with open(STATE_PATH, "r") as f:
-            return json.load(f)
+            content = f.read()
+        return json.loads(content) if content else {}
     except Exception:
         return {"error": "state_not_found"}
 
@@ -45,7 +46,8 @@ async def websocket_endpoint(ws: WebSocket):
     while True:
         try:
             with open(STATE_PATH, "r") as f:
-                state = json.load(f)
+                content = f.read()
+            state = json.loads(content) if content else {}
         except Exception:
             state = {"error": "state_not_found"}
 
