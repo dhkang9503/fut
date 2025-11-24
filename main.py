@@ -289,7 +289,7 @@ def detect_cci_signal(df: pd.DataFrame):
 
 def main():
     exchange = init_exchange()
-    logging.info("OKX CCI + Bollinger 자동매매 봇 시작 (1h, 리스크 3% 고정, 익절/손절 후 방향 대칭 제한)")
+    logging.info("OKX CCI + Bollinger 자동매매 봇 시작 (1h, 리스크 3% 고정, 익절/손절 후 방향 대칭 제한, 동적 TP)")
 
     pos_state = {
         sym: {
@@ -297,7 +297,7 @@ def main():
             "size": 0.0,
             "entry_price": None,
             "stop_price": None,
-            "tp_price": None,          # ★ 추가: TP 가격 (엔트리 시점의 BB upper/lower)
+            "tp_price": None,          # 대시보드용 TP 라인 (현재 BB 상/하단)
             "stop_order_id": None,
             "entry_time": None,
         }
@@ -362,28 +362,44 @@ def main():
                     entry_price = exch_pos.get("entry_price")
                     if entry_price and entry_price > 0:
                         pos_state[sym]["entry_price"] = entry_price
-                    # tp_price는 엔트리 시점에만 설정하므로 여기서 건드리지 않음
+                    # tp_price는 아래 TP 관리 루프에서 동적으로 세팅
 
-            # --- TP 관리 --- #
+            # --- TP 관리 (동적 Bollinger TP + 대시보드용 tp_price 갱신) --- #
             for sym in SYMBOLS:
                 if sym not in data:
                     continue
                 side = pos_state[sym]["side"]
                 size = pos_state[sym]["size"]
-                tp_price = pos_state[sym].get("tp_price")
                 if side is None or size <= 0:
+                    # 포지션 없음 → TP 라인 클리어
+                    pos_state[sym]["tp_price"] = None
                     continue
-                if tp_price is None or tp_price <= 0:
-                    continue  # TP 가격이 없으면 TP 로직 스킵
 
                 df_sym, prev, curr = data[sym]
 
+                bb_upper = float(curr.get("bb_upper", float("nan")))
+                bb_lower = float(curr.get("bb_lower", float("nan")))
                 high = float(curr["high"])
                 low = float(curr["low"])
 
-                # ★ 롱 TP: 고가가 tp_price 이상
-                if side == "long" and high >= tp_price:
-                    logging.info(f"[TP LONG] {sym} TP 가격({tp_price:.6f}) 터치 → 롱 익절")
+                # 대시보드용 TP 라인: 현재 BB 상/하단 값을 그대로 반영
+                if side == "long":
+                    if not math.isnan(bb_upper):
+                        pos_state[sym]["tp_price"] = bb_upper
+                    else:
+                        pos_state[sym]["tp_price"] = None
+                elif side == "short":
+                    if not math.isnan(bb_lower):
+                        pos_state[sym]["tp_price"] = bb_lower
+                    else:
+                        pos_state[sym]["tp_price"] = None
+                else:
+                    pos_state[sym]["tp_price"] = None
+
+                # 실제 익절 로직: 원래 코드처럼 BB 상/하단을 기준으로 TP
+                # 롱 TP: 상단 터치
+                if side == "long" and not math.isnan(bb_upper) and high >= bb_upper:
+                    logging.info(f"[TP LONG] {sym} 볼린저 상단({bb_upper:.6f}) 터치 → 롱 익절")
                     stop_order_id = pos_state[sym]["stop_order_id"]
                     if stop_order_id:
                         try:
@@ -419,9 +435,9 @@ def main():
                     }
                     entry_restrict[sym] = "short_only"
 
-                # ★ 숏 TP: 저가가 tp_price 이하
-                elif side == "short" and low <= tp_price:
-                    logging.info(f"[TP SHORT] {sym} TP 가격({tp_price:.6f}) 터치 → 숏 익절")
+                # 숏 TP: 하단 터치
+                elif side == "short" and not math.isnan(bb_lower) and low <= bb_lower:
+                    logging.info(f"[TP SHORT] {sym} 볼린저 하단({bb_lower:.6f}) 터치 → 숏 익절")
                     stop_order_id = pos_state[sym]["stop_order_id"]
                     if stop_order_id:
                         try:
@@ -479,15 +495,6 @@ def main():
                 est_entry_price = signal["entry_price"]
                 stop_price = signal["stop_price"]
 
-                # ★ A 방식 TP 계산: 엔트리 시점의 BB upper/lower를 TP로 저장
-                bb_upper = float(curr.get("bb_upper", float("nan")))
-                bb_lower = float(curr.get("bb_lower", float("nan")))
-                tp_price = None
-                if side_signal == "long" and not math.isnan(bb_upper):
-                    tp_price = bb_upper
-                elif side_signal == "short" and not math.isnan(bb_lower):
-                    tp_price = bb_lower
-
                 restrict = entry_restrict.get(sym)
                 if restrict == "long_only" and side_signal != "long":
                     logging.info(f"[{sym}] 진입 제한: long_only → 숏 신호 무시")
@@ -517,6 +524,15 @@ def main():
                     logging.warning(f"[{sym}] 포지션 수량이 0입니다. 진입 스킵.")
                     continue
 
+                # 참고용: 진입 시점의 BB 값(로그/디버깅용)
+                bb_upper = float(curr.get("bb_upper", float("nan")))
+                bb_lower = float(curr.get("bb_lower", float("nan")))
+                tp_hint = None
+                if side_signal == "long" and not math.isnan(bb_upper):
+                    tp_hint = bb_upper
+                elif side_signal == "short" and not math.isnan(bb_lower):
+                    tp_hint = bb_lower
+
                 try:
                     if side_signal == "long":
                         side = "buy"
@@ -533,7 +549,8 @@ def main():
                         f"[ENTRY {log_side}] {sym} CCI 신호 진입 / "
                         f"stop_pct={stop_pct*100:.3f}%%, "
                         f"target_lev≈{RISK_PER_TRADE/stop_pct:.2f}x, eff_lev≈{eff_lev:.2f}x, "
-                        f"entry≈{est_entry_price:.6f}, SL={stop_price:.6f}, TP={tp_price if tp_price else float('nan'):.6f}"
+                        f"entry≈{est_entry_price:.6f}, SL={stop_price:.6f}, "
+                        f"TP_hint={tp_hint if tp_hint is not None else float('nan'):.6f}"
                     )
 
                     order = exchange.create_order(
@@ -563,7 +580,7 @@ def main():
                     pos_state[sym]["entry_price"] = actual_entry_price
                     pos_state[sym]["entry_time"] = datetime.now(timezone.utc)
                     pos_state[sym]["stop_price"] = stop_price
-                    pos_state[sym]["tp_price"] = tp_price
+                    # tp_price는 TP 관리 루프에서 매 루프마다 BB 기준으로 갱신됨
 
                     stop_order_id = None
                     try:
@@ -590,8 +607,7 @@ def main():
 
                     logging.info(
                         f"[{sym}] {log_side} 실제 진입가={actual_entry_price:.6f}, 수량={actual_size}, "
-                        f"SL={stop_price:.6f}, TP={tp_price if tp_price else float('nan'):.6f}, "
-                        f"stop_pct={stop_pct*100:.3f}%%"
+                        f"SL={stop_price:.6f}, stop_pct={stop_pct*100:.3f}%%"
                     )
 
                     last_signal_candle_ts[sym] = curr_ts
