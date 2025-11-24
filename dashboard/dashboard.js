@@ -1,6 +1,7 @@
-// 모니터링 심볼
+// 모니터링 심볼 (JSON의 키 그대로)
 const SYMBOLS = ["BTC/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"];
 
+// 심볼 → HTML div id 매핑
 const CHART_IDS = {
     "BTC/USDT:USDT": "chart-btc",
     "XRP/USDT:USDT": "chart-xrp",
@@ -60,6 +61,7 @@ function initChartForSymbol(sym) {
     tpLines[sym] = tp;
 }
 
+// Entry Restriction 예쁘게
 function renderEntryRestriction(entryRestrict) {
     if (!entryRestrict) return "-";
     let text = "";
@@ -71,33 +73,49 @@ function renderEntryRestriction(entryRestrict) {
 }
 
 function updateDashboard(state) {
-    // Equity
+    // 1) 위쪽 숫자 영역들 먼저 업데이트
     if (state.equity != null) {
         equityEl.innerText = Number(state.equity).toLocaleString() + " USDT";
     } else {
         equityEl.innerText = "-";
     }
 
-    // Entry Restriction
     entryRestrictEl.innerText = renderEntryRestriction(state.entry_restrict);
-
-    // Raw 상태 표시
     posEl.innerText = JSON.stringify(state.pos_state || {}, null, 2);
     logsEl.innerText = JSON.stringify(state.last_signal || {}, null, 2);
 
+    // 2) 차트용 데이터
     const ohlcv = state.ohlcv || {};
     const posState = state.pos_state || {};
 
     for (const sym of SYMBOLS) {
-        const candles = ohlcv[sym];
+        let raw = ohlcv[sym];
+        if (!raw) continue;
+
+        // 🔹 raw 는 JSON에서 이미 배열 형태지만,
+        // 혹시라도 객체로 들어와도 대응하도록 방어 코드 추가
+        let candles;
+        if (Array.isArray(raw)) {
+            candles = raw;
+        } else {
+            candles = Object.values(raw);
+        }
+
         if (!candles || candles.length === 0) continue;
 
+        // 차트 미생성 시 초기화
         if (!charts[sym]) {
             initChartForSymbol(sym);
         }
 
-        candleSeries[sym].setData(candles);
+        try {
+            candleSeries[sym].setData(candles);
+            charts[sym].timeScale().fitContent();
+        } catch (e) {
+            console.log("chart error for", sym, e);
+        }
 
+        // 3) 포지션 엔트리/SL/TP 라인 오버레이
         const p = posState[sym] || {};
         const hasPosition = p.side && p.size > 0 && p.entry_price != null;
 
@@ -107,7 +125,7 @@ function updateDashboard(state) {
         if (hasPosition) {
             const entryPrice = p.entry_price;
             const stopPrice = p.stop_price;
-            const tpPrice = p.tp_price; // 없으면 undefined라 자동 무시됨
+            const tpPrice = p.tp_price;
 
             const lineData = (price) => [
                 { time: firstTime, value: price },
@@ -118,6 +136,7 @@ function updateDashboard(state) {
             stopLines[sym].setData(stopPrice ? lineData(stopPrice) : []);
             tpLines[sym].setData(tpPrice ? lineData(tpPrice) : []);
         } else {
+            // 포지션 없으면 라인 제거
             entryLines[sym].setData([]);
             stopLines[sym].setData([]);
             tpLines[sym].setData([]);
@@ -145,75 +164,6 @@ function connectWS() {
 
     socket.onerror = (e) => {
         console.log("WS Error:", e);
-    };
-}
-
-connectWS();
-function updateDashboard(state) {
-    // Equity
-    document.getElementById("equity").innerText =
-        state.equity ? state.equity.toLocaleString() + " USDT" : "-";
-
-    // Entry Restriction
-    const restrict = state.entry_restrict;
-    let text = "";
-
-    for (const sym in restrict) {
-        const r = restrict[sym];
-        text += `${sym}: ${r === null ? "-" : r}\n`;
-    }
-
-// entryRestrictElement.innerText = text;
-
-    document.getElementById("entry_restrict").innerText =
-        text || "none";
-
-    // Position
-    document.getElementById("position").innerText =
-        JSON.stringify(state.pos_state, null, 2);
-
-    // Logs
-    document.getElementById("logs").innerText =
-        JSON.stringify(state.last_signal, null, 2);
-
-    // 현재 포지션 가진 심볼 찾기
-    const activeSymbols = Object.keys(state.pos_state || {}).filter(sym => {
-        const p = state.pos_state[sym];
-        return p && p.side && p.size > 0;
-    });
-
-    if (activeSymbols.length === 0) {
-        document.getElementById("chart").innerHTML =
-            "<p class='text-gray-400'>현재 포지션 없음</p>";
-        return;
-    }
-
-    const sym = activeSymbols[0]; // 첫 번째 포지션 심볼만 표시
-
-    const pos = state.pos_state[sym];
-    const price = pos.entry_price || 0;
-
-    if (!chart) initChart();
-
-    // SL / TP / Entry 라인 업데이트
-    const now = Math.floor(Date.now() / 1000);
-
-    entryLine.setData([{ time: now, value: pos.entry_price }]);
-    stopLine.setData([{ time: now, value: pos.stop_price }]);
-    tpLine.setData([{ time: now, value: pos.tp_price }]);
-}
-
-function connectWS() {
-    socket = new WebSocket("ws://" + window.location.hostname + ":8000/ws");
-
-    socket.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        updateDashboard(data);
-    };
-
-    socket.onclose = () => {
-        console.log("WS Closed. Reconnecting in 3s...");
-        setTimeout(connectWS, 3000);
     };
 }
 
