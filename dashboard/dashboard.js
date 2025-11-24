@@ -1,21 +1,25 @@
 // 모니터링 심볼 (JSON의 키 그대로)
 const SYMBOLS = ["BTC/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"];
 
-// 심볼 → canvas id 매핑
+// 심볼 → div id 매핑
 const CHART_IDS = {
     "BTC/USDT:USDT": "chart-btc",
     "XRP/USDT:USDT": "chart-xrp",
     "DOGE/USDT:USDT": "chart-doge",
 };
 
-const charts = {};  // 심볼별 Chart.js 인스턴스
+const charts = {};        // 심볼별 chart 객체
+const candleSeries = {};  // 심볼별 캔들 시리즈
+const entryLines = {};    // 엔트리 라인
+const stopLines = {};     // 스탑 라인
+const tpLines = {};       // TP 라인
 
 const equityEl = document.getElementById("equity");
 const entryRestrictEl = document.getElementById("entry_restrict");
 const posEl = document.getElementById("position");
 const logsEl = document.getElementById("logs");
 
-// Entry Restriction 예쁘게
+// Entry Restriction 텍스트 렌더링
 function renderEntryRestriction(entryRestrict) {
     if (!entryRestrict) return "-";
     let text = "";
@@ -26,148 +30,60 @@ function renderEntryRestriction(entryRestrict) {
     return text.trim();
 }
 
-// 심볼별 차트 초기화
-function initChart(sym, labels, closeData, entryPrice, stopPrice, tpPrice) {
-    const canvasId = CHART_IDS[sym];
-    const ctx = document.getElementById(canvasId);
-    if (!ctx) return;
+// 심볼별 차트 생성
+function initChartForSymbol(sym) {
+    const containerId = CHART_IDS[sym];
+    const el = document.getElementById(containerId);
+    if (!el) return;
 
-    const datasets = [];
-
-    // 메인 가격 라인
-    datasets.push({
-        label: `${sym} Close`,
-        data: closeData,
-        borderColor: "#38bdf8",
-        borderWidth: 2,
-        pointRadius: 0,
-        tension: 0.1,
-    });
-
-    const makeLineDataset = (label, color, price) => ({
-        label,
-        data: labels.map(() => price),
-        borderColor: color,
-        borderWidth: 1,
-        borderDash: [4, 4],
-        pointRadius: 0,
-        tension: 0,
-    });
-
-    if (entryPrice != null) {
-        datasets.push(makeLineDataset("Entry", "#eab308", entryPrice));
-    }
-    if (stopPrice != null) {
-        datasets.push(makeLineDataset("Stop", "#f97373", stopPrice));
-    }
-    if (tpPrice != null) {
-        datasets.push(makeLineDataset("TP", "#4ade80", tpPrice));
-    }
-
-    const chart = new Chart(ctx, {
-        type: "line",
-        data: {
-            labels,
-            datasets,
+    const chart = LightweightCharts.createChart(el, {
+        width: el.clientWidth,
+        height: el.clientHeight,
+        layout: {
+            background: { color: "#111827" },
+            textColor: "#e5e7eb",
         },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: {
-                    display: false,
-                },
-            },
-            scales: {
-                x: {
-                    ticks: {
-                        maxTicksLimit: 6,
-                        color: "#9ca3af",
-                        font: { size: 10 },
-                    },
-                    grid: { color: "#1f2937" },
-                },
-                y: {
-                    ticks: {
-                        color: "#9ca3af",
-                        font: { size: 10 },
-                    },
-                    grid: { color: "#1f2937" },
-                },
-            },
+        grid: {
+            vertLines: { color: "#1f2937" },
+            horzLines: { color: "#1f2937" },
+        },
+        timeScale: {
+            timeVisible: true,
+            secondsVisible: false,
+            borderColor: "#374151",
+        },
+        rightPriceScale: {
+            borderColor: "#374151",
+        },
+        crosshair: {
+            mode: LightweightCharts.CrosshairMode.Normal,
         },
     });
+
+    const candles = chart.addCandlestickSeries({
+        upColor: "#22c55e",
+        borderUpColor: "#22c55e",
+        wickUpColor: "#22c55e",
+        downColor: "#ef4444",
+        borderDownColor: "#ef4444",
+        wickDownColor: "#ef4444",
+    });
+
+    const entry = chart.addLineSeries({ color: "#eab308", lineWidth: 1 });
+    const stop = chart.addLineSeries({ color: "#ef4444", lineWidth: 1 });
+    const tp = chart.addLineSeries({ color: "#22c55e", lineWidth: 1 });
 
     charts[sym] = chart;
-}
+    candleSeries[sym] = candles;
+    entryLines[sym] = entry;
+    stopLines[sym] = stop;
+    tpLines[sym] = tp;
 
-// 차트 업데이트
-function updateChart(sym, candles, posInfo) {
-    if (!candles || candles.length === 0) return;
-
-    const labels = candles.map(c => {
-        const d = new Date(c.time * 1000);
-        // 'MM-DD HH:mm' 정도로 간단하게
-        return `${(d.getMonth() + 1).toString().padStart(2, "0")}-${d
-            .getDate()
-            .toString()
-            .padStart(2, "0")} ${d.getHours().toString().padStart(2, "0")}:00`;
+    // 간단한 리사이즈 대응
+    window.addEventListener("resize", () => {
+        const rect = el.getBoundingClientRect();
+        chart.applyOptions({ width: rect.width, height: rect.height });
     });
-
-    const closeData = candles.map(c => c.close);
-
-    const hasPosition =
-        posInfo &&
-        posInfo.side &&
-        posInfo.size > 0 &&
-        posInfo.entry_price != null;
-
-    const entryPrice = hasPosition ? posInfo.entry_price : null;
-    const stopPrice = hasPosition ? posInfo.stop_price : null;
-    const tpPrice = hasPosition ? posInfo.tp_price : null;
-
-    if (!charts[sym]) {
-        // 최초 생성
-        initChart(sym, labels, closeData, entryPrice, stopPrice, tpPrice);
-        return;
-    }
-
-    const chart = charts[sym];
-
-    // dataset[0] = close, [1] 이후는 entry/stop/tp (있을 경우)
-    chart.data.labels = labels;
-    chart.data.datasets[0].data = closeData;
-
-    // 기존 수평선 datasets는 싹 갈아엎자
-    chart.data.datasets = chart.data.datasets.slice(0, 1);
-
-    const makeLineDataset = (label, color, price) => ({
-        label,
-        data: labels.map(() => price),
-        borderColor: color,
-        borderWidth: 1,
-        borderDash: [4, 4],
-        pointRadius: 0,
-        tension: 0,
-    });
-
-    if (entryPrice != null) {
-        chart.data.datasets.push(
-            makeLineDataset("Entry", "#eab308", entryPrice)
-        );
-    }
-    if (stopPrice != null) {
-        chart.data.datasets.push(
-            makeLineDataset("Stop", "#f97373", stopPrice)
-        );
-    }
-    if (tpPrice != null) {
-        chart.data.datasets.push(
-            makeLineDataset("TP", "#4ade80", tpPrice)
-        );
-    }
-
-    chart.update("none");
 }
 
 // 대시보드 전체 업데이트
@@ -187,15 +103,64 @@ function updateDashboard(state) {
     const posState = state.pos_state || {};
 
     for (const sym of SYMBOLS) {
-        const candles = ohlcv[sym];
+        let raw = ohlcv[sym];
+        if (!raw) continue;
+
+        // 배열이 아니더라도 values 로 바꿔서 사용
+        const candles = Array.isArray(raw) ? raw : Object.values(raw);
         if (!candles || candles.length === 0) continue;
 
-        const posInfo = posState[sym] || {};
-        updateChart(sym, candles, posInfo);
+        if (!charts[sym]) {
+            initChartForSymbol(sym);
+        }
+
+        // time 은 초 단위 숫자여야 함
+        const mapped = candles.map(c => ({
+            time: Number(c.time),   // 초단위
+            open: Number(c.open),
+            high: Number(c.high),
+            low: Number(c.low),
+            close: Number(c.close),
+        }));
+
+        candleSeries[sym].setData(mapped);
+        charts[sym].timeScale().fitContent();
+
+        // 포지션 라인
+        const p = posState[sym] || {};
+        const hasPosition = p.side && p.size > 0 && p.entry_price != null;
+
+        const firstTime = mapped[0].time;
+        const lastTime = mapped[mapped.length - 1].time;
+
+        const makeLineData = (price) => ([
+            { time: firstTime, value: price },
+            { time: lastTime, value: price },
+        ]);
+
+        if (hasPosition) {
+            const entryPrice = p.entry_price;
+            const stopPrice = p.stop_price;
+            const tpPrice = p.tp_price;
+
+            entryLines[sym].setData(
+                entryPrice != null ? makeLineData(entryPrice) : []
+            );
+            stopLines[sym].setData(
+                stopPrice != null ? makeLineData(stopPrice) : []
+            );
+            tpLines[sym].setData(
+                tpPrice != null ? makeLineData(tpPrice) : []
+            );
+        } else {
+            entryLines[sym].setData([]);
+            stopLines[sym].setData([]);
+            tpLines[sym].setData([]);
+        }
     }
 }
 
-// WebSocket 연결 및 자동 재접속
+// WebSocket 연결 & 자동 재접속
 function connectWS() {
     const wsUrl =
         (location.protocol === "https:" ? "wss://" : "ws://") +
