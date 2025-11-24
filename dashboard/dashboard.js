@@ -74,6 +74,7 @@ function renderPosition(posState) {
             size: p.size || 0,
             entry_price: p.entry_price || null,
             stop_price: p.stop_price || null,
+            tp_price: p.tp_price || null,          // ★ TP 표시 추가
             stop_order_id: p.stop_order_id || null,
             entry_time: p.entry_time || null,
         };
@@ -142,15 +143,44 @@ function initChart(symbol) {
         data: {
             datasets: [
                 {
+                    // 0: 캔들
                     label: symbol,
+                    type: "candlestick",
                     data: [],
                     barThickness: 4,
-                    barPercentage: 0.6
+                    barPercentage: 0.6,
+                },
+                {
+                    // 1: 진입가 라인
+                    label: "Entry",
+                    type: "line",
+                    data: [],
+                    borderWidth: 1,
+                    borderDash: [4, 2],
+                    pointRadius: 0,
+                },
+                {
+                    // 2: TP 라인
+                    label: "TP",
+                    type: "line",
+                    data: [],
+                    borderWidth: 1,
+                    borderDash: [2, 2],
+                    pointRadius: 0,
+                },
+                {
+                    // 3: SL 라인
+                    label: "SL",
+                    type: "line",
+                    data: [],
+                    borderWidth: 1,
+                    borderDash: [2, 4],
+                    pointRadius: 0,
                 },
             ],
         },
         options: {
-            parsing: false, // 우리가 직접 {x,o,h,l,c} 포맷으로 넣을 거라서
+            parsing: false, // 우리가 직접 {x,o,h,l,c}/{x,y} 포맷으로 넣을 거라서
             responsive: true,
             maintainAspectRatio: false,
             scales: {
@@ -160,7 +190,6 @@ function initChart(symbol) {
                         tooltipFormat: "yyyy-MM-dd HH:mm",
                     },
                     ticks: {
-                        // 너무 빽빽하면 자동으로 줄여줌
                         source: "auto",
                     },
                 },
@@ -177,7 +206,15 @@ function initChart(symbol) {
                         label: (ctx) => {
                             const v = ctx.raw;
                             if (!v) return "";
-                            return `O:${v.o} H:${v.h} L:${v.l} C:${v.c}`;
+                            // 캔들일 때
+                            if (v.o !== undefined) {
+                                return `O:${v.o} H:${v.h} L:${v.l} C:${v.c}`;
+                            }
+                            // 라인일 때
+                            if (v.y !== undefined) {
+                                return `Price: ${v.y}`;
+                            }
+                            return "";
                         },
                     },
                 },
@@ -189,8 +226,8 @@ function initChart(symbol) {
     return chart;
 }
 
-// 차트 데이터 갱신
-function updateChart(symbol, rawCandles) {
+// 차트 데이터 갱신 + 진입/TP/SL 라인 표시
+function updateChart(symbol, rawCandles, posStateForSymbol) {
     if (!Array.isArray(rawCandles)) return;
 
     let chart = charts[symbol];
@@ -204,7 +241,56 @@ function updateChart(symbol, rawCandles) {
         .map(mapCandleForChart)
         .filter(c => c !== null);
 
+    // 0번 dataset: 캔들
     chart.data.datasets[0].data = mapped;
+
+    // 진입 / TP / SL 라인 데이터 세팅
+    const hasPos = posStateForSymbol && posStateForSymbol.side && posStateForSymbol.size > 0;
+    let entryLineData = [];
+    let tpLineData = [];
+    let slLineData = [];
+
+    if (hasPos && mapped.length > 0) {
+        const firstX = mapped[0].x;
+        const lastX = mapped[mapped.length - 1].x;
+
+        const entryPrice = Number(posStateForSymbol.entry_price);
+        const tpPrice = Number(posStateForSymbol.tp_price);
+        const slPrice = Number(posStateForSymbol.stop_price);
+
+        if (!isNaN(entryPrice) && entryPrice > 0) {
+            entryLineData = [
+                { x: firstX, y: entryPrice },
+                { x: lastX, y: entryPrice },
+            ];
+        }
+
+        if (!isNaN(tpPrice) && tpPrice > 0) {
+            tpLineData = [
+                { x: firstX, y: tpPrice },
+                { x: lastX, y: tpPrice },
+            ];
+        }
+
+        if (!isNaN(slPrice) && slPrice > 0) {
+            slLineData = [
+                { x: firstX, y: slPrice },
+                { x: lastX, y: slPrice },
+            ];
+        }
+    }
+
+    // 1: Entry, 2: TP, 3: SL
+    if (chart.data.datasets[1]) {
+        chart.data.datasets[1].data = entryLineData;
+    }
+    if (chart.data.datasets[2]) {
+        chart.data.datasets[2].data = tpLineData;
+    }
+    if (chart.data.datasets[3]) {
+        chart.data.datasets[3].data = slLineData;
+    }
+
     chart.update();
 }
 
@@ -266,20 +352,21 @@ function handleStateUpdate(state) {
     renderEntryRestriction(state.entry_restrict);
 
     // 3) Position
-    renderPosition(state.pos_state);
+    const posState = state.pos_state || {};
+    renderPosition(posState);
 
     // 4) Logs / last_signal
     renderLogs(state);
 
-    // 5) 캔들 차트 (state.ohlcv 사용)
+    // 5) 캔들 차트 (state.ohlcv + pos_state 사용)
     const ohlcv = state.ohlcv || {};
     for (const sym of SYMBOLS) {
         const candles = ohlcv[sym];
         if (!Array.isArray(candles) || candles.length === 0) {
-            // 데이터가 없는 경우, 해당 차트는 그대로 두거나 나중에 클리어할 수 있음
             continue;
         }
-        updateChart(sym, candles);
+        const p = posState[sym] || null;
+        updateChart(sym, candles, p);
     }
 }
 
