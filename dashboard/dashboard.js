@@ -1,211 +1,294 @@
 // =====================
-// Chart.js + Financial Plugin 캔들 차트 버전
+// 기본 설정
 // =====================
 
 // 심볼 리스트
 const SYMBOLS = ["BTC/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"];
 
-// 심볼 → canvas ID 매핑
+// 심볼 → canvas ID 매핑 (HTML의 <canvas id="...">와 맞춰야 함)
 const CHART_IDS = {
     "BTC/USDT:USDT": "chart-btc",
     "XRP/USDT:USDT": "chart-xrp",
     "DOGE/USDT:USDT": "chart-doge",
 };
 
-let charts = {};
-let equityEl = document.getElementById("equity");
-let entryRestrictEl = document.getElementById("entry_restrict");
-let posEl = document.getElementById("position");
-let logsEl = document.getElementById("logs");
+// 차트 인스턴스 저장
+const charts = {};
+
+// DOM 엘리먼트
+const equityEl = document.getElementById("equity");
+const entryRestrictEl = document.getElementById("entry_restrict");
+const posEl = document.getElementById("position");
+const logsEl = document.getElementById("logs");
+
+// =====================
+// 유틸 함수
+// =====================
+
+// 숫자를 소수 n째 자리까지 포맷
+function fmtNum(value, digits = 3) {
+    if (value === null || value === undefined || isNaN(value)) return "-";
+    return Number(value).toFixed(digits);
+}
+
+// USDT 표시
+function fmtUSDT(value) {
+    if (value === null || value === undefined || isNaN(value)) return "-";
+    return `${Number(value).toFixed(3)} USDT`;
+}
 
 // =====================
 // Entry Restriction 출력
 // =====================
 function renderEntryRestriction(entryRestrict) {
-    if (!entryRestrict) return "-";
-    let text = "";
-    for (const sym of SYMBOLS) {
-        const r = entryRestrict[sym];
-        text += `${sym}: ${r === null ? "-" : r}\n`;
-    }
-    return text.trim();
-}
-
-// =====================
-// Chart.js 캔들 차트 초기화
-// =====================
-function initChart(sym) {
-    const canvasId = CHART_IDS[sym];
-    const canvas = document.getElementById(canvasId);
-    if (!canvas) return;
-
-    const ctx = canvas.getContext("2d");
-
-    // 기존 차트 제거
-    if (charts[sym]) {
-        charts[sym].destroy();
+    if (!entryRestrictEl) return;
+    if (!entryRestrict) {
+        entryRestrictEl.textContent = "-";
+        return;
     }
 
-    charts[sym] = new Chart(ctx, {
-        type: "candlestick",
-        data: {
-            datasets: [
-                {
-                    label: `${sym} OHLC`,
-                    data: [],  // 차후 setData 로 채울 것
-                    borderColor: "#00bcd4",
-                    color: {
-                        up: "#22c55e",
-                        down: "#ef4444",
-                        unchanged: "#e5e7eb",
-                    },
-                }
-            ]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,   // div 높이를 그대로 사용
-            animation: false,
-
-            scales: {
-                x: {
-                    type: "timeseries",
-                    time: {
-                        unit: "hour"
-                    },
-                    grid: { color: "#1f2937" },
-                    ticks: { color: "#9ca3af" }
-                },
-                y: {
-                    grid: { color: "#1f2937" },
-                    ticks: { color: "#9ca3af" }
-                }
-            },
-
-            plugins: {
-                legend: { display: false },
-            }
-        }
+    const lines = SYMBOLS.map(sym => {
+        const v = entryRestrict[sym];
+        return `${sym}:  ${v ? v : "-"}`;
     });
+
+    entryRestrictEl.textContent = lines.join("\n");
 }
 
 // =====================
-// 차트에 캔들 데이터 반영
+// 현재 포지션 출력
 // =====================
-function updateCandleChart(sym, ohlcv) {
-    if (!charts[sym]) {
-        initChart(sym);
+function renderPosition(posState) {
+    if (!posEl) return;
+    if (!posState) {
+        posEl.textContent = "{}";
+        return;
     }
 
-    const chart = charts[sym];
-    if (!chart) return;
-
-    const dataset = chart.data.datasets[0];
-
-    dataset.data = ohlcv.map(c => ({
-        x: Number(c.time) * 1000,
-        o: Number(c.open),
-        h: Number(c.high),
-        l: Number(c.low),
-        c: Number(c.close),
-    }));
-
-    chart.update();
-}
-
-// =====================
-// 포지션 라인 오버레이
-// =====================
-function updateOverlayLines(sym, position, ohlcv) {
-    if (!charts[sym]) return;
-    const chart = charts[sym];
-
-    // 기존 보조선 제거
-    chart.data.datasets = chart.data.datasets.filter(d => d.type === "candlestick");
-
-    const first = Number(ohlcv[0].time) * 1000;
-    const last = Number(ohlcv[ohlcv.length - 1].time) * 1000;
-
-    function makeLine(label, price, color) {
-        return {
-            label,
-            type: "line",
-            borderColor: color,
-            borderWidth: 1,
-            fill: false,
-            data: [
-                { x: first, y: price },
-                { x: last, y: price }
-            ]
+    // 예쁘게 포맷해서 보여주기
+    const formatted = {};
+    for (const sym of SYMBOLS) {
+        const p = posState[sym] || {};
+        formatted[sym] = {
+            side: p.side || null,
+            size: p.size || 0,
+            entry_price: p.entry_price || null,
+            stop_price: p.stop_price || null,
+            stop_order_id: p.stop_order_id || null,
+            entry_time: p.entry_time || null,
         };
     }
 
-    if (position && position.entry_price) {
-        chart.data.datasets.push(
-            makeLine("Entry", position.entry_price, "#eab308")
-        );
-    }
-    if (position && position.stop_price) {
-        chart.data.datasets.push(
-            makeLine("Stop", position.stop_price, "#ef4444")
-        );
-    }
-    if (position && position.tp_price) {
-        chart.data.datasets.push(
-            makeLine("TP", position.tp_price, "#22c55e")
-        );
-    }
-
-    chart.update();
+    posEl.textContent = JSON.stringify(formatted, null, 2);
 }
 
 // =====================
-// Dashboard 업데이트
+// 로그 출력 (지금은 last_signal이나 나중에 확장용)
 // =====================
-function updateDashboard(state) {
-    if (state.equity != null) {
-        equityEl.innerText = Number(state.equity).toLocaleString() + " USDT";
+function renderLogs(state) {
+    if (!logsEl) return;
+    const lastSignal = state.last_signal || {};
+    if (Object.keys(lastSignal).length === 0) {
+        logsEl.textContent = "{}";
+        return;
+    }
+    logsEl.textContent = JSON.stringify(lastSignal, null, 2);
+}
+
+// =====================
+// Chart.js 캔들 차트 생성/업데이트
+// =====================
+
+// Chart.js candlestick가 기대하는 포맷:
+// { x: Date(or ms), o: number, h: number, l: number, c: number }
+
+// 백엔드의 ohlcv 한 개를 위 포맷으로 변환
+function mapCandleForChart(raw) {
+    if (!raw) return null;
+
+    // bot_state.json의 time은 "초 단위 Unix timestamp" 이므로 ms로 변환
+    const t = raw.time ? raw.time * 1000 : null;
+    if (!t) return null;
+
+    const o = Number(raw.open);
+    const h = Number(raw.high);
+    const l = Number(raw.low);
+    const c = Number(raw.close);
+
+    if ([o, h, l, c].some(v => isNaN(v))) return null;
+
+    return {
+        x: new Date(t),
+        o,
+        h,
+        l,
+        c,
+    };
+}
+
+// 차트 초기화
+function initChart(symbol) {
+    const canvasId = CHART_IDS[symbol];
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) {
+        console.warn("Canvas element not found for", symbol, canvasId);
+        return null;
     }
 
-    entryRestrictEl.innerText = renderEntryRestriction(state.entry_restrict);
-    posEl.innerText = JSON.stringify(state.pos_state || {}, null, 2);
-    logsEl.innerText = JSON.stringify(state.last_signal || {}, null, 2);
+    const ctx = canvas.getContext("2d");
 
-    const ohlcv = state.ohlcv || {};
+    const chart = new Chart(ctx, {
+        type: "candlestick", // chartjs-chart-financial 플러그인 기준
+        data: {
+            datasets: [
+                {
+                    label: symbol,
+                    data: [],
+                },
+            ],
+        },
+        options: {
+            parsing: false, // 우리가 직접 {x,o,h,l,c} 포맷으로 넣을 거라서
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: {
+                    type: "time",
+                    time: {
+                        tooltipFormat: "yyyy-MM-dd HH:mm",
+                    },
+                    ticks: {
+                        // 너무 빽빽하면 자동으로 줄여줌
+                        source: "auto",
+                    },
+                },
+                y: {
+                    position: "right",
+                },
+            },
+            plugins: {
+                legend: {
+                    display: false,
+                },
+                tooltip: {
+                    callbacks: {
+                        label: (ctx) => {
+                            const v = ctx.raw;
+                            if (!v) return "";
+                            return `O:${v.o} H:${v.h} L:${v.l} C:${v.c}`;
+                        },
+                    },
+                },
+            },
+        },
+    });
 
-    for (const sym of SYMBOLS) {
-        if (!ohlcv[sym] || ohlcv[sym].length === 0) continue;
+    charts[symbol] = chart;
+    return chart;
+}
 
-        // 캔들 반영
-        updateCandleChart(sym, ohlcv[sym]);
+// 차트 데이터 갱신
+function updateChart(symbol, rawCandles) {
+    if (!Array.isArray(rawCandles)) return;
 
-        // 라인 오버레이
-        const posData = (state.pos_state || {})[sym];
-        updateOverlayLines(sym, posData, ohlcv[sym]);
+    let chart = charts[symbol];
+    if (!chart) {
+        chart = initChart(symbol);
+        if (!chart) return;
     }
+
+    // rawCandles → {x,o,h,l,c} 배열로 변환
+    const mapped = rawCandles
+        .map(mapCandleForChart)
+        .filter(c => c !== null);
+
+    chart.data.datasets[0].data = mapped;
+    chart.update();
 }
 
 // =====================
 // WebSocket 연결
 // =====================
-function connectWS() {
-    const wsUrl =
-        (location.protocol === "https:" ? "wss://" : "ws://") +
-        window.location.hostname +
-        ":8000/ws";
 
-    const socket = new WebSocket(wsUrl);
+let ws = null;
+let reconnectTimer = null;
 
-    socket.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        updateDashboard(data);
+function connectWebSocket() {
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+    const wsUrl = `${protocol}://${window.location.host}/ws`;
+
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+        console.log("WebSocket connected:", wsUrl);
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
     };
 
-    socket.onclose = () => {
-        setTimeout(connectWS, 2000);
+    ws.onclose = () => {
+        console.warn("WebSocket closed. Reconnecting in 3s...");
+        if (!reconnectTimer) {
+            reconnectTimer = setTimeout(connectWebSocket, 3000);
+        }
     };
 
-    socket.onerror = () => {};
+    ws.onerror = (err) => {
+        console.error("WebSocket error:", err);
+        ws.close();
+    };
+
+    ws.onmessage = (event) => {
+        try {
+            const state = JSON.parse(event.data);
+            handleStateUpdate(state);
+        } catch (e) {
+            console.error("Failed to parse WS message:", e);
+        }
+    };
 }
 
-connectWS();
+// =====================
+// 상태 업데이트 핸들러
+// =====================
+function handleStateUpdate(state) {
+    if (!state) return;
+
+    // 1) Equity
+    if (equityEl) {
+        equityEl.textContent = fmtUSDT(state.equity);
+    }
+
+    // 2) Entry Restriction
+    renderEntryRestriction(state.entry_restrict);
+
+    // 3) Position
+    renderPosition(state.pos_state);
+
+    // 4) Logs / last_signal
+    renderLogs(state);
+
+    // 5) 캔들 차트 (state.ohlcv 사용)
+    const ohlcv = state.ohlcv || {};
+    for (const sym of SYMBOLS) {
+        const candles = ohlcv[sym];
+        if (!Array.isArray(candles) || candles.length === 0) {
+            // 데이터가 없는 경우, 해당 차트는 그대로 두거나 나중에 클리어할 수 있음
+            continue;
+        }
+        updateChart(sym, candles);
+    }
+}
+
+// =====================
+// 초기 실행
+// =====================
+
+window.addEventListener("load", () => {
+    // 차트 먼저 초기화 (데이터 없어도 canvas 생성)
+    SYMBOLS.forEach(sym => initChart(sym));
+
+    // WebSocket 연결 시작
+    connectWebSocket();
+});
