@@ -40,8 +40,18 @@ function updateDashboard(state) {
         state.equity ? state.equity.toLocaleString() + " USDT" : "-";
 
     // Entry Restriction
+    const restrict = state.entry_restrict;
+    let text = "";
+
+    for (const sym in restrict) {
+        const r = restrict[sym];
+        text += `${sym}: ${r === null ? "-" : r}\n`;
+    }
+
+// entryRestrictElement.innerText = text;
+
     document.getElementById("entry_restrict").innerText =
-        state.entry_restrict || "none";
+        text || "none";
 
     // Position
     document.getElementById("position").innerText =
