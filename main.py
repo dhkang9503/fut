@@ -19,25 +19,18 @@ SYMBOLS = [
     "DOGE/USDT:USDT",
 ]
 
-TIMEFRAME = "5m"
-HTF_TIMEFRAME = "1h"  # HTF 추세 판단용 (1시간봉)
-
-MA_SHORT = 50
-MA_LONG = 200
+TIMEFRAME = "1h"   # CCI + Bollinger 전략: 1시간봉
 
 # 리스크 및 레버리지 관련
 RISK_PER_TRADE = 0.03      # 손절 도달 시 계좌의 3% 손실 목표
 MAX_LEVERAGE   = 10        # 최대 레버리지(실제 포지션 노출 / equity 상한)
 
-# ma_gap 기반 최소/최대 손절 폭 (이제는 사용하지 않지만 남겨둠)
-MIN_STOP_PCT = 0.01        # 1.0%
-MAX_STOP_PCT = 0.03        # 3.0%
-
-# FVG + 스윕 전략 파라미터
-SWEEP_LOOKBACK = 12        # 스윕 탐지용 lookback 캔들 수(5분봉 기준)
-TP_RR          = 2.0       # 목표 손익비 (1:R)
-
 LOOP_INTERVAL = 5          # 루프 주기(초)
+
+# CCI / 볼린저 파라미터
+CCI_PERIOD = 20
+BB_PERIOD  = 20
+BB_K       = 2.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,7 +51,7 @@ def init_exchange():
         },
     })
 
-    # 🔹 데모(모의거래)면 켜기
+    # 🔹 데모(모의거래)면 켜기 (실계정이면 False 로 바꿔)
     exchange.set_sandbox_mode(True)
 
     # 마켓 정보 미리 로드
@@ -83,7 +76,7 @@ def init_exchange():
 
 # ============== 유틸 함수들 ============== #
 
-def fetch_ohlcv_df(exchange, symbol, timeframe, limit=300):
+def fetch_ohlcv_df(exchange, symbol, timeframe, limit=200):
     """OHLCV 데이터를 pandas DataFrame으로 변환."""
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     if not ohlcv:
@@ -98,12 +91,23 @@ def fetch_ohlcv_df(exchange, symbol, timeframe, limit=300):
 
 def calculate_indicators(df: pd.DataFrame):
     """
-    MA50, MA200 및 ma_gap 계산.
-    (현재 FVG 전략에서는 직접 사용하지 않지만, 향후 확장 대비 그대로 유지)
+    CCI, Bollinger Bands 계산.
+    - CCI: period = CCI_PERIOD
+    - Bollinger: close 기준, period = BB_PERIOD, K = BB_K
     """
-    df["ma50"] = df["close"].rolling(MA_SHORT).mean()
-    df["ma200"] = df["close"].rolling(MA_LONG).mean()
-    df["ma_gap"] = (df["ma50"] - df["ma200"]).abs() / df["close"]
+    # CCI용 typical price
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    ma_tp = tp.rolling(CCI_PERIOD).mean()
+    mean_dev = (tp - ma_tp).abs().rolling(CCI_PERIOD).mean()
+    df["cci"] = (tp - ma_tp) / (0.015 * mean_dev)
+
+    # Bollinger Bands
+    ma = df["close"].rolling(BB_PERIOD).mean()
+    std = df["close"].rolling(BB_PERIOD).std()
+    df["bb_mid"]   = ma
+    df["bb_upper"] = ma + BB_K * std
+    df["bb_lower"] = ma - BB_K * std
+
     return df
 
 def fetch_futures_equity(exchange):
@@ -213,146 +217,68 @@ def sync_positions(exchange, symbols):
 
     return result
 
-# ============== HTF 추세 & FVG+스윕 진입 로직 함수들 ============== #
+# ============== CCI + Bollinger 엔트리 로직 ============== #
 
-def fetch_htf_trend(exchange, symbol, timeframe=HTF_TIMEFRAME):
+def detect_cci_signal(df: pd.DataFrame):
     """
-    상위 타임프레임(기본 1h)에서 MA50/MA200 기준으로 추세 판단.
-    - return: +1(상승), -1(하락), 0(애매)
-    """
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=MA_LONG + 10)
-    except Exception as e:
-        logging.warning(f"{symbol} HTF 캔들 조회 실패: {e}")
-        return 0
-
-    if not ohlcv:
-        return 0
-
-    df = pd.DataFrame(
-        ohlcv,
-        columns=["ts", "open", "high", "low", "close", "volume"],
-    )
-    df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    df.set_index("dt", inplace=True)
-
-    df["ma_short"] = df["close"].rolling(MA_SHORT).mean()
-    df["ma_long"] = df["close"].rolling(MA_LONG).mean()
-
-    if len(df) < MA_LONG + 1:
-        # 데이터 부족 시 추세 애매 처리
-        return 0
-
-    # 마지막으로 닫힌 HTF 캔들 기준
-    last = df.iloc[-2]
-
-    if pd.isna(last["ma_short"]) or pd.isna(last["ma_long"]):
-        return 0
-
-    if last["ma_short"] > last["ma_long"]:
-        return 1
-    elif last["ma_short"] < last["ma_long"]:
-        return -1
-    else:
-        return 0
-
-def detect_fvg_sweep_signal(df: pd.DataFrame, htf_trend: int,
-                            sweep_lookback: int = SWEEP_LOOKBACK,
-                            rr: float = TP_RR):
-    """
-    5분봉 df 기준, 마지막으로 닫힌 캔들(curr = df.iloc[-2])에서
-    - HTF 추세 필터
-    - 유동성 스윕
-    - 3캔들 FVG
-    조합으로 진입 신호 탐지.
+    마지막으로 닫힌 캔들 기준 CCI 신호 탐지.
+    - 직전 캔들의 CCI, 현재(막 닫힌) 캔들의 CCI 비교
+    - 숏: prev_cci > +100 이고 curr_cci <= +99
+    - 롱: prev_cci < -100 이고 curr_cci >= -99
 
     return:
       None 또는 {
         "side": "long"/"short",
         "entry_price": float,
         "stop_price": float,
-        "tp_price": float,
         "signal_ts": int,
       }
     """
-    if df is None or len(df) < sweep_lookback + 4:
+    if df is None or len(df) < CCI_PERIOD + 3:
         return None
 
-    # 마지막으로 닫힌 캔들 기준
-    curr = df.iloc[-2]     # i
-    prev = df.iloc[-3]     # i-1
-    prev2 = df.iloc[-4]    # i-2
+    curr = df.iloc[-2]   # 막 닫힌 캔들
+    prev = df.iloc[-3]   # 그 이전 캔들
 
-    idx_curr = len(df) - 2
-    if idx_curr <= 0:
+    cci_curr = float(curr.get("cci", float("nan")))
+    cci_prev = float(prev.get("cci", float("nan")))
+    if math.isnan(cci_curr) or math.isnan(cci_prev):
         return None
-
-    # 스윕 판단용 이전 구간(현재 캔들 제외)
-    start_idx = max(0, idx_curr - sweep_lookback)
-    prior = df.iloc[start_idx:idx_curr]
-    if prior.empty:
-        return None
-
-    min_low = float(prior["low"].min())
-    max_high = float(prior["high"].max())
 
     entry_price = float(curr["close"])
     if entry_price <= 0:
         return None
 
-    signal = None
+    side = None
+    stop_price = None
 
-    # ===== 상승 추세 + bullish sweep + bullish FVG → 롱 신호 ===== #
-    if htf_trend == 1:
-        bullish_sweep = (float(curr["low"]) < min_low) and (entry_price > min_low)
-        bullish_fvg = float(prev2["high"]) < float(curr["low"])  # prev2.high < curr.low
+    # 숏 신호: 과매수(+100 이상) 후 꺾여서 +99 이하로 복귀
+    if cci_prev > 100 and cci_curr <= 99:
+        side = "short"
+        # 손절: 이전 봉(막 닫힌 캔들)의 고가
+        stop_price = float(curr["high"])
 
-        if bullish_sweep and bullish_fvg:
-            # FVG 구간 [prev2.high, curr.low] 중 하단(prev2.high)을 손절 기준으로 사용
-            stop_price = float(prev2["high"])
-            if stop_price <= 0 or stop_price >= entry_price:
-                return None
+    # 롱 신호: 과매도(-100 이하) 후 꺾여서 -99 이상으로 복귀
+    elif cci_prev < -100 and cci_curr >= -99:
+        side = "long"
+        # 손절: 이전 봉(막 닫힌 캔들)의 저가
+        stop_price = float(curr["low"])
 
-            risk = entry_price - stop_price
-            tp_price = entry_price + rr * risk
+    if side is None or stop_price is None or stop_price <= 0:
+        return None
 
-            signal = {
-                "side": "long",
-                "entry_price": entry_price,
-                "stop_price": stop_price,
-                "tp_price": tp_price,
-                "signal_ts": int(curr["ts"]),
-            }
-
-    # ===== 하락 추세 + bearish sweep + bearish FVG → 숏 신호 ===== #
-    if htf_trend == -1 and signal is None:
-        bearish_sweep = (float(curr["high"]) > max_high) and (entry_price < max_high)
-        bearish_fvg = float(prev2["low"]) > float(curr["high"])  # prev2.low > curr.high
-
-        if bearish_sweep and bearish_fvg:
-            # FVG 구간 [curr.high, prev2.low] 중 상단(prev2.low)을 손절 기준으로 사용
-            stop_price = float(prev2["low"])
-            if stop_price <= 0 or stop_price <= entry_price:
-                return None
-
-            risk = stop_price - entry_price
-            tp_price = entry_price - rr * risk
-
-            signal = {
-                "side": "short",
-                "entry_price": entry_price,
-                "stop_price": stop_price,
-                "tp_price": tp_price,
-                "signal_ts": int(curr["ts"]),
-            }
-
-    return signal
+    return {
+        "side": side,
+        "entry_price": entry_price,
+        "stop_price": stop_price,
+        "signal_ts": int(curr["ts"]),
+    }
 
 # ============== 메인 루프 ============== #
 
 def main():
     exchange = init_exchange()
-    logging.info("OKX BTC+XRP+DOGE 자동매매 봇 시작 (FVG+스윕+HTF, 리스크 3% 고정, 심볼별 포지션 허용)")
+    logging.info("OKX CCI + Bollinger 자동매매 봇 시작 (1h, 리스크 3% 고정, 익절/손절 후 방향 대칭 제한)")
 
     # 심볼별 포지션 상태 관리용
     pos_state = {
@@ -361,36 +287,38 @@ def main():
             "size": 0.0,
             "entry_price": None,
             "stop_price": None,
-            "tp_price": None,
             "stop_order_id": None,
             "entry_time": None,
         }
         for sym in SYMBOLS
     }
 
+    # 손절/익절 이후 허용 방향 제한:
+    #   None        : 제한 없음 (롱/숏 모두 허용)
+    #   "long_only" : 롱만 허용
+    #   "short_only": 숏만 허용
+    entry_restrict = {sym: None for sym in SYMBOLS}
+
     last_signal_candle_ts = {}  # 심볼별 마지막 신호 캔들 ts
 
     while True:
         try:
-            # --- 각 심볼별 캔들/지표/HTF 추세 업데이트 --- #
-            data = {}  # symbol -> (df, prev2, prev, curr, htf_trend)
+            # --- 각 심볼별 캔들/지표 업데이트 --- #
+            data = {}  # symbol -> (df, prev, curr)
             for sym in SYMBOLS:
-                df = fetch_ohlcv_df(exchange, sym, TIMEFRAME, limit=MA_LONG + 10)
+                df = fetch_ohlcv_df(exchange, sym, TIMEFRAME, limit=CCI_PERIOD + BB_PERIOD + 20)
                 if df is None or df.empty:
                     logging.warning(f"{sym} 캔들 데이터를 가져오지 못했습니다.")
                     continue
                 df = calculate_indicators(df)
-                if len(df) < MA_LONG + 4:
-                    logging.info(f"{sym}: FVG/MA 계산에 필요한 캔들이 부족합니다.")
+                if len(df) < max(CCI_PERIOD, BB_PERIOD) + 3:
+                    logging.info(f"{sym}: 지표 계산에 필요한 캔들이 부족합니다.")
                     continue
 
-                prev2 = df.iloc[-4]
                 prev = df.iloc[-3]
                 curr = df.iloc[-2]
 
-                # HTF 추세 계산
-                htf_trend = fetch_htf_trend(exchange, sym, timeframe=HTF_TIMEFRAME)
-                data[sym] = (df, prev2, prev, curr, htf_trend)
+                data[sym] = (df, prev, curr)
 
             if not data:
                 logging.warning("어느 심볼에서도 유효한 데이터가 없습니다. 대기.")
@@ -405,14 +333,23 @@ def main():
                 has_pos = exch_pos.get("has_position", False)
 
                 if not has_pos:
-                    # 거래소 포지션이 사라졌는데 로컬 상태에는 남아 있으면, 스탑로스/수동청산 등으로 봄
+                    # 거래소 포지션이 사라졌는데 로컬 상태에는 남아 있으면,
+                    # 스탑로스 or 수동청산 등으로 판단하고 방향 제한 규칙 적용
                     if pos_state[sym]["side"] is not None and pos_state[sym]["size"] > 0:
-                        logging.info(f"[{sym}] 거래소 포지션이 사라짐 → 로컬 상태 초기화 (스탑로스 or 수동 청산)")
+                        last_side = pos_state[sym]["side"]
+                        logging.info(f"[{sym}] 거래소 포지션이 사라짐 → 로컬 상태 초기화 (스탑로스 or 수동 청산), last_side={last_side}")
+                        # 룰 (완전 대칭):
+                        # - 숏 포지션 종료(손절/익절): 다음에는 롱 타점만 대기
+                        # - 롱 포지션 종료(손절/익절): 다음에는 숏 타점만 대기
+                        if last_side == "short":
+                            entry_restrict[sym] = "long_only"
+                        elif last_side == "long":
+                            entry_restrict[sym] = "short_only"
+
                     pos_state[sym]["side"] = None
                     pos_state[sym]["size"] = 0.0
                     pos_state[sym]["entry_price"] = None
                     pos_state[sym]["stop_price"] = None
-                    pos_state[sym]["tp_price"] = None
                     pos_state[sym]["stop_order_id"] = None
                     pos_state[sym]["entry_time"] = None
                 else:
@@ -423,26 +360,30 @@ def main():
                     if entry_price and entry_price > 0:
                         pos_state[sym]["entry_price"] = entry_price
 
-            # ---------------- 포지션 있는 심볼들: TP 관리 ---------------- #
+            # ---------------- 포지션 있는 심볼들: TP(볼린저 터치) 관리 ---------------- #
             for sym in SYMBOLS:
                 if sym not in data:
                     continue
 
                 side = pos_state[sym]["side"]
                 size = pos_state[sym]["size"]
-                tp_price = pos_state[sym]["tp_price"]
 
-                if side is None or size <= 0 or tp_price is None:
-                    continue  # 이 심볼은 포지션 없음 또는 TP 미설정
+                if side is None or size <= 0:
+                    continue  # 이 심볼은 포지션 없음
 
-                df_sym, prev2, prev, curr, htf_trend = data[sym]
+                df_sym, prev, curr = data[sym]
 
-                # 롱 포지션 TP: 현재 캔들의 high가 tp 이상
+                bb_upper = float(curr.get("bb_upper", float("nan")))
+                bb_lower = float(curr.get("bb_lower", float("nan")))
+                high = float(curr["high"])
+                low = float(curr["low"])
+
+                # 롱 포지션 TP: 현재(막 닫힌) 캔들의 high가 볼린저 상단 이상 터치
                 if side == "long":
-                    if float(curr["high"]) >= tp_price:
-                        logging.info(f"[TP LONG] {sym} TP={tp_price:.6f} 도달 → 시장가 롱 익절")
+                    if (not math.isnan(bb_upper)) and high >= bb_upper:
+                        logging.info(f"[TP LONG] {sym} 볼린저 상단 터치 (high={high:.6f}, bb_upper={bb_upper:.6f}) → 시장가 롱 익절")
 
-                        # 1) 먼저 스탑로스 주문 취소
+                        # 스탑로스 주문 취소
                         stop_order_id = pos_state[sym]["stop_order_id"]
                         if stop_order_id is not None:
                             try:
@@ -453,7 +394,7 @@ def main():
                         pos_state[sym]["stop_order_id"] = None
                         pos_state[sym]["stop_price"] = None
 
-                        # 2) 방금 시점의 실제 포지션 사이즈 다시 조회
+                        # 방금 시점의 실제 포지션 사이즈 다시 조회
                         exch_positions_now = sync_positions(exchange, SYMBOLS)
                         p_now = exch_positions_now.get(sym, {})
                         if (not p_now.get("has_position")) or p_now.get("size", 0) <= 0:
@@ -461,13 +402,14 @@ def main():
                             pos_state[sym]["side"] = None
                             pos_state[sym]["size"] = 0.0
                             pos_state[sym]["entry_price"] = None
-                            pos_state[sym]["tp_price"] = None
                             pos_state[sym]["entry_time"] = None
+                            # 롱 종료 후 → 숏만 허용
+                            entry_restrict[sym] = "short_only"
                             continue
 
                         current_size = p_now["size"]
 
-                        # 3) 시장가 청산
+                        # 시장가 청산
                         try:
                             order = exchange.create_order(
                                 sym,
@@ -482,21 +424,23 @@ def main():
                         except Exception as e:
                             logging.error(f"{sym} 롱 익절 주문 실패: {e}")
 
-                        # 4) 이 심볼 포지션 상태 리셋
+                        # 포지션 상태 리셋
                         pos_state[sym]["side"] = None
                         pos_state[sym]["size"] = 0.0
                         pos_state[sym]["entry_price"] = None
                         pos_state[sym]["stop_price"] = None
-                        pos_state[sym]["tp_price"] = None
                         pos_state[sym]["stop_order_id"] = None
                         pos_state[sym]["entry_time"] = None
 
-                # 숏 포지션 TP: 현재 캔들의 low가 tp 이하
-                elif side == "short":
-                    if float(curr["low"]) <= tp_price:
-                        logging.info(f"[TP SHORT] {sym} TP={tp_price:.6f} 도달 → 시장가 숏 익절")
+                        # 롱 종료 후 → 숏만 허용 (대칭)
+                        entry_restrict[sym] = "short_only"
 
-                        # 1) 먼저 스탑로스 주문 취소
+                # 숏 포지션 TP: 현재(막 닫힌) 캔들의 low가 볼린저 하단 이하 터치
+                elif side == "short":
+                    if (not math.isnan(bb_lower)) and low <= bb_lower:
+                        logging.info(f"[TP SHORT] {sym} 볼린저 하단 터치 (low={low:.6f}, bb_lower={bb_lower:.6f}) → 시장가 숏 익절")
+
+                        # 스탑로스 주문 취소
                         stop_order_id = pos_state[sym]["stop_order_id"]
                         if stop_order_id is not None:
                             try:
@@ -507,7 +451,7 @@ def main():
                         pos_state[sym]["stop_order_id"] = None
                         pos_state[sym]["stop_price"] = None
 
-                        # 2) 방금 시점의 실제 포지션 사이즈 다시 조회
+                        # 방금 시점의 실제 포지션 사이즈 다시 조회
                         exch_positions_now = sync_positions(exchange, SYMBOLS)
                         p_now = exch_positions_now.get(sym, {})
                         if (not p_now.get("has_position")) or p_now.get("size", 0) <= 0:
@@ -515,13 +459,14 @@ def main():
                             pos_state[sym]["side"] = None
                             pos_state[sym]["size"] = 0.0
                             pos_state[sym]["entry_price"] = None
-                            pos_state[sym]["tp_price"] = None
                             pos_state[sym]["entry_time"] = None
+                            # 숏 종료 후 → 롱만 허용 (대칭)
+                            entry_restrict[sym] = "long_only"   # ★ 대칭 조건
                             continue
 
                         current_size = p_now["size"]
 
-                        # 3) 시장가 청산
+                        # 시장가 청산
                         try:
                             order = exchange.create_order(
                                 sym,
@@ -536,14 +481,16 @@ def main():
                         except Exception as e:
                             logging.error(f"{sym} 숏 익절 주문 실패: {e}")
 
-                        # 4) 이 심볼 포지션 상태 리셋
+                        # 포지션 상태 리셋
                         pos_state[sym]["side"] = None
                         pos_state[sym]["size"] = 0.0
                         pos_state[sym]["entry_price"] = None
                         pos_state[sym]["stop_price"] = None
-                        pos_state[sym]["tp_price"] = None
                         pos_state[sym]["stop_order_id"] = None
                         pos_state[sym]["entry_time"] = None
+
+                        # 숏 종료 후 → 롱만 허용 (대칭)
+                        entry_restrict[sym] = "long_only"       # ★ 대칭 조건
 
             # ---------------- 포지션 없는 심볼들: 각 심볼 신호 체크 후 진입 ---------------- #
             for sym in SYMBOLS:
@@ -555,22 +502,30 @@ def main():
                 if pos_state[sym]["side"] is not None and pos_state[sym]["size"] > 0:
                     continue
 
-                df_sym, prev2, prev, curr, htf_trend = data[sym]
+                df_sym, prev, curr = data[sym]
                 curr_ts = int(curr["ts"])
 
                 # 같은 심볼의 같은 캔들에서 중복 진입 방지
                 if sym in last_signal_candle_ts and last_signal_candle_ts[sym] == curr_ts:
                     continue
 
-                # FVG + 스윕 + HTF 기반 진입 신호 탐지
-                signal = detect_fvg_sweep_signal(df_sym, htf_trend)
+                # CCI 기반 진입 신호 탐지
+                signal = detect_cci_signal(df_sym)
                 if not signal:
                     continue
 
                 side_signal = signal["side"]       # "long" or "short"
                 est_entry_price = signal["entry_price"]
                 stop_price = signal["stop_price"]
-                tp_price_struct = signal["tp_price"]
+
+                # 방향 제한 규칙 적용 (완전 대칭)
+                restrict = entry_restrict.get(sym)
+                if restrict == "long_only" and side_signal != "long":
+                    logging.info(f"[{sym}] 현재 진입 제한: long_only → 숏 신호 무시")
+                    continue
+                if restrict == "short_only" and side_signal != "short":
+                    logging.info(f"[{sym}] 현재 진입 제한: short_only → 롱 신호 무시")
+                    continue
 
                 if est_entry_price <= 0 or stop_price <= 0:
                     continue
@@ -604,16 +559,18 @@ def main():
                         side = "buy"
                         pos_side = "long"
                         log_side = "LONG"
+                        sl_side = "sell"
                     else:
                         side = "sell"
                         pos_side = "short"
                         log_side = "SHORT"
+                        sl_side = "buy"
 
                     logging.info(
-                        f"[ENTRY {log_side}] {sym} 진입 신호(FVG+스윕+HTF) / "
-                        f"htf_trend={htf_trend}, stop_pct={stop_pct*100:.3f}%%, "
+                        f"[ENTRY {log_side}] {sym} CCI 신호 진입 / "
+                        f"stop_pct={stop_pct*100:.3f}%%, "
                         f"target_lev≈{RISK_PER_TRADE/stop_pct:.2f}x, eff_lev≈{eff_lev:.2f}x, "
-                        f"entry≈{est_entry_price:.6f}, SL={stop_price:.6f}, TP≈{tp_price_struct:.6f}"
+                        f"entry≈{est_entry_price:.6f}, SL={stop_price:.6f}"
                     )
 
                     # 시장가 진입
@@ -626,9 +583,9 @@ def main():
                             "tdMode": "cross",
                         },
                     )
-                    logging.info(f"[{sym}] {log_side} 진입 주문 체결: {order}")
+                    logging.info(f"{sym}] {log_side} 진입 주문 체결: {order}")
 
-                    # 🔹 실제 포지션 진입가/사이즈를 다시 조회해서 TP 기준으로 사용
+                    # 🔹 실제 포지션 진입가/사이즈를 다시 조회
                     actual_entry_price = est_entry_price
                     actual_size = amount
 
@@ -648,18 +605,7 @@ def main():
                     pos_state[sym]["size"] = actual_size
                     pos_state[sym]["entry_price"] = actual_entry_price
                     pos_state[sym]["entry_time"] = datetime.now(timezone.utc)
-                    pos_state[sym]["stop_price"] = stop_price  # 구조적 손절(변경 없음)
-
-                    # 실제 진입가 기준 TP 재계산 (손익비 유지)
-                    risk_abs = abs(actual_entry_price - stop_price)
-                    if pos_side == "long":
-                        tp_price = actual_entry_price + TP_RR * risk_abs
-                        sl_side = "sell"
-                    else:
-                        tp_price = actual_entry_price - TP_RR * risk_abs
-                        sl_side = "buy"
-
-                    pos_state[sym]["tp_price"] = tp_price
+                    pos_state[sym]["stop_price"] = stop_price  # 구조적 손절
 
                     # 조건부 스탑마켓 주문 (reduceOnly)
                     stop_order_id = None
@@ -687,10 +633,13 @@ def main():
 
                     logging.info(
                         f"[{sym}] {log_side} 실제 진입가={actual_entry_price:.6f}, 수량={actual_size}, "
-                        f"SL={stop_price:.6f}, TP={tp_price:.6f}, stop_pct={stop_pct*100:.3f}%%"
+                        f"SL={stop_price:.6f}, stop_pct={stop_pct*100:.3f}%%"
                     )
 
                     last_signal_candle_ts[sym] = curr_ts
+
+                    # 진입 성공 시, 이전에 걸려있던 방향 제한은 리셋
+                    entry_restrict[sym] = None
 
                 except Exception as e:
                     logging.error(f"[{sym}] {log_side} 진입 주문 실패: {e}")
@@ -700,6 +649,7 @@ def main():
         except Exception as e:
             logging.error(f"메인 루프 에러: {e}")
             time.sleep(LOOP_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
