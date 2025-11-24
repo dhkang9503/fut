@@ -1,25 +1,46 @@
-let socket = null;
-let chart = null;
-let candleSeries = null;
-let entryLine = null;
-let stopLine = null;
-let tpLine = null;
+// 모니터링 심볼
+const SYMBOLS = ["BTC/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"];
 
-function initChart() {
-    const chartElement = document.getElementById("chart");
-    chartElement.innerHTML = "";
+const CHART_IDS = {
+    "BTC/USDT:USDT": "chart-btc",
+    "XRP/USDT:USDT": "chart-xrp",
+    "DOGE/USDT:USDT": "chart-doge",
+};
 
-    chart = LightweightCharts.createChart(chartElement, {
-        layout: { background: { color: "#1f2937" }, textColor: "white" },
-        grid: {
-            vertLines: { color: "#2d3748" },
-            horzLines: { color: "#2d3748" },
+const charts = {};
+const candleSeries = {};
+const entryLines = {};
+const stopLines = {};
+const tpLines = {};
+
+const equityEl = document.getElementById("equity");
+const entryRestrictEl = document.getElementById("entry_restrict");
+const posEl = document.getElementById("position");
+const logsEl = document.getElementById("logs");
+
+function initChartForSymbol(sym) {
+    const containerId = CHART_IDS[sym];
+    const el = document.getElementById(containerId);
+    if (!el) return;
+
+    const chart = LightweightCharts.createChart(el, {
+        layout: {
+            background: { color: "#111827" },
+            textColor: "white",
         },
-        width: chartElement.clientWidth,
-        height: 400,
+        grid: {
+            vertLines: { color: "#1f2937" },
+            horzLines: { color: "#1f2937" },
+        },
+        width: el.clientWidth,
+        height: 220,
+        timeScale: {
+            timeVisible: true,
+            secondsVisible: false,
+        },
     });
 
-    candleSeries = chart.addCandlestickSeries({
+    const candles = chart.addCandlestickSeries({
         upColor: "#22c55e",
         borderUpColor: "#22c55e",
         wickUpColor: "#22c55e",
@@ -28,12 +49,106 @@ function initChart() {
         wickDownColor: "#ef4444",
     });
 
-    entryLine = chart.addLineSeries({ color: "yellow", lineWidth: 2 });
-    stopLine = chart.addLineSeries({ color: "red", lineWidth: 2 });
-    tpLine = chart.addLineSeries({ color: "green", lineWidth: 2 });
+    const entry = chart.addLineSeries({ color: "yellow", lineWidth: 1 });
+    const stop = chart.addLineSeries({ color: "red", lineWidth: 1 });
+    const tp = chart.addLineSeries({ color: "lime", lineWidth: 1 });
+
+    charts[sym] = chart;
+    candleSeries[sym] = candles;
+    entryLines[sym] = entry;
+    stopLines[sym] = stop;
+    tpLines[sym] = tp;
 }
 
+function renderEntryRestriction(entryRestrict) {
+    if (!entryRestrict) return "-";
+    let text = "";
+    for (const sym of SYMBOLS) {
+        const r = entryRestrict[sym];
+        text += `${sym}: ${r === null ? "-" : r}\n`;
+    }
+    return text.trim();
+}
 
+function updateDashboard(state) {
+    // Equity
+    if (state.equity != null) {
+        equityEl.innerText = Number(state.equity).toLocaleString() + " USDT";
+    } else {
+        equityEl.innerText = "-";
+    }
+
+    // Entry Restriction
+    entryRestrictEl.innerText = renderEntryRestriction(state.entry_restrict);
+
+    // Raw 상태 표시
+    posEl.innerText = JSON.stringify(state.pos_state || {}, null, 2);
+    logsEl.innerText = JSON.stringify(state.last_signal || {}, null, 2);
+
+    const ohlcv = state.ohlcv || {};
+    const posState = state.pos_state || {};
+
+    for (const sym of SYMBOLS) {
+        const candles = ohlcv[sym];
+        if (!candles || candles.length === 0) continue;
+
+        if (!charts[sym]) {
+            initChartForSymbol(sym);
+        }
+
+        candleSeries[sym].setData(candles);
+
+        const p = posState[sym] || {};
+        const hasPosition = p.side && p.size > 0 && p.entry_price != null;
+
+        const firstTime = candles[0].time;
+        const lastTime = candles[candles.length - 1].time;
+
+        if (hasPosition) {
+            const entryPrice = p.entry_price;
+            const stopPrice = p.stop_price;
+            const tpPrice = p.tp_price; // 없으면 undefined라 자동 무시됨
+
+            const lineData = (price) => [
+                { time: firstTime, value: price },
+                { time: lastTime, value: price },
+            ];
+
+            entryLines[sym].setData(entryPrice ? lineData(entryPrice) : []);
+            stopLines[sym].setData(stopPrice ? lineData(stopPrice) : []);
+            tpLines[sym].setData(tpPrice ? lineData(tpPrice) : []);
+        } else {
+            entryLines[sym].setData([]);
+            stopLines[sym].setData([]);
+            tpLines[sym].setData([]);
+        }
+    }
+}
+
+function connectWS() {
+    const wsUrl =
+        (location.protocol === "https:" ? "wss://" : "ws://") +
+        window.location.hostname +
+        ":8000/ws";
+
+    const socket = new WebSocket(wsUrl);
+
+    socket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        updateDashboard(data);
+    };
+
+    socket.onclose = () => {
+        console.log("WS Closed. Reconnecting in 3s...");
+        setTimeout(connectWS, 3000);
+    };
+
+    socket.onerror = (e) => {
+        console.log("WS Error:", e);
+    };
+}
+
+connectWS();
 function updateDashboard(state) {
     // Equity
     document.getElementById("equity").innerText =
