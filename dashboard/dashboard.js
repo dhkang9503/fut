@@ -491,7 +491,7 @@ function initCciChart(symbol) {
                     data: [],
                     borderWidth: 1,
                     pointRadius: 0,
-                    borderColor: "#facc15",   // 밝은 노란색
+                    borderColor: "rgba(250,204,21,0.7)",   // 밝은 노란색
                     tension: 0.1,
                 },
                 {
