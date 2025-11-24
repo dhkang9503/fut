@@ -357,8 +357,8 @@ function initCciChart(symbol) {
                 },
                 y: {
                     position: "right",
-                    suggestedMin: -250,
-                    suggestedMax: 250,
+                    // suggestedMin: -250,
+                    // suggestedMax: 250,
                 },
             },
             plugins: {
