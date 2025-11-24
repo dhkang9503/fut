@@ -17,6 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.mount("/", StaticFiles(directory="dashboard", html=True), name="static")
 
 @app.get("/state")
 def get_state():
