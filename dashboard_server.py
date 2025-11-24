@@ -51,7 +51,8 @@ async def websocket_endpoint(ws: WebSocket):
 
         await ws.send_json(state)
         await asyncio.sleep(1)
-            return json.load(f)
+        
+        return json.load(f)
     except Exception:
         return {"error": "state_not_found"}
 
