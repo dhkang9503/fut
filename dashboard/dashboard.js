@@ -1,25 +1,26 @@
-// 모니터링 심볼 (JSON의 키 그대로)
+// =====================
+// Chart.js + Financial Plugin 캔들 차트 버전
+// =====================
+
+// 심볼 리스트
 const SYMBOLS = ["BTC/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"];
 
-// 심볼 → div id 매핑
+// 심볼 → canvas ID 매핑
 const CHART_IDS = {
     "BTC/USDT:USDT": "chart-btc",
     "XRP/USDT:USDT": "chart-xrp",
     "DOGE/USDT:USDT": "chart-doge",
 };
 
-const charts = {};        // 심볼별 chart 객체
-const candleSeries = {};  // 심볼별 캔들 시리즈
-const entryLines = {};    // 엔트리 라인
-const stopLines = {};     // 스탑 라인
-const tpLines = {};       // TP 라인
+let charts = {};
+let equityEl = document.getElementById("equity");
+let entryRestrictEl = document.getElementById("entry_restrict");
+let posEl = document.getElementById("position");
+let logsEl = document.getElementById("logs");
 
-const equityEl = document.getElementById("equity");
-const entryRestrictEl = document.getElementById("entry_restrict");
-const posEl = document.getElementById("position");
-const logsEl = document.getElementById("logs");
-
-// Entry Restriction 텍스트 렌더링
+// =====================
+// Entry Restriction 출력
+// =====================
 function renderEntryRestriction(entryRestrict) {
     if (!entryRestrict) return "-";
     let text = "";
@@ -30,69 +31,140 @@ function renderEntryRestriction(entryRestrict) {
     return text.trim();
 }
 
-// 심볼별 차트 생성
-function initChartForSymbol(sym) {
-    const containerId = CHART_IDS[sym];
-    const el = document.getElementById(containerId);
-    if (!el) return;
+// =====================
+// Chart.js 캔들 차트 초기화
+// =====================
+function initChart(sym) {
+    const canvasId = CHART_IDS[sym];
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
 
-    const chart = LightweightCharts.createChart(el, {
-        width: el.clientWidth,
-        height: el.clientHeight,
-        layout: {
-            background: { color: "#111827" },
-            textColor: "#e5e7eb",
-        },
-        grid: {
-            vertLines: { color: "#1f2937" },
-            horzLines: { color: "#1f2937" },
-        },
-        timeScale: {
-            timeVisible: true,
-            secondsVisible: false,
-            borderColor: "#374151",
-        },
-        rightPriceScale: {
-            borderColor: "#374151",
-        },
-        crosshair: {
-            mode: LightweightCharts.CrosshairMode.Normal,
-        },
-    });
+    const ctx = canvas.getContext("2d");
 
-    const candles = chart.addCandlestickSeries({
-        upColor: "#22c55e",
-        borderUpColor: "#22c55e",
-        wickUpColor: "#22c55e",
-        downColor: "#ef4444",
-        borderDownColor: "#ef4444",
-        wickDownColor: "#ef4444",
-    });
+    // 기존 차트 제거
+    if (charts[sym]) {
+        charts[sym].destroy();
+    }
 
-    const entry = chart.addLineSeries({ color: "#eab308", lineWidth: 1 });
-    const stop = chart.addLineSeries({ color: "#ef4444", lineWidth: 1 });
-    const tp = chart.addLineSeries({ color: "#22c55e", lineWidth: 1 });
+    charts[sym] = new Chart(ctx, {
+        type: "candlestick",
+        data: {
+            datasets: [
+                {
+                    label: `${sym} OHLC`,
+                    data: [],  // 차후 setData 로 채울 것
+                    borderColor: "#00bcd4",
+                    color: {
+                        up: "#22c55e",
+                        down: "#ef4444",
+                        unchanged: "#e5e7eb",
+                    },
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,   // div 높이를 그대로 사용
+            animation: false,
 
-    charts[sym] = chart;
-    candleSeries[sym] = candles;
-    entryLines[sym] = entry;
-    stopLines[sym] = stop;
-    tpLines[sym] = tp;
+            scales: {
+                x: {
+                    type: "timeseries",
+                    time: {
+                        unit: "hour"
+                    },
+                    grid: { color: "#1f2937" },
+                    ticks: { color: "#9ca3af" }
+                },
+                y: {
+                    grid: { color: "#1f2937" },
+                    ticks: { color: "#9ca3af" }
+                }
+            },
 
-    // 간단한 리사이즈 대응
-    window.addEventListener("resize", () => {
-        const rect = el.getBoundingClientRect();
-        chart.applyOptions({ width: rect.width, height: rect.height });
+            plugins: {
+                legend: { display: false },
+            }
+        }
     });
 }
 
-// 대시보드 전체 업데이트
+// =====================
+// 차트에 캔들 데이터 반영
+// =====================
+function updateCandleChart(sym, ohlcv) {
+    if (!charts[sym]) {
+        initChart(sym);
+    }
+
+    const chart = charts[sym];
+    if (!chart) return;
+
+    const dataset = chart.data.datasets[0];
+
+    dataset.data = ohlcv.map(c => ({
+        x: Number(c.time) * 1000,
+        o: Number(c.open),
+        h: Number(c.high),
+        l: Number(c.low),
+        c: Number(c.close),
+    }));
+
+    chart.update();
+}
+
+// =====================
+// 포지션 라인 오버레이
+// =====================
+function updateOverlayLines(sym, position, ohlcv) {
+    if (!charts[sym]) return;
+    const chart = charts[sym];
+
+    // 기존 보조선 제거
+    chart.data.datasets = chart.data.datasets.filter(d => d.type === "candlestick");
+
+    const first = Number(ohlcv[0].time) * 1000;
+    const last = Number(ohlcv[ohlcv.length - 1].time) * 1000;
+
+    function makeLine(label, price, color) {
+        return {
+            label,
+            type: "line",
+            borderColor: color,
+            borderWidth: 1,
+            fill: false,
+            data: [
+                { x: first, y: price },
+                { x: last, y: price }
+            ]
+        };
+    }
+
+    if (position && position.entry_price) {
+        chart.data.datasets.push(
+            makeLine("Entry", position.entry_price, "#eab308")
+        );
+    }
+    if (position && position.stop_price) {
+        chart.data.datasets.push(
+            makeLine("Stop", position.stop_price, "#ef4444")
+        );
+    }
+    if (position && position.tp_price) {
+        chart.data.datasets.push(
+            makeLine("TP", position.tp_price, "#22c55e")
+        );
+    }
+
+    chart.update();
+}
+
+// =====================
+// Dashboard 업데이트
+// =====================
 function updateDashboard(state) {
-    // 상단 숫자/텍스트들
     if (state.equity != null) {
         equityEl.innerText = Number(state.equity).toLocaleString() + " USDT";
-    } else {
-        equityEl.innerText = "-";
     }
 
     entryRestrictEl.innerText = renderEntryRestriction(state.entry_restrict);
@@ -100,67 +172,22 @@ function updateDashboard(state) {
     logsEl.innerText = JSON.stringify(state.last_signal || {}, null, 2);
 
     const ohlcv = state.ohlcv || {};
-    const posState = state.pos_state || {};
 
     for (const sym of SYMBOLS) {
-        let raw = ohlcv[sym];
-        if (!raw) continue;
+        if (!ohlcv[sym] || ohlcv[sym].length === 0) continue;
 
-        // 배열이 아니더라도 values 로 바꿔서 사용
-        const candles = Array.isArray(raw) ? raw : Object.values(raw);
-        if (!candles || candles.length === 0) continue;
+        // 캔들 반영
+        updateCandleChart(sym, ohlcv[sym]);
 
-        if (!charts[sym]) {
-            initChartForSymbol(sym);
-        }
-
-        // time 은 초 단위 숫자여야 함
-        const mapped = candles.map(c => ({
-            time: Number(c.time),   // 초단위
-            open: Number(c.open),
-            high: Number(c.high),
-            low: Number(c.low),
-            close: Number(c.close),
-        }));
-
-        candleSeries[sym].setData(mapped);
-        charts[sym].timeScale().fitContent();
-
-        // 포지션 라인
-        const p = posState[sym] || {};
-        const hasPosition = p.side && p.size > 0 && p.entry_price != null;
-
-        const firstTime = mapped[0].time;
-        const lastTime = mapped[mapped.length - 1].time;
-
-        const makeLineData = (price) => ([
-            { time: firstTime, value: price },
-            { time: lastTime, value: price },
-        ]);
-
-        if (hasPosition) {
-            const entryPrice = p.entry_price;
-            const stopPrice = p.stop_price;
-            const tpPrice = p.tp_price;
-
-            entryLines[sym].setData(
-                entryPrice != null ? makeLineData(entryPrice) : []
-            );
-            stopLines[sym].setData(
-                stopPrice != null ? makeLineData(stopPrice) : []
-            );
-            tpLines[sym].setData(
-                tpPrice != null ? makeLineData(tpPrice) : []
-            );
-        } else {
-            entryLines[sym].setData([]);
-            stopLines[sym].setData([]);
-            tpLines[sym].setData([]);
-        }
+        // 라인 오버레이
+        const posData = (state.pos_state || {})[sym];
+        updateOverlayLines(sym, posData, ohlcv[sym]);
     }
 }
 
-// WebSocket 연결 & 자동 재접속
+// =====================
+// WebSocket 연결
+// =====================
 function connectWS() {
     const wsUrl =
         (location.protocol === "https:" ? "wss://" : "ws://") +
@@ -175,13 +202,10 @@ function connectWS() {
     };
 
     socket.onclose = () => {
-        console.log("WS Closed. Reconnecting in 3s...");
-        setTimeout(connectWS, 3000);
+        setTimeout(connectWS, 2000);
     };
 
-    socket.onerror = (e) => {
-        console.log("WS Error:", e);
-    };
+    socket.onerror = () => {};
 }
 
 connectWS();
