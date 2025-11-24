@@ -25,7 +25,7 @@ TIMEFRAME = "1h"
 
 RISK_PER_TRADE = 0.03
 MAX_LEVERAGE   = 10
-LOOP_INTERVAL  = 5
+LOOP_INTERVAL  = 3
 
 CCI_PERIOD = 14
 BB_PERIOD  = 20
@@ -99,11 +99,13 @@ def fetch_ohlcv_df(exchange, symbol, timeframe, limit=200):
 
 
 def calculate_indicators(df):
+    # CCI
     tp = (df["high"] + df["low"] + df["close"]) / 3
     ma_tp = tp.rolling(CCI_PERIOD).mean()
     mad = (tp - ma_tp).abs().rolling(CCI_PERIOD).mean()
     df["cci"] = (tp - ma_tp) / (0.015 * mad)
 
+    # Bollinger Bands
     ma = df["close"].rolling(BB_PERIOD).mean()
     std = df["close"].rolling(BB_PERIOD).std()
     df["bb_mid"]   = ma
@@ -149,10 +151,12 @@ def sync_positions(exchange, symbols):
 
     for p in positions:
         sym = p.get("symbol")
-        if sym not in symbols: continue
+        if sym not in symbols:
+            continue
 
         contracts = float(p.get("contracts") or 0)
-        if contracts == 0: continue
+        if contracts == 0:
+            continue
 
         side = p.get("side") or ("long" if contracts > 0 else "short")
         entry_price = float(p.get("entryPrice") or 0)
@@ -206,10 +210,23 @@ def detect_cci_signal(df):
     }
 
 
+def _safe_float(v):
+    """
+    NaN / inf / None 등을 JSON에 안 들어가게 None으로 치환
+    """
+    try:
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    except Exception:
+        return None
+
+
 # ============== 메인 루프 ============== #
 def main():
     exchange = init_exchange()
-    logging.info("CCI + Bollinger 자동매매 (동적 TP + 마커 표시) 시작")
+    logging.info("CCI + Bollinger 자동매매 (동적 TP + 마커 표시 + BB/CCI 대시보드) 시작")
 
     pos_state = {
         sym: {
@@ -267,7 +284,8 @@ def main():
 
             # --- TP 관리 (동적) --- #
             for sym in SYMBOLS:
-                if sym not in data: continue
+                if sym not in data:
+                    continue
                 df, prev, curr = data[sym]
 
                 side = pos_state[sym]["side"]
@@ -288,37 +306,41 @@ def main():
                 if side == "long" and high >= bb_upper:
                     # 롱 익절
                     if pos_state[sym]["stop_order_id"]:
-                        try: exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
-                        except: pass
+                        try:
+                            exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
+                        except Exception:
+                            pass
 
                     exch_now = sync_positions(exchange, SYMBOLS)[sym]
                     if exch_now["has_position"]:
-                        exchange.create_order(sym, "market", "sell", exch_now["size"], params={"tdMode":"cross"})
+                        exchange.create_order(sym, "market", "sell", exch_now["size"], params={"tdMode": "cross"})
 
                     entry_restrict[sym] = "short_only"
                     pos_state[sym] = {
-                        "side": None,"size":0,"entry_price":None,
-                        "stop_price":None,"tp_price":None,
-                        "entry_candle_ts":None,"stop_order_id":None,
-                        "entry_time":None,
+                        "side": None, "size": 0, "entry_price": None,
+                        "stop_price": None, "tp_price": None,
+                        "entry_candle_ts": None, "stop_order_id": None,
+                        "entry_time": None,
                     }
 
                 elif side == "short" and low <= bb_lower:
                     # 숏 익절
                     if pos_state[sym]["stop_order_id"]:
-                        try: exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
-                        except: pass
+                        try:
+                            exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
+                        except Exception:
+                            pass
 
                     exch_now = sync_positions(exchange, SYMBOLS)[sym]
                     if exch_now["has_position"]:
-                        exchange.create_order(sym, "market", "buy", exch_now["size"], params={"tdMode":"cross"})
+                        exchange.create_order(sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"})
 
                     entry_restrict[sym] = "long_only"
                     pos_state[sym] = {
-                        "side":None,"size":0,"entry_price":None,
-                        "stop_price":None,"tp_price":None,
-                        "entry_candle_ts":None,"stop_order_id":None,
-                        "entry_time":None,
+                        "side": None, "size": 0, "entry_price": None,
+                        "stop_price": None, "tp_price": None,
+                        "entry_candle_ts": None, "stop_order_id": None,
+                        "entry_time": None,
                     }
 
             # --- 신규 진입 --- #
@@ -392,22 +414,22 @@ def main():
                         "market",
                         sl_side,
                         actual_size,
-                        params={"tdMode":"cross", "reduceOnly":True, "stopLossPrice":stop_price},
+                        params={"tdMode": "cross", "reduceOnly": True, "stopLossPrice": stop_price},
                     )
                     pos_state[sym]["stop_order_id"] = sl_order.get("id")
-                except:
+                except Exception:
                     pos_state[sym]["stop_order_id"] = None
 
                 last_signal_candle_ts[sym] = curr_ts
                 entry_restrict[sym] = None
 
-            # --- 대시보드용 OHLCV 저장 --- #
+            # --- 대시보드용 OHLCV + 인디케이터 저장 --- #
             ohlcv_state = {}
             for sym in SYMBOLS:
                 if sym not in data:
                     continue
                 df, _, _ = data[sym]
-                tail = df.tail(120)
+                tail = df.tail(100)
                 candles = []
                 for row in tail.itertuples():
                     candles.append({
@@ -416,6 +438,11 @@ def main():
                         "high": float(row.high),
                         "low": float(row.low),
                         "close": float(row.close),
+                        # 인디케이터 값들 같이 전달
+                        "bb_upper": _safe_float(getattr(row, "bb_upper", None)),
+                        "bb_lower": _safe_float(getattr(row, "bb_lower", None)),
+                        "bb_mid": _safe_float(getattr(row, "bb_mid", None)),
+                        "cci": _safe_float(getattr(row, "cci", None)),
                     })
                 ohlcv_state[sym] = candles
 
