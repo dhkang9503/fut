@@ -5,23 +5,15 @@
 // 심볼 리스트
 const SYMBOLS = ["BTC/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"];
 
-// 캔들 차트 canvas ID
+// 심볼 → canvas ID 매핑 (HTML의 <canvas id="...">와 맞춰야 함)
 const CHART_IDS = {
     "BTC/USDT:USDT": "chart-btc",
     "XRP/USDT:USDT": "chart-xrp",
     "DOGE/USDT:USDT": "chart-doge",
 };
 
-// CCI 차트 canvas ID
-const CCI_CHART_IDS = {
-    "BTC/USDT:USDT": "chart-btc-cci",
-    "XRP/USDT:USDT": "chart-xrp-cci",
-    "DOGE/USDT:USDT": "chart-doge-cci",
-};
-
 // 차트 인스턴스 저장
 const charts = {};
-const cciCharts = {};
 
 // DOM 엘리먼트
 const equityEl = document.getElementById("equity");
@@ -33,11 +25,13 @@ const logsEl = document.getElementById("logs");
 // 유틸 함수
 // =====================
 
+// 숫자를 소수 n째 자리까지 포맷
 function fmtNum(value, digits = 3) {
     if (value === null || value === undefined || isNaN(value)) return "-";
     return Number(value).toFixed(digits);
 }
 
+// USDT 표시
 function fmtUSDT(value) {
     if (value === null || value === undefined || isNaN(value)) return "-";
     return `${Number(value).toFixed(3)} USDT`;
@@ -46,7 +40,6 @@ function fmtUSDT(value) {
 // =====================
 // Entry Restriction 출력
 // =====================
-
 function renderEntryRestriction(entryRestrict) {
     if (!entryRestrictEl) return;
     if (!entryRestrict) {
@@ -65,7 +58,6 @@ function renderEntryRestriction(entryRestrict) {
 // =====================
 // 현재 포지션 출력
 // =====================
-
 function renderPosition(posState) {
     if (!posEl) return;
     if (!posState) {
@@ -73,6 +65,7 @@ function renderPosition(posState) {
         return;
     }
 
+    // 예쁘게 포맷해서 보여주기
     const formatted = {};
     for (const sym of SYMBOLS) {
         const p = posState[sym] || {};
@@ -90,9 +83,8 @@ function renderPosition(posState) {
 }
 
 // =====================
-// 로그 출력
+// 로그 출력 (지금은 last_signal이나 나중에 확장용)
 // =====================
-
 function renderLogs(state) {
     if (!logsEl) return;
     const lastSignal = state.last_signal || {};
@@ -104,13 +96,17 @@ function renderLogs(state) {
 }
 
 // =====================
-// 데이터 매핑
+// Chart.js 캔들 차트 생성/업데이트
 // =====================
 
-// OHLCV + BB + CCI 한 캔들을 {x,o,h,l,c,bb_mid,bb_upper,bb_lower,cci}로 변환
+// Chart.js candlestick가 기대하는 포맷:
+// { x: Date(or ms), o: number, h: number, l: number, c: number }
+
+// 백엔드의 ohlcv 한 개를 위 포맷으로 변환
 function mapCandleForChart(raw) {
     if (!raw) return null;
 
+    // bot_state.json의 time은 "초 단위 Unix timestamp" 이므로 ms로 변환
     const t = raw.time ? raw.time * 1000 : null;
     if (!t) return null;
 
@@ -121,43 +117,16 @@ function mapCandleForChart(raw) {
 
     if ([o, h, l, c].some(v => isNaN(v))) return null;
 
-    const bb_mid = raw.bb_mid !== null && raw.bb_mid !== undefined ? Number(raw.bb_mid) : null;
-    const bb_upper = raw.bb_upper !== null && raw.bb_upper !== undefined ? Number(raw.bb_upper) : null;
-    const bb_lower = raw.bb_lower !== null && raw.bb_lower !== undefined ? Number(raw.bb_lower) : null;
-    const cci = raw.cci !== null && raw.cci !== undefined ? Number(raw.cci) : null;
-
     return {
         x: new Date(t),
         o,
         h,
         l,
         c,
-        bb_mid,
-        bb_upper,
-        bb_lower,
-        cci,
     };
 }
 
-// CCI용 데이터만 뽑기
-function mapCciForChart(raw) {
-    if (!raw) return null;
-    const t = raw.time ? raw.time * 1000 : null;
-    if (!t) return null;
-
-    const cci = raw.cci;
-    if (cci === null || cci === undefined || isNaN(Number(cci))) return null;
-
-    return {
-        x: new Date(t),
-        y: Number(cci),
-    };
-}
-
-// =====================
-// 캔들 + BB 차트 생성/업데이트
-// =====================
-
+// 차트 초기화
 function initChart(symbol) {
     const canvasId = CHART_IDS[symbol];
     const canvas = document.getElementById(canvasId);
@@ -169,49 +138,19 @@ function initChart(symbol) {
     const ctx = canvas.getContext("2d");
 
     const chart = new Chart(ctx, {
-        type: "candlestick",
+        type: "candlestick", // chartjs-chart-financial 플러그인 기준
         data: {
             datasets: [
                 {
-                    // 캔들
                     label: symbol,
-                    type: "candlestick",
                     data: [],
-                    parsing: false,  // {x,o,h,l,c} 직접 사용
                     barThickness: 4,
-                    barPercentage: 0.6,
-                },
-                {
-                    // BB mid
-                    label: "BB Mid",
-                    type: "line",
-                    data: [],
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    borderDash: [2, 2],
-                    parsing: { xAxisKey: "x", yAxisKey: "bb_mid" },
-                },
-                {
-                    // BB upper
-                    label: "BB Upper",
-                    type: "line",
-                    data: [],
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    parsing: { xAxisKey: "x", yAxisKey: "bb_upper" },
-                },
-                {
-                    // BB lower
-                    label: "BB Lower",
-                    type: "line",
-                    data: [],
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    parsing: { xAxisKey: "x", yAxisKey: "bb_lower" },
+                    barPercentage: 0.6
                 },
             ],
         },
         options: {
+            parsing: false, // 우리가 직접 {x,o,h,l,c} 포맷으로 넣을 거라서
             responsive: true,
             maintainAspectRatio: false,
             scales: {
@@ -221,6 +160,7 @@ function initChart(symbol) {
                         tooltipFormat: "yyyy-MM-dd HH:mm",
                     },
                     ticks: {
+                        // 너무 빽빽하면 자동으로 줄여줌
                         source: "auto",
                     },
                 },
@@ -237,10 +177,7 @@ function initChart(symbol) {
                         label: (ctx) => {
                             const v = ctx.raw;
                             if (!v) return "";
-                            if (ctx.dataset.type === "candlestick") {
-                                return `O:${v.o} H:${v.h} L:${v.l} C:${v.c}`;
-                            }
-                            return `${ctx.dataset.label}: ${fmtNum(ctx.parsed.y, 2)}`;
+                            return `O:${v.o} H:${v.h} L:${v.l} C:${v.c}`;
                         },
                     },
                 },
@@ -252,6 +189,7 @@ function initChart(symbol) {
     return chart;
 }
 
+// 차트 데이터 갱신
 function updateChart(symbol, rawCandles) {
     if (!Array.isArray(rawCandles)) return;
 
@@ -261,89 +199,9 @@ function updateChart(symbol, rawCandles) {
         if (!chart) return;
     }
 
+    // rawCandles → {x,o,h,l,c} 배열로 변환
     const mapped = rawCandles
         .map(mapCandleForChart)
-        .filter(c => c !== null);
-
-    // 모든 dataset에 같은 data 배열을 공유시킴
-    chart.data.datasets[0].data = mapped; // 캔들
-    chart.data.datasets[1].data = mapped; // BB mid
-    chart.data.datasets[2].data = mapped; // BB upper
-    chart.data.datasets[3].data = mapped; // BB lower
-
-    chart.update();
-}
-
-// =====================
-// CCI 차트 생성/업데이트
-// =====================
-
-function initCciChart(symbol) {
-    const canvasId = CCI_CHART_IDS[symbol];
-    const canvas = document.getElementById(canvasId);
-    if (!canvas) {
-        console.warn("CCI canvas not found for", symbol, canvasId);
-        return null;
-    }
-
-    const ctx = canvas.getContext("2d");
-
-    const chart = new Chart(ctx, {
-        type: "line",
-        data: {
-            datasets: [
-                {
-                    label: "CCI",
-                    data: [],
-                    borderWidth: 1,
-                    pointRadius: 0,
-                },
-            ],
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-                x: {
-                    type: "time",
-                    time: {
-                        tooltipFormat: "yyyy-MM-dd HH:mm",
-                    },
-                },
-                y: {
-                    position: "right",
-                    ticks: {
-                        // 보통 ±200 정도가 많이 보이는 영역
-                        callback: (value) => value,
-                    },
-                },
-            },
-            plugins: {
-                legend: { display: false },
-                tooltip: {
-                    callbacks: {
-                        label: (ctx) => `CCI: ${fmtNum(ctx.parsed.y, 2)}`,
-                    },
-                },
-            },
-        },
-    });
-
-    cciCharts[symbol] = chart;
-    return chart;
-}
-
-function updateCciChart(symbol, rawCandles) {
-    if (!Array.isArray(rawCandles)) return;
-
-    let chart = cciCharts[symbol];
-    if (!chart) {
-        chart = initCciChart(symbol);
-        if (!chart) return;
-    }
-
-    const mapped = rawCandles
-        .map(mapCciForChart)
         .filter(c => c !== null);
 
     chart.data.datasets[0].data = mapped;
@@ -396,24 +254,32 @@ function connectWebSocket() {
 // =====================
 // 상태 업데이트 핸들러
 // =====================
-
 function handleStateUpdate(state) {
     if (!state) return;
 
+    // 1) Equity
     if (equityEl) {
         equityEl.textContent = fmtUSDT(state.equity);
     }
 
+    // 2) Entry Restriction
     renderEntryRestriction(state.entry_restrict);
+
+    // 3) Position
     renderPosition(state.pos_state);
+
+    // 4) Logs / last_signal
     renderLogs(state);
 
+    // 5) 캔들 차트 (state.ohlcv 사용)
     const ohlcv = state.ohlcv || {};
     for (const sym of SYMBOLS) {
         const candles = ohlcv[sym];
-        if (!Array.isArray(candles) || candles.length === 0) continue;
+        if (!Array.isArray(candles) || candles.length === 0) {
+            // 데이터가 없는 경우, 해당 차트는 그대로 두거나 나중에 클리어할 수 있음
+            continue;
+        }
         updateChart(sym, candles);
-        updateCciChart(sym, candles);
     }
 }
 
@@ -422,9 +288,9 @@ function handleStateUpdate(state) {
 // =====================
 
 window.addEventListener("load", () => {
-    SYMBOLS.forEach(sym => {
-        initChart(sym);
-        initCciChart(sym);
-    });
+    // 차트 먼저 초기화 (데이터 없어도 canvas 생성)
+    SYMBOLS.forEach(sym => initChart(sym));
+
+    // WebSocket 연결 시작
     connectWebSocket();
 });
