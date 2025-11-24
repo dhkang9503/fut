@@ -144,6 +144,8 @@ function initChart(symbol) {
                 {
                     label: symbol,
                     data: [],
+                    barThickness: 4,
+                    barPercentage: 0.6
                 },
             ],
         },
