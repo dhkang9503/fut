@@ -49,7 +49,7 @@ def save_state(pos_state, entry_restrict, last_signal, equity):
         "equity": equity,
         "timestamp": datetime.utcnow().isoformat()
     }
-    with open("/home/ubuntu/bot_state.json", "w") as f:
+    with open("/app/bot_state.json", "w") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 # ============== 거래소 초기화 ============== #
