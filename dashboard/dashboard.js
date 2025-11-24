@@ -412,7 +412,7 @@ function initCciChart(symbol) {
                     // 0: 실제 CCI 값
                     label: "CCI",
                     data: [],
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     borderColor: "#facc15",   // 밝은 노란색
                     tension: 0.1,
