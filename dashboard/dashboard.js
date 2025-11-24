@@ -123,28 +123,31 @@ function initChart(symbol) {
                     barPercentage: 0.6,
                 },
                 {
-                    // 1: Entry
+                    // 1: Entry (주황색)
                     label: "Entry",
                     type: "line",
                     data: [],
+                    borderColor: "#fb923c",     // 🟧 주황
                     borderWidth: 1,
                     borderDash: [4, 2],
                     pointRadius: 0,
                 },
                 {
-                    // 2: TP
+                    // 2: TP (초록색)
                     label: "TP",
                     type: "line",
                     data: [],
+                    borderColor: "#a3e635",
                     borderWidth: 1,
                     borderDash: [2, 2],
                     pointRadius: 0,
                 },
                 {
-                    // 3: SL
+                    // 3: SL (빨간색)
                     label: "SL",
                     type: "line",
                     data: [],
+                    borderColor: "#ef4444",     // 🔴 빨강
                     borderWidth: 1,
                     borderDash: [2, 4],
                     pointRadius: 0,
@@ -154,6 +157,7 @@ function initChart(symbol) {
                     label: "BB Upper",
                     type: "line",
                     data: [],
+                    borderColor: "rgba(75, 192, 192, 0.4)",     // 청록
                     borderWidth: 1,
                     pointRadius: 0,
                 },
@@ -162,6 +166,7 @@ function initChart(symbol) {
                     label: "BB Lower",
                     type: "line",
                     data: [],
+                    borderColor: "rgba(153, 102, 255, 0.4)",     // 보라
                     borderWidth: 1,
                     pointRadius: 0,
                 },
@@ -170,6 +175,7 @@ function initChart(symbol) {
                     label: "BB Mid",
                     type: "line",
                     data: [],
+                    borderColor: "rgba(228, 229, 231, 0.4)",     // 회색
                     borderWidth: 1,
                     pointRadius: 0,
                 },
@@ -311,7 +317,7 @@ function initCciChart(symbol) {
                     // 0: 실제 CCI 값
                     label: "CCI",
                     data: [],
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     borderColor: "#facc15",   // 밝은 노란색
                     tension: 0.1,
@@ -357,6 +363,7 @@ function initCciChart(symbol) {
                 },
                 y: {
                     position: "right",
+                    // 필요하면 suggestedMin/Max 조절 가능
                     // suggestedMin: -250,
                     // suggestedMax: 250,
                 },
@@ -424,7 +431,6 @@ function updateCciChart(symbol, rawCandles) {
 
     chart.update();
 }
-
 
 // =====================
 // WebSocket
