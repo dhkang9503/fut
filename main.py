@@ -38,6 +38,18 @@ logging.basicConfig(
 )
 
 # ============== OKX 초기화 ============== #
+import json
+
+def save_state(pos_state, entry_restrict, last_signal, equity):
+    state = {
+        "pos_state": pos_state,
+        "entry_restrict": entry_restrict,
+        "last_signal": last_signal,
+        "equity": equity,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    with open("/home/ubuntu/bot_state.json", "w") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 def init_exchange():
     exchange = ccxt.okx({
@@ -644,7 +656,10 @@ def main():
                 except Exception as e:
                     logging.error(f"[{sym}] {log_side} 진입 주문 실패: {e}")
 
+            
+            save_state(pos_state, entry_restrict, last_signal_candle_ts, total_equity)
             time.sleep(LOOP_INTERVAL)
+
 
         except Exception as e:
             logging.error(f"메인 루프 에러: {e}")
