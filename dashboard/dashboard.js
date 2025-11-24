@@ -63,6 +63,7 @@ function renderPosition(posState) {
             tp_price: p.tp_price || null,
             stop_order_id: p.stop_order_id || null,
             entry_time: p.entry_time || null,
+            entry_candle_ts: p.entry_candle_ts || null,
         };
     }
     posEl.textContent = JSON.stringify(formatted, null, 2);
@@ -97,7 +98,7 @@ function mapCandleForChart(raw) {
 }
 
 // =====================
-// 가격 + 볼밴 + 진입/TP/SL 차트
+// 가격 + 볼밴 + 진입/TP/SL + 진입 마커 차트
 // =====================
 
 function initChart(symbol) {
@@ -127,27 +128,27 @@ function initChart(symbol) {
                     label: "Entry",
                     type: "line",
                     data: [],
-                    borderColor: "#fb923c",     // 🟧 주황
+                    borderColor: "#fb923c",
                     borderWidth: 1,
                     borderDash: [4, 2],
                     pointRadius: 0,
                 },
                 {
-                    // 2: TP (초록색)
+                    // 2: TP (노랑)
                     label: "TP",
                     type: "line",
                     data: [],
-                    borderColor: "#a3e635",
+                    borderColor: "#facc15",
                     borderWidth: 1,
                     borderDash: [2, 2],
                     pointRadius: 0,
                 },
                 {
-                    // 3: SL (빨간색)
+                    // 3: SL (빨강)
                     label: "SL",
                     type: "line",
                     data: [],
-                    borderColor: "#ef4444",     // 🔴 빨강
+                    borderColor: "#ef4444",
                     borderWidth: 1,
                     borderDash: [2, 4],
                     pointRadius: 0,
@@ -157,27 +158,51 @@ function initChart(symbol) {
                     label: "BB Upper",
                     type: "line",
                     data: [],
-                    borderColor: "rgba(75, 192, 192, 0.4)",     // 청록
                     borderWidth: 1,
                     pointRadius: 0,
+                    borderColor: "rgba(75,192,192,0.4)",   // #4BC0C0 + 투명
                 },
                 {
                     // 5: BB Lower
                     label: "BB Lower",
                     type: "line",
                     data: [],
-                    borderColor: "rgba(153, 102, 255, 0.4)",     // 보라
                     borderWidth: 1,
                     pointRadius: 0,
+                    borderColor: "rgba(153,102,255,0.4)",  // #9966FF + 투명
                 },
                 {
                     // 6: BB Mid
                     label: "BB Mid",
                     type: "line",
                     data: [],
-                    borderColor: "rgba(228, 229, 231, 0.4)",     // 회색
                     borderWidth: 1,
                     pointRadius: 0,
+                    borderColor: "rgba(228,229,231,0.4)",  // #E4E5E7 + 투명
+                },
+                {
+                    // 7: 롱 진입 마커 (캔들 하단 삼각형)
+                    label: "Long Entry Marker",
+                    type: "scatter",
+                    data: [],
+                    showLine: false,
+                    pointRadius: 5,
+                    pointStyle: "triangle",
+                    borderColor: "#38bdf8",
+                    backgroundColor: "#38bdf8",
+                },
+                {
+                    // 8: 숏 진입 마커 (캔들 상단 역삼각형)
+                    label: "Short Entry Marker",
+                    type: "scatter",
+                    data: [],
+                    showLine: false,
+                    pointRadius: 5,
+                    pointStyle: "triangle",
+                    // rotation은 시각적으로는 중요치 않지만, 지원되는 버전에서는 아래 옵션:
+                    // pointRotation: 180,
+                    borderColor: "#fb7185",
+                    backgroundColor: "#fb7185",
                 },
             ],
         },
@@ -291,11 +316,81 @@ function updateChart(symbol, rawCandles, posStateForSymbol) {
     if (chart.data.datasets[5]) chart.data.datasets[5].data = bbLowerData;
     if (chart.data.datasets[6]) chart.data.datasets[6].data = bbMidData;
 
+    // ===== 진입 마커 (롱/숏 삼각형) =====
+    let longMarkers = [];
+    let shortMarkers = [];
+
+    // posStateForSymbol.side 가 있으면 그 포지션 기준으로 표시
+    if (posStateForSymbol && posStateForSymbol.side && hasCandles) {
+        let entryTsSec = null;
+
+        // 1) entry_candle_ts (ms 단위) 있으면 우선 사용
+        if (posStateForSymbol.entry_candle_ts) {
+            const v = Number(posStateForSymbol.entry_candle_ts);
+            if (!isNaN(v) && v > 0) {
+                entryTsSec = Math.floor(v / 1000);
+            }
+        }
+
+        // 2) 없으면 entry_time(ISO) 기반으로 계산
+        if (entryTsSec === null && posStateForSymbol.entry_time) {
+            const d = new Date(posStateForSymbol.entry_time);
+            if (!isNaN(d.getTime())) {
+                entryTsSec = Math.floor(d.getTime() / 1000);
+            }
+        }
+
+        // 3) entryTsSec 기준으로 해당(또는 가장 가까운) 캔들 찾기
+        let targetRaw = null;
+        if (entryTsSec !== null) {
+            // 정확히 time이 일치하는 캔들 먼저 시도
+            for (const raw of rawCandles) {
+                if (Number(raw.time) === entryTsSec) {
+                    targetRaw = raw;
+                    break;
+                }
+            }
+
+            // 정확히 일치하는 게 없으면 "가장 가까운 time"을 가진 캔들 선택
+            if (!targetRaw) {
+                let minDiff = Infinity;
+                for (const raw of rawCandles) {
+                    const t = Number(raw.time);
+                    if (isNaN(t)) continue;
+                    const diff = Math.abs(t - entryTsSec);
+                    if (diff < minDiff) {
+                        minDiff = diff;
+                        targetRaw = raw;
+                    }
+                }
+            }
+        }
+
+        if (targetRaw) {
+            const markerX = new Date(Number(targetRaw.time) * 1000);
+            const high = Number(targetRaw.high);
+            const low = Number(targetRaw.low);
+
+            if (posStateForSymbol.side === "long" && !isNaN(low)) {
+                longMarkers = [
+                    { x: markerX, y: low * 0.992 },
+                ];
+            } else if (posStateForSymbol.side === "short" && !isNaN(high)) {
+                shortMarkers = [
+                    { x: markerX, y: high * 1.008 },
+                ];
+            }
+        }
+    }
+
+    if (chart.data.datasets[7]) chart.data.datasets[7].data = longMarkers;
+    if (chart.data.datasets[8]) chart.data.datasets[8].data = shortMarkers;
+
     chart.update();
 }
 
 // =====================
-// CCI 차트 (라벨 + 값 방식으로 단순화)
+// CCI 차트 (라벨 + 값 방식)
 // =====================
 
 function initCciChart(symbol) {
@@ -317,7 +412,7 @@ function initCciChart(symbol) {
                     // 0: 실제 CCI 값
                     label: "CCI",
                     data: [],
-                    borderWidth: 1,
+                    borderWidth: 2,
                     pointRadius: 0,
                     borderColor: "#facc15",   // 밝은 노란색
                     tension: 0.1,
@@ -328,8 +423,8 @@ function initCciChart(symbol) {
                     data: [],
                     borderWidth: 1,
                     pointRadius: 0,
-                    borderColor: "rgba(148,163,184,0.8)", // gray-400 정도
-                    borderDash: [],                        // 실선
+                    borderColor: "rgba(148,163,184,0.8)",
+                    borderDash: [],
                 },
                 {
                     // 2: +100 라인 (회색 점선)
@@ -363,9 +458,6 @@ function initCciChart(symbol) {
                 },
                 y: {
                     position: "right",
-                    // 필요하면 suggestedMin/Max 조절 가능
-                    // suggestedMin: -250,
-                    // suggestedMax: 250,
                 },
             },
             plugins: {
@@ -386,7 +478,6 @@ function initCciChart(symbol) {
     cciCharts[symbol] = chart;
     return chart;
 }
-
 
 function updateCciChart(symbol, rawCandles) {
     if (!Array.isArray(rawCandles)) return;
@@ -420,7 +511,6 @@ function updateCciChart(symbol, rawCandles) {
     chart.data.labels = labels;
     chart.data.datasets[0].data = cciValues;
 
-    // 고정 수평선들: labels 개수만큼 0 / +100 / -100으로 채워 넣기
     const zeroLine = labels.map(() => 0);
     const plus100Line = labels.map(() => 100);
     const minus100Line = labels.map(() => -100);
