@@ -1,2 +1,4 @@
 ccxt
 pandas
+fastapi
+uvicorn[standard]
