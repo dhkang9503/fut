@@ -31,22 +31,29 @@
 
     <!-- 실시간 차트 (3개 심볼 1h) -->
     <div class="bg-gray-800 p-4 rounded-lg mb-4">
-      <h2 class="text-xl font-semibold mb-2">📊 실시간 캔들 차트 (1h, 심볼별)</h2>
-      <div class="space-y-6">
-        <div>
-          <div class="text-sm text-gray-300 mb-1">BTC/USDT:USDT</div>
-          <div id="chart-btc" class="w-full h-[220px] bg-gray-900 rounded-md"></div>
-        </div>
-        <div>
-          <div class="text-sm text-gray-300 mb-1">XRP/USDT:USDT</div>
-          <div id="chart-xrp" class="w-full h-[220px] bg-gray-900 rounded-md"></div>
-        </div>
-        <div>
-          <div class="text-sm text-gray-300 mb-1">DOGE/USDT:USDT</div>
-          <div id="chart-doge" class="w-full h-[220px] bg-gray-900 rounded-md"></div>
-        </div>
+  <h2 class="text-xl font-semibold mb-2">📊 실시간 캔들 차트 (1h, 심볼별)</h2>
+  <div class="space-y-6">
+    <div>
+      <div class="text-sm text-gray-300 mb-1">BTC/USDT:USDT</div>
+      <div class="w-full h-[220px] bg-gray-900 rounded-md">
+        <canvas id="chart-btc" class="w-full h-full"></canvas>
       </div>
     </div>
+    <div>
+      <div class="text-sm text-gray-300 mb-1">XRP/USDT:USDT</div>
+      <div class="w-full h-[220px] bg-gray-900 rounded-md">
+        <canvas id="chart-xrp" class="w-full h-full"></canvas>
+      </div>
+    </div>
+    <div>
+      <div class="text-sm text-gray-300 mb-1">DOGE/USDT:USDT</div>
+      <div class="w-full h-[220px] bg-gray-900 rounded-md">
+        <canvas id="chart-doge" class="w-full h-full"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+
 
     <!-- 현재 포지션 -->
     <div class="bg-gray-800 p-4 rounded-lg mb-4">
