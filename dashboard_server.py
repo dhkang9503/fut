@@ -53,9 +53,6 @@ async def websocket_endpoint(ws: WebSocket):
         await asyncio.sleep(1)
         
         return json.load(f)
-    except Exception:
-        return {"error": "state_not_found"}
-
 
 # 🔹 WebSocket (대시보드 실시간 업데이트)
 @app.websocket("/ws")
