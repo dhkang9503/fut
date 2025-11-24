@@ -33,6 +33,33 @@ function fmtUSDT(value) {
     return `${Number(value).toFixed(3)} USDT`;
 }
 
+function fmtNumber(value, digits = 4) {
+    if (value === null || value === undefined || isNaN(value)) return "-";
+    return Number(value).toFixed(digits);
+}
+
+function fmtDateTime(value) {
+    if (!value) return "-";
+
+    // entry_time 은 ISO(UTC)로 들어오므로, Date로 파싱한 뒤 KST(+9h)로 변환
+    const d = new Date(value);
+    if (isNaN(d.getTime())) return "-";
+
+    const KST_OFFSET = 9 * 60 * 60 * 1000; // 9시간(ms)
+    const kst = new Date(d.getTime() + KST_OFFSET);
+
+    const yyyy = kst.getFullYear();
+    const MM = String(kst.getMonth() + 1).padStart(2, "0");
+    const DD = String(kst.getDate()).padStart(2, "0");
+    const hh = String(kst.getHours()).padStart(2, "0");
+    const mm = String(kst.getMinutes()).padStart(2, "0");
+    const ss = String(kst.getSeconds()).padStart(2, "0");
+
+    // 👉 2025/11/25 01:02:03 형태
+    return `${yyyy}/${MM}/${DD} ${hh}:${mm}:${ss}`;
+}
+
+
 function renderEntryRestriction(entryRestrict) {
     if (!entryRestrictEl) return;
     if (!entryRestrict) {
@@ -46,27 +73,89 @@ function renderEntryRestriction(entryRestrict) {
     entryRestrictEl.textContent = lines.join("\n");
 }
 
+// =====================
+// 현재 포지션: 표 렌더
+// =====================
+
 function renderPosition(posState) {
     if (!posEl) return;
+
     if (!posState) {
-        posEl.textContent = "{}";
+        posEl.innerHTML = `<div class="text-gray-400 text-sm">포지션 정보가 없습니다.</div>`;
         return;
     }
-    const formatted = {};
+
+    // pos_state 에서 실제로 포지션이 있는 심볼만 추리기
+    const rows = [];
     for (const sym of SYMBOLS) {
-        const p = posState[sym] || {};
-        formatted[sym] = {
-            side: p.side || null,
-            size: p.size || 0,
-            entry_price: p.entry_price || null,
-            stop_price: p.stop_price || null,
-            tp_price: p.tp_price || null,
-            stop_order_id: p.stop_order_id || null,
-            entry_time: p.entry_time || null,
-            entry_candle_ts: p.entry_candle_ts || null,
-        };
+        const p = posState[sym];
+        if (!p || !p.side || !p.size || p.size === 0) continue;
+
+        rows.push({
+            symbol: sym,
+            side: p.side,
+            size: p.size,
+            entry_price: p.entry_price,
+            tp_price: p.tp_price,
+            stop_price: p.stop_price,
+            stop_order_id: p.stop_order_id,
+            entry_time: p.entry_time,
+        });
     }
-    posEl.textContent = JSON.stringify(formatted, null, 2);
+
+    if (rows.length === 0) {
+        posEl.innerHTML = `<div class="text-gray-400 text-sm">열려있는 포지션이 없습니다.</div>`;
+        return;
+    }
+
+    let html = `
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-xs sm:text-sm text-left border-collapse">
+          <thead>
+            <tr class="border-b border-gray-700 bg-gray-900/40">
+              <th class="px-2 py-1 sm:px-3 sm:py-2">진입시간</th>
+              <th class="px-2 py-1 sm:px-3 sm:py-2">심볼</th>
+              <th class="px-2 py-1 sm:px-3 sm:py-2">방향</th>
+              <th class="px-2 py-1 sm:px-3 sm:py-2 text-right">사이즈</th>
+              <th class="px-2 py-1 sm:px-3 sm:py-2 text-right">진입가</th>
+              <th class="px-2 py-1 sm:px-3 sm:py-2 text-right">익절가</th>
+              <th class="px-2 py-1 sm:px-3 sm:py-2 text-right">손절가</th>
+              <th class="px-2 py-1 sm:px-3 sm:py-2">stop_order_id</th>
+            </tr>
+          </thead>
+          <tbody>
+    `;
+
+    for (const r of rows) {
+        const sideLabel = r.side === "long" ? "롱" : (r.side === "short" ? "숏" : "-");
+        const sideColor =
+            r.side === "long"
+                ? "text-green-400"
+                : r.side === "short"
+                ? "text-red-400"
+                : "text-gray-300";
+
+        html += `
+          <tr class="border-b border-gray-800 hover:bg-gray-900/40">
+            <td class="px-2 py-1 sm:px-3 sm:py-2 whitespace-nowrap text-gray-300">${fmtDateTime(r.entry_time)}</td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 whitespace-nowrap text-gray-200">${r.symbol}</td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 whitespace-nowrap ${sideColor} font-semibold">${sideLabel}</td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-gray-100">${fmtNumber(r.size, 0)}</td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-gray-100">${fmtNumber(r.entry_price)}</td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-teal-300">${r.tp_price != null ? fmtNumber(r.tp_price) : "-"}</td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-red-300">${r.stop_price != null ? fmtNumber(r.stop_price) : "-"}</td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 text-gray-400 break-all">${r.stop_order_id || "-"}</td>
+          </tr>
+        `;
+    }
+
+    html += `
+          </tbody>
+        </table>
+      </div>
+    `;
+
+    posEl.innerHTML = html;
 }
 
 function renderLogs(state) {
@@ -181,7 +270,7 @@ function initChart(symbol) {
                     borderColor: "rgba(228,229,231,0.4)",  // #E4E5E7 + 투명
                 },
                 {
-                    // 7: 롱 진입 마커 (캔들 하단 삼각형)
+                    // 7: 롱 진입 마커
                     label: "Long Entry Marker",
                     type: "scatter",
                     data: [],
@@ -192,15 +281,13 @@ function initChart(symbol) {
                     backgroundColor: "#38bdf8",
                 },
                 {
-                    // 8: 숏 진입 마커 (캔들 상단 역삼각형)
+                    // 8: 숏 진입 마커
                     label: "Short Entry Marker",
                     type: "scatter",
                     data: [],
                     showLine: false,
                     pointRadius: 5,
                     pointStyle: "triangle",
-                    // rotation은 시각적으로는 중요치 않지만, 지원되는 버전에서는 아래 옵션:
-                    // pointRotation: 180,
                     borderColor: "#fb7185",
                     backgroundColor: "#fb7185",
                 },
@@ -320,11 +407,9 @@ function updateChart(symbol, rawCandles, posStateForSymbol) {
     let longMarkers = [];
     let shortMarkers = [];
 
-    // posStateForSymbol.side 가 있으면 그 포지션 기준으로 표시
     if (posStateForSymbol && posStateForSymbol.side && hasCandles) {
         let entryTsSec = null;
 
-        // 1) entry_candle_ts (ms 단위) 있으면 우선 사용
         if (posStateForSymbol.entry_candle_ts) {
             const v = Number(posStateForSymbol.entry_candle_ts);
             if (!isNaN(v) && v > 0) {
@@ -332,7 +417,6 @@ function updateChart(symbol, rawCandles, posStateForSymbol) {
             }
         }
 
-        // 2) 없으면 entry_time(ISO) 기반으로 계산
         if (entryTsSec === null && posStateForSymbol.entry_time) {
             const d = new Date(posStateForSymbol.entry_time);
             if (!isNaN(d.getTime())) {
@@ -340,10 +424,8 @@ function updateChart(symbol, rawCandles, posStateForSymbol) {
             }
         }
 
-        // 3) entryTsSec 기준으로 해당(또는 가장 가까운) 캔들 찾기
         let targetRaw = null;
         if (entryTsSec !== null) {
-            // 정확히 time이 일치하는 캔들 먼저 시도
             for (const raw of rawCandles) {
                 if (Number(raw.time) === entryTsSec) {
                     targetRaw = raw;
@@ -351,7 +433,6 @@ function updateChart(symbol, rawCandles, posStateForSymbol) {
                 }
             }
 
-            // 정확히 일치하는 게 없으면 "가장 가까운 time"을 가진 캔들 선택
             if (!targetRaw) {
                 let minDiff = Infinity;
                 for (const raw of rawCandles) {
@@ -372,13 +453,9 @@ function updateChart(symbol, rawCandles, posStateForSymbol) {
             const low = Number(targetRaw.low);
 
             if (posStateForSymbol.side === "long" && !isNaN(low)) {
-                longMarkers = [
-                    { x: markerX, y: low * 0.992 },
-                ];
+                longMarkers = [{ x: markerX, y: low * 0.999 }];
             } else if (posStateForSymbol.side === "short" && !isNaN(high)) {
-                shortMarkers = [
-                    { x: markerX, y: high * 1.008 },
-                ];
+                shortMarkers = [{ x: markerX, y: high * 1.001 }];
             }
         }
     }
@@ -412,13 +489,13 @@ function initCciChart(symbol) {
                     // 0: 실제 CCI 값
                     label: "CCI",
                     data: [],
-                    borderWidth: 1,
+                    borderWidth: 2,
                     pointRadius: 0,
                     borderColor: "#facc15",   // 밝은 노란색
                     tension: 0.1,
                 },
                 {
-                    // 1: 0 라인 (회색, 반투명 실선)
+                    // 1: 0 라인
                     label: "Zero",
                     data: [],
                     borderWidth: 1,
@@ -427,7 +504,7 @@ function initCciChart(symbol) {
                     borderDash: [],
                 },
                 {
-                    // 2: +100 라인 (회색 점선)
+                    // 2: +100 라인
                     label: "+100",
                     data: [],
                     borderWidth: 1,
@@ -436,7 +513,7 @@ function initCciChart(symbol) {
                     borderDash: [4, 4],
                 },
                 {
-                    // 3: -100 라인 (회색 점선)
+                    // 3: -100 라인
                     label: "-100",
                     data: [],
                     borderWidth: 1,
@@ -452,9 +529,7 @@ function initCciChart(symbol) {
             scales: {
                 x: {
                     type: "category",
-                    ticks: {
-                        maxTicksLimit: 6,
-                    },
+                    ticks: { maxTicksLimit: 6 },
                 },
                 y: {
                     position: "right",
@@ -577,8 +652,10 @@ function handleStateUpdate(state) {
     }
 
     renderEntryRestriction(state.entry_restrict);
+
     const posState = state.pos_state || {};
     renderPosition(posState);
+
     renderLogs(state);
 
     const ohlcv = state.ohlcv || {};

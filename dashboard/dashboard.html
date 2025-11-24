@@ -10,7 +10,6 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial"></script>
-
 </head>
 
 <body class="bg-gray-900 text-white">
@@ -33,50 +32,43 @@
     <div class="bg-gray-800 p-4 rounded-lg mb-4">
       <h2 class="text-xl font-semibold mb-2">📊 실시간 캔들 차트 (1h, 심볼별)</h2>
       <div class="space-y-6">
-
-        <!-- BTC -->
         <div>
           <div class="text-sm text-gray-300 mb-1">BTC/USDT:USDT</div>
           <div class="w-full h-[220px] bg-gray-900 rounded-md">
             <canvas id="chart-btc" class="w-full h-full"></canvas>
           </div>
-          <div class="w-full h-[120px] bg-gray-900 rounded-md mt-2">
+          <div class="w-full h-[140px] bg-gray-900 rounded-md mt-2">
             <canvas id="cci-btc" class="w-full h-full"></canvas>
           </div>
         </div>
-
-        <!-- XRP -->
         <div>
           <div class="text-sm text-gray-300 mb-1">XRP/USDT:USDT</div>
           <div class="w-full h-[220px] bg-gray-900 rounded-md">
             <canvas id="chart-xrp" class="w-full h-full"></canvas>
           </div>
-          <div class="w-full h-[120px] bg-gray-900 rounded-md mt-2">
+          <div class="w-full h-[140px] bg-gray-900 rounded-md mt-2">
             <canvas id="cci-xrp" class="w-full h-full"></canvas>
           </div>
         </div>
-
-        <!-- DOGE -->
         <div>
           <div class="text-sm text-gray-300 mb-1">DOGE/USDT:USDT</div>
           <div class="w-full h-[220px] bg-gray-900 rounded-md">
             <canvas id="chart-doge" class="w-full h-full"></canvas>
           </div>
-          <div class="w-full h-[120px] bg-gray-900 rounded-md mt-2">
+          <div class="w-full h-[140px] bg-gray-900 rounded-md mt-2">
             <canvas id="cci-doge" class="w-full h-full"></canvas>
           </div>
         </div>
-
       </div>
     </div>
 
-    <!-- 현재 포지션 -->
+    <!-- 현재 포지션: 표 형태 -->
     <div class="bg-gray-800 p-4 rounded-lg mb-4">
       <h2 class="text-xl font-semibold mb-2">현재 포지션</h2>
-      <pre id="position" class="whitespace-pre-wrap text-xs sm:text-sm"></pre>
+      <div id="position" class="text-xs sm:text-sm"></div>
     </div>
 
-    <!-- 최근 로그 (last_signal 그대로 표시) -->
+    <!-- 최근 로그 -->
     <div class="bg-gray-800 p-4 rounded-lg mb-4">
       <h2 class="text-xl font-semibold mb-2">최근 로그</h2>
       <pre id="logs" class="whitespace-pre-wrap text-xs sm:text-sm h-[160px] overflow-y-auto"></pre>
@@ -84,10 +76,11 @@
   </div>
 
   <script src="/static/dashboard.js"></script>
+
+  <!-- 모바일에서 콘솔 보기용 -->
   <script src="https://cdn.jsdelivr.net/npm/eruda"></script>
   <script>
     eruda.init();
   </script>
-
 </body>
 </html>
