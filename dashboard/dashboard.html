@@ -7,8 +7,8 @@
 
   <!-- Tailwind -->
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- Lightweight Charts -->
-  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 
 <body class="bg-gray-900 text-white">
@@ -30,18 +30,18 @@
     <!-- 실시간 차트 (3개 심볼 1h) -->
     <div class="bg-gray-800 p-4 rounded-lg mb-4">
       <h2 class="text-xl font-semibold mb-2">📊 실시간 차트 (1h, 심볼별)</h2>
-      <div class="space-y-4">
+      <div class="space-y-6">
         <div>
           <div class="text-sm text-gray-300 mb-1">BTC/USDT:USDT</div>
-          <div id="chart-btc" class="w-full h-[220px] bg-gray-900 rounded-md"></div>
+          <canvas id="chart-btc" class="w-full h-[220px] bg-gray-900 rounded-md"></canvas>
         </div>
         <div>
           <div class="text-sm text-gray-300 mb-1">XRP/USDT:USDT</div>
-          <div id="chart-xrp" class="w-full h-[220px] bg-gray-900 rounded-md"></div>
+          <canvas id="chart-xrp" class="w-full h-[220px] bg-gray-900 rounded-md"></canvas>
         </div>
         <div>
           <div class="text-sm text-gray-300 mb-1">DOGE/USDT:USDT</div>
-          <div id="chart-doge" class="w-full h-[220px] bg-gray-900 rounded-md"></div>
+          <canvas id="chart-doge" class="w-full h-[220px] bg-gray-900 rounded-md"></canvas>
         </div>
       </div>
     </div>
@@ -56,18 +56,6 @@
     <div class="bg-gray-800 p-4 rounded-lg mb-4">
       <h2 class="text-xl font-semibold mb-2">최근 로그</h2>
       <pre id="logs" class="whitespace-pre-wrap text-xs sm:text-sm h-[160px] overflow-y-auto"></pre>
-    </div>
-  </div>
-
-  <script src="/static/dashboard.js"></script>
-</body>
-</html>
-    </div>
-
-    <!-- Logs -->
-    <div class="bg-gray-800 p-4 rounded-lg mb-4">
-      <h2 class="text-xl font-semibold">최근 로그</h2>
-      <pre id="logs" class="whitespace-pre-wrap h-[200px] overflow-y-scroll"></pre>
     </div>
   </div>
 
