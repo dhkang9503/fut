@@ -4,6 +4,7 @@ from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from starlette.websockets import WebSocketDisconnect
 
 STATE_PATH = "/app/bot_state.json"
 
@@ -43,13 +44,21 @@ def get_state():
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    while True:
-        try:
-            with open(STATE_PATH, "r") as f:
-                content = f.read()
-            state = json.loads(content) if content else {}
-        except Exception:
-            state = {"error": "state_not_found"}
+    try:
+        while True:
+            try:
+                with open(STATE_PATH, "r") as f:
+                    content = f.read()
+                state = json.loads(content) if content else {}
+            except Exception:
+                state = {"error": "state_not_found"}
 
-        await ws.send_json(state)
-        await asyncio.sleep(1)
+            await ws.send_json(state)
+            await asyncio.sleep(1)
+
+    except WebSocketDisconnect:
+        pass
+
+    except Exception as e:
+        # 진짜 에러만 로깅
+        print(f"WebSocket error: {e}")

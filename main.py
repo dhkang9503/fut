@@ -25,7 +25,7 @@ TIMEFRAME = "1h"
 
 RISK_PER_TRADE = 0.03
 MAX_LEVERAGE   = 10
-LOOP_INTERVAL  = 5
+LOOP_INTERVAL  = 3
 
 CCI_PERIOD = 14
 BB_PERIOD  = 20
@@ -429,7 +429,7 @@ def main():
                 if sym not in data:
                     continue
                 df, _, _ = data[sym]
-                tail = df.tail(120)
+                tail = df.tail(100)
                 candles = []
                 for row in tail.itertuples():
                     candles.append({
