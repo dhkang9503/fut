@@ -28,7 +28,7 @@ MAX_LEVERAGE   = 10        # 최대 레버리지(실제 포지션 노출 / equit
 LOOP_INTERVAL = 5          # 루프 주기(초)
 
 # CCI / 볼린저 파라미터
-CCI_PERIOD = 20
+CCI_PERIOD = 14
 BB_PERIOD  = 20
 BB_K       = 2.0
 
