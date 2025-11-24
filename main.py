@@ -265,12 +265,12 @@ def detect_cci_signal(df: pd.DataFrame):
     stop_price = None
 
     # 숏 신호: 과매수(+100 이상) 후 꺾여서 +99 이하로 복귀
-    if cci_prev > 100 and cci_curr <= 99:
+    if cci_prev > 100 and (70 <= cci_curr <= 99):
         side = "short"
         stop_price = float(curr["high"])
 
     # 롱 신호: 과매도(-100 이하) 후 꺾여서 -99 이상으로 복귀
-    elif cci_prev < -100 and cci_curr >= -99:
+    elif cci_prev < -100 and (-70 >= cci_curr >= -99):
         side = "long"
         stop_price = float(curr["low"])
 
