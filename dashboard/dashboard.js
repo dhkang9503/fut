@@ -288,6 +288,7 @@ function initChart(symbol) {
                     showLine: false,
                     pointRadius: 5,
                     pointStyle: "triangle",
+                    rotation: Math.PI,
                     borderColor: "#fb7185",
                     backgroundColor: "#fb7185",
                 },
