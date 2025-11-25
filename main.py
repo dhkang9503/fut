@@ -193,11 +193,11 @@ def detect_cci_signal(df):
 
     if cci_prev > 100 and 70 <= cci_curr <= 99:   # 숏 진입
         side = "short"
-        stop_price = float(curr["high"])
+        stop_price = float(curr["high"]) * 1.01
 
     elif cci_prev < -100 and -70 >= cci_curr >= -99:  # 롱 진입
         side = "long"
-        stop_price = float(curr["low"])
+        stop_price = float(curr["low"]) * 0.99
 
     if side is None or stop_price <= 0:
         return None
