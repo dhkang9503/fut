@@ -30,6 +30,7 @@ LOOP_INTERVAL  = 3
 CCI_PERIOD = 14
 BB_PERIOD  = 20
 BB_K       = 2.0
+SL_OFFSET  = 0.02 # 1%
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -193,11 +194,11 @@ def detect_cci_signal(df):
 
     if (cci_prev > 100) and (70 <= cci_curr <= 99):   # 숏 진입
         side = "short"
-        stop_price = float(curr["high"]) * 1.01
+        stop_price = float(curr["high"]) * (1 + SL_OFFSET)
 
     elif (cci_prev < -100) and (-70 >= cci_curr >= -99):  # 롱 진입
         side = "long"
-        stop_price = float(curr["low"]) * 0.99
+        stop_price = float(curr["low"]) * (1 - SL_OFFSET)
 
     if side is None or stop_price <= 0:
         return None
@@ -267,6 +268,11 @@ def main():
 
             for sym in SYMBOLS:
                 if not exch_positions[sym]["has_position"]:
+                    if pos_state[sym]["side"] == "long":
+                        entry_restrict[sym] = "short_only"
+                    elif pos_state[sym]["side"] == "short":
+                        entry_restrict[sym] = "long_only"
+
                     pos_state[sym] = {
                         "side": None,
                         "size": 0,
