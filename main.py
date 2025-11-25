@@ -421,7 +421,7 @@ def main():
                     pos_state[sym]["stop_order_id"] = None
 
                 last_signal_candle_ts[sym] = curr_ts
-                entry_restrict[sym] = None
+                # entry_restrict[sym] = None
 
             # --- 대시보드용 OHLCV + 인디케이터 저장 --- #
             ohlcv_state = {}
