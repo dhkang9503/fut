@@ -346,6 +346,7 @@ def main():
 
                     exch_now = sync_positions(exchange, SYMBOLS)[sym]
                     if exch_now["has_position"]:
+                        print(sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"})
                         exchange.create_order(sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"})
 
                     entry_restrict[sym] = "long_only"
