@@ -310,12 +310,13 @@ def main():
                 bb_lower = float(curr["bb_lower"])
                 high = float(curr["high"])
                 low = float(curr["low"])
+                curr_price = float(curr["close"])
 
                 # 대시보드용 tp_price = 현재 볼린저
                 pos_state[sym]["tp_price"] = bb_upper if side == "long" else bb_lower
 
                 # 실제 익절
-                if side == "long" and high >= bb_upper:
+                if side == "long" and curr_price >= bb_upper:
                     # 롱 익절
                     if pos_state[sym]["stop_order_id"]:
                         try:
@@ -335,7 +336,7 @@ def main():
                         "entry_time": None,
                     }
 
-                elif side == "short" and low <= bb_lower:
+                elif side == "short" and curr_price <= bb_lower:
                     # 숏 익절
                     if pos_state[sym]["stop_order_id"]:
                         try:
