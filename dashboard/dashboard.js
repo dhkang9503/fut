@@ -288,7 +288,7 @@ function initChart(symbol) {
                     showLine: false,
                     pointRadius: 5,
                     pointStyle: "triangle",
-                    rotation: Math.PI,
+                    pointRotation: 180,
                     borderColor: "#fb7185",
                     backgroundColor: "#fb7185",
                 },
@@ -454,9 +454,9 @@ function updateChart(symbol, rawCandles, posStateForSymbol) {
             const low = Number(targetRaw.low);
 
             if (posStateForSymbol.side === "long" && !isNaN(low)) {
-                longMarkers = [{ x: markerX, y: low * 0.999 }];
+                longMarkers = [{ x: markerX, y: low * 0.995 }];
             } else if (posStateForSymbol.side === "short" && !isNaN(high)) {
-                shortMarkers = [{ x: markerX, y: high * 1.001 }];
+                shortMarkers = [{ x: markerX, y: high * 1.005 }];
             }
         }
     }
