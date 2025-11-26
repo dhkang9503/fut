@@ -176,13 +176,17 @@ def detect_cci_signal(df):
     if df is None or len(df) < CCI_PERIOD + 3:
         return None
 
-    curr = df.iloc[-2]
-    prev = df.iloc[-3]
+    # 최근 마감된 2개 + 그 이전 1개 (총 3개 캔들)
+    curr  = df.iloc[-1]  # 방금 마감된 캔들
+    prev1 = df.iloc[-2]  # 그 이전
+    prev2 = df.iloc[-3]  # 그 이전
 
-    cci_curr = float(curr.get("cci", float("nan")))
-    cci_prev = float(prev.get("cci", float("nan")))
+    cci_curr  = float(curr.get("cci", float("nan")))
+    cci_prev1 = float(prev1.get("cci", float("nan")))
+    cci_prev2 = float(prev2.get("cci", float("nan")))
 
-    if math.isnan(cci_curr) or math.isnan(cci_prev):
+    # CCI 계산 안 됐으면 스킵
+    if any(math.isnan(x) for x in [cci_curr, cci_prev1, cci_prev2]):
         return None
 
     entry_price = float(curr["close"])
@@ -192,13 +196,16 @@ def detect_cci_signal(df):
     side = None
     stop_price = None
 
-    if (cci_prev > 100) and (70 <= cci_curr <= 99):   # 숏 진입
-        side = "short"
-        stop_price = float(curr["high"]) * (1 + SL_OFFSET)
-
-    elif (cci_prev < -100) and (-70 >= cci_curr >= -99):  # 롱 진입
+    # ----- 꺾임 로직 -----
+    # 롱 진입: 내려가다가(cci_prev2 > cci_prev1) 다시 위로 꺾임(cci_curr > cci_prev1)
+    if (cci_prev2 > cci_prev1) and (cci_curr > cci_prev1) and (cci_prev1 < -100):
         side = "long"
         stop_price = float(curr["low"]) * (1 - SL_OFFSET)
+
+    # 숏 진입: 올라가다가(cci_prev2 < cci_prev1) 다시 아래로 꺾임(cci_curr < cci_prev1)
+    elif (cci_prev2 < cci_prev1) and (cci_curr < cci_prev1) and (cci_prev1 > 100):
+        side = "short"
+        stop_price = float(curr["high"]) * (1 + SL_OFFSET)
 
     if side is None or stop_price <= 0:
         return None
@@ -209,7 +216,6 @@ def detect_cci_signal(df):
         "stop_price": stop_price,
         "signal_ts": int(curr["ts"]),
     }
-
 
 def _safe_float(v):
     """
