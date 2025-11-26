@@ -30,7 +30,7 @@ LOOP_INTERVAL  = 3
 CCI_PERIOD = 14
 BB_PERIOD  = 20
 BB_K       = 2.0
-SL_OFFSET  = 0.02 # 1%
+SL_OFFSET  = 0.01 # 1%
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
