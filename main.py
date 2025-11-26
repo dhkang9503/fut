@@ -263,7 +263,7 @@ def main():
                 df = calculate_indicators(df)
                 if len(df) < BB_PERIOD + 3:
                     continue
-                data[sym] = (df, df.iloc[-3], df.iloc[-2])
+                data[sym] = (df, df.iloc[-3], df.iloc[-1])
 
             if not data:
                 time.sleep(LOOP_INTERVAL)
@@ -346,7 +346,6 @@ def main():
 
                     exch_now = sync_positions(exchange, SYMBOLS)[sym]
                     if exch_now["has_position"]:
-                        print(sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"})
                         exchange.create_order(sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"})
 
                     entry_restrict[sym] = "long_only"
