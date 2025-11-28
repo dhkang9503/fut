@@ -200,12 +200,12 @@ def detect_cci_signal(df):
     # 롱 진입: 내려가다가(cci_prev2 > cci_prev1) 다시 위로 꺾임(cci_curr > cci_prev1)
     if (cci_prev2 > cci_prev1) and (cci_curr > cci_prev1) and (cci_prev1 < -100):
         side = "long"
-        stop_price = float(curr["low"]) * (1 - SL_OFFSET)
+        stop_price = float(prev1["low"]) * (1 - SL_OFFSET)
 
     # 숏 진입: 올라가다가(cci_prev2 < cci_prev1) 다시 아래로 꺾임(cci_curr < cci_prev1)
     elif (cci_prev2 < cci_prev1) and (cci_curr < cci_prev1) and (cci_prev1 > 100):
         side = "short"
-        stop_price = float(curr["high"]) * (1 + SL_OFFSET)
+        stop_price = float(prev1["high"]) * (1 + SL_OFFSET)
 
     if side is None or stop_price <= 0:
         return None
