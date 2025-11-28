@@ -277,8 +277,8 @@ function initChart(symbol) {
                     showLine: false,
                     pointRadius: 5,
                     pointStyle: "triangle",
-                    borderColor: "#38bdf8",
-                    backgroundColor: "#38bdf8",
+                    borderColor: "rgba(56, 189, 248, 0.5)",
+                    backgroundColor: "rgba(56, 189, 248, 0.5)",
                 },
                 {
                     // 8: 숏 진입 마커
@@ -289,8 +289,8 @@ function initChart(symbol) {
                     pointRadius: 5,
                     pointStyle: "triangle",
                     pointRotation: 180,
-                    borderColor: "#fb7185",
-                    backgroundColor: "#fb7185",
+                    borderColor: "rgba(251, 113, 133, 0.5)",
+                    backgroundColor: "rgba(251, 113, 133, 0.5)",
                 },
             ],
         },
@@ -454,9 +454,9 @@ function updateChart(symbol, rawCandles, posStateForSymbol) {
             const low = Number(targetRaw.low);
 
             if (posStateForSymbol.side === "long" && !isNaN(low)) {
-                longMarkers = [{ x: markerX, y: low * 0.995 }];
+                longMarkers = [{ x: markerX, y: low * 0.99 }];
             } else if (posStateForSymbol.side === "short" && !isNaN(high)) {
-                shortMarkers = [{ x: markerX, y: high * 1.005 }];
+                shortMarkers = [{ x: markerX, y: high * 1.01 }];
             }
         }
     }
