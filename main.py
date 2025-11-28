@@ -389,7 +389,7 @@ def main():
 
                 stop_pct = abs(entry_price - stop_price) / entry_price
                 amount, eff_lev = compute_order_size_risk_based(
-                    exchange, sym, entry_price, total, stop_pct
+                    exchange, sym, entry_price, free, stop_pct
                 )
                 if amount <= 0:
                     continue
