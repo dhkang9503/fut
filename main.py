@@ -30,7 +30,9 @@ LOOP_INTERVAL  = 3
 CCI_PERIOD = 14
 BB_PERIOD  = 20
 BB_K       = 2.0
-SL_OFFSET  = 0.01 # 1%
+
+SL_OFFSET  = 0.01  # 1%
+TP_OFFSET  = 0.002 # 0.2%
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -313,7 +315,7 @@ def main():
                 curr_price = float(curr["close"])
 
                 # 대시보드용 tp_price = 현재 볼린저
-                pos_state[sym]["tp_price"] = bb_upper if side == "long" else bb_lower
+                pos_state[sym]["tp_price"] = bb_upper * (1 - TP_OFFSET) if side == "long" else bb_lower * (1 + TP_OFFSET)
 
                 # 실제 익절
                 if side == "long" and curr_price >= bb_upper:
