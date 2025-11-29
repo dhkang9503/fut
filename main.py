@@ -32,7 +32,7 @@ BB_PERIOD  = 20
 BB_K       = 2.0
 
 SL_OFFSET  = 0.01  # 1%
-TP_OFFSET  = 0.002 # 0.2%
+TP_OFFSET  = 0.0015 # 0.15%
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
