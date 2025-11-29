@@ -330,7 +330,7 @@ def main():
                     if exch_now["has_position"]:
                         exchange.create_order(sym, "market", "sell", exch_now["size"], params={"tdMode": "cross"})
 
-                    entry_restrict[sym] = "short_only"
+                    entry_restrict[sym] = None # "short_only"
                     pos_state[sym] = {
                         "side": None, "size": 0, "entry_price": None,
                         "stop_price": None, "tp_price": None,
@@ -350,7 +350,7 @@ def main():
                     if exch_now["has_position"]:
                         exchange.create_order(sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"})
 
-                    entry_restrict[sym] = "long_only"
+                    entry_restrict[sym] = None # "long_only"
                     pos_state[sym] = {
                         "side": None, "size": 0, "entry_price": None,
                         "stop_price": None, "tp_price": None,
