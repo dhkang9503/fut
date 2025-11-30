@@ -31,8 +31,10 @@ CCI_PERIOD = 14
 BB_PERIOD  = 20
 BB_K       = 2.0
 
-SL_OFFSET  = 0.01  # 1%
-TP_OFFSET  = 0.0015 # 0.15%
+SL_OFFSET  = 0.01  # 1%: 스톱로스 여유폭
+TP_OFFSET  = 0.0015 # 0.15%: 익절가 여유폭
+
+R_THRESHOLD = 1.0  # R >= 1.0 인 경우에만 진입
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -383,6 +385,17 @@ def main():
                 if entry_restrict[sym] == "long_only" and side_signal != "long":
                     continue
                 if entry_restrict[sym] == "short_only" and side_signal != "short":
+                    continue
+
+                bb_upper = float(curr["bb_upper"])
+                bb_lower = float(curr["bb_lower"])
+                tp_price = bb_upper * (1 - TP_OFFSET) if side_signal == "long" else bb_lower * (1 + TP_OFFSET)
+
+                stop_pct = abs(entry_price - stop_price)
+                tp_pct = abs(entry_price - tp_price)
+
+                R = tp_pct / stop_pct
+                if R < R_THRESHOLD:
                     continue
 
                 free, total = fetch_futures_equity(exchange)

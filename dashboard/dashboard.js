@@ -45,8 +45,7 @@ function fmtDateTime(value) {
     const d = new Date(value);
     if (isNaN(d.getTime())) return "-";
 
-    const KST_OFFSET = 9 * 60 * 60 * 1000; // 9시간(ms)
-    const kst = new Date(d.getTime() + KST_OFFSET);
+    const kst = new Date(d.getTime());
 
     const yyyy = kst.getFullYear();
     const MM = String(kst.getMonth() + 1).padStart(2, "0");
