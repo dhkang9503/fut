@@ -381,6 +381,15 @@ def main():
                 entry_price = signal["entry_price"]
                 stop_price = signal["stop_price"]
 
+                # --- 진입가 vs 손절가 유효성 검사 ---
+                if side_signal == "long":
+                    if stop_price >= entry_price:
+                        continue   # 비정상 SL → 진입 금지
+
+                elif side_signal == "short":
+                    if stop_price <= entry_price:
+                        continue   # 비정상 SL → 진입 금지
+
                 # entry 제한 체크
                 if entry_restrict[sym] == "long_only" and side_signal != "long":
                     continue
