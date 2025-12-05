@@ -112,7 +112,7 @@ def calculate_indicators(df):
 
     # Bollinger Bands
     ma = df["close"].rolling(BB_PERIOD).mean()
-    std = df["close"].rolling(BB_PERIOD).std()
+    std = df["close"].rolling(BB_PERIOD).std(ddof=0)
     df["bb_mid"]   = ma
     df["bb_upper"] = ma + BB_K * std
     df["bb_lower"] = ma - BB_K * std
