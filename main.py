@@ -104,14 +104,15 @@ def fetch_ohlcv_df(exchange, symbol, timeframe, limit=200):
 
 
 def calculate_indicators(df):
-    # CCI
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    # ma_tp = tp.rolling(CCI_PERIOD).mean()
-    # mad = (tp - ma_tp).abs().rolling(CCI_PERIOD).mean()
-    # df["cci"] = (tp - ma_tp) / (0.015 * mad)
-    sma = tp.rolling(CCI_PERIOD).mean()
-    mad = (tp - sma).abs().rolling(CCI_PERIOD).apply(lambda x: x.sum() / CCI_PERIOD, raw=True)
-    df["cci"] = (tp - sma) / (0.015 * mad)
+    # ----- CCI (OKX TradingView 스타일) -----
+    tp = (df["high"] + df["low"] + df["close"]) / 3  # hlc3
+    sma_tp = tp.rolling(CCI_PERIOD).mean()
+    # mean deviation = sum(|x - mean(x)|)/length (TradingView ta.dev 스타일)
+    def _mean_dev(window):
+        m = window.mean()
+        return (window.sub(m).abs().sum()) / len(window)
+    md = tp.rolling(CCI_PERIOD).apply(_mean_dev, raw=False)
+    df["cci"] = (tp - sma_tp) / (0.015 * md)
 
     # Bollinger Bands
     ma = df["close"].rolling(BB_PERIOD).mean()
