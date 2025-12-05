@@ -75,7 +75,7 @@ def init_exchange():
         "enableRateLimit": True,
         "options": {"defaultType": "swap", "defaultSettle": "usdt"},
     })
-    exchange.set_sandbox_mode(True)
+    # exchange.set_sandbox_mode(True)
     exchange.load_markets()
 
     try:
