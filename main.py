@@ -31,13 +31,10 @@ CCI_PERIOD = 14
 BB_PERIOD  = 20
 BB_K       = 2.0
 
-SL_OFFSET  = 0.01   # 1%: 스톱로스 여유폭
+SL_OFFSET  = 0.01  # 1%: 스톱로스 여유폭
 TP_OFFSET  = 0.0015 # 0.15%: 익절가 여유폭
 
-R_THRESHOLD = 1.1   # R >= 1.0 인 경우에만 진입
-
-# --- CCI 반전 최소 변화량 (로드맵 4번) ---
-CCI_REV_THRESHOLD = 5.0
+R_THRESHOLD = 1.1  # R >= 1.0 인 경우에만 진입
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -207,26 +204,14 @@ def detect_cci_signal(df):
     side = None
     stop_price = None
 
-    # ----- 꺾임 로직 (로드맵 4번: 최소 변화량 적용) -----
+    # ----- 꺾임 로직 -----
     # 롱 진입: 내려가다가(cci_prev2 > cci_prev1) 다시 위로 꺾임(cci_curr > cci_prev1)
-    # + cci_curr - cci_prev1 이 최소 CCI_REV_THRESHOLD 이상
-    if (
-        (cci_prev2 > cci_prev1) and
-        (cci_curr > cci_prev1) and
-        (cci_prev1 < -100) and
-        (cci_curr - cci_prev1 >= CCI_REV_THRESHOLD)
-    ):
+    if (cci_prev2 > cci_prev1) and (cci_curr > cci_prev1) and (cci_prev1 < -100):
         side = "long"
         stop_price = float(prev1["low"]) * (1 - SL_OFFSET)
 
     # 숏 진입: 올라가다가(cci_prev2 < cci_prev1) 다시 아래로 꺾임(cci_curr < cci_prev1)
-    # + cci_prev1 - cci_curr 이 최소 CCI_REV_THRESHOLD 이상
-    elif (
-        (cci_prev2 < cci_prev1) and
-        (cci_curr < cci_prev1) and
-        (cci_prev1 > 100) and
-        (cci_prev1 - cci_curr >= CCI_REV_THRESHOLD)
-    ):
+    elif (cci_prev2 < cci_prev1) and (cci_curr < cci_prev1) and (cci_prev1 > 100):
         side = "short"
         stop_price = float(prev1["high"]) * (1 + SL_OFFSET)
 
@@ -239,7 +224,6 @@ def detect_cci_signal(df):
         "stop_price": stop_price,
         "signal_ts": int(curr["ts"]),
     }
-
 
 def _safe_float(v):
     """
@@ -276,11 +260,6 @@ def main():
     entry_restrict = {sym: None for sym in SYMBOLS}
     last_signal_candle_ts = {}
 
-    # --- SL 이후 상태 관리 (로드맵 3번용) ---
-    sl_last_exit_side = {sym: None for sym in SYMBOLS}
-    sl_last_exit_candle_ts = {sym: None for sym in SYMBOLS}
-    sl_reentry_used = {sym: False for sym in SYMBOLS}
-
     while True:
         try:
             # --- OHLCV & 지표 --- #
@@ -303,19 +282,10 @@ def main():
 
             for sym in SYMBOLS:
                 if not exch_positions[sym]["has_position"]:
-                    # 포지션이 있었는데 사라졌으면: SL 또는 외부 청산으로 판단
-                    if pos_state[sym]["side"] in ("long", "short"):
-                        exit_side = pos_state[sym]["side"]
-                        sl_last_exit_side[sym] = exit_side
-                        if sym in data:
-                            _, _, curr_for_sl = data[sym]
-                            sl_last_exit_candle_ts[sym] = int(curr_for_sl["ts"])
-                        else:
-                            sl_last_exit_candle_ts[sym] = None
-                        sl_reentry_used[sym] = False
-
-                    # 기존 entry_restrict 방향 제한은 사용 안 하고 초기화
-                    entry_restrict[sym] = None
+                    if pos_state[sym]["side"] == "long":
+                        entry_restrict[sym] = "short_only"
+                    elif pos_state[sym]["side"] == "short":
+                        entry_restrict[sym] = "long_only"
 
                     pos_state[sym] = {
                         "side": None,
@@ -366,7 +336,7 @@ def main():
                     if exch_now["has_position"]:
                         exchange.create_order(sym, "market", "sell", exch_now["size"], params={"tdMode": "cross"})
 
-                    entry_restrict[sym] = None  # TP 후에는 제한 없음
+                    entry_restrict[sym] = None # "short_only"
                     pos_state[sym] = {
                         "side": None, "size": 0, "entry_price": None,
                         "stop_price": None, "tp_price": None,
@@ -386,7 +356,7 @@ def main():
                     if exch_now["has_position"]:
                         exchange.create_order(sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"})
 
-                    entry_restrict[sym] = None  # TP 후에는 제한 없음
+                    entry_restrict[sym] = None # "long_only"
                     pos_state[sym] = {
                         "side": None, "size": 0, "entry_price": None,
                         "stop_price": None, "tp_price": None,
@@ -415,17 +385,6 @@ def main():
                 entry_price = signal["entry_price"]
                 stop_price = signal["stop_price"]
 
-                # --- 로드맵 1번: 밴드 바깥 진입 필터 ---
-                bb_upper = float(curr["bb_upper"])
-                bb_lower = float(curr["bb_lower"])
-
-                # 롱: 하단 밴드 아래에서만 진입
-                if side_signal == "long" and not (entry_price < bb_lower):
-                    continue
-                # 숏: 상단 밴드 위에서만 진입
-                if side_signal == "short" and not (entry_price > bb_upper):
-                    continue
-
                 # --- 진입가 vs 손절가 유효성 검사 ---
                 if side_signal == "long":
                     if stop_price >= entry_price:
@@ -435,35 +394,14 @@ def main():
                     if stop_price <= entry_price:
                         continue   # 비정상 SL → 진입 금지
 
-                # --- 로드맵 3번: SL 이후 처리 ---
-                sl_side = sl_last_exit_side.get(sym)
-                sl_ts = sl_last_exit_candle_ts.get(sym)
-                re_used = sl_reentry_used.get(sym, False)
-
-                if sl_side is not None:
-                    # 손절이 감지된 캔들과 같은 캔들에서는 무조건 진입 금지 (다음 캔들 패스 효과)
-                    if sl_ts is not None and curr_ts == sl_ts:
-                        continue
-
-                    # 반대 방향 신호가 나오면 제한 리셋 후 자유 진입
-                    if side_signal != sl_side:
-                        sl_last_exit_side[sym] = None
-                        sl_last_exit_candle_ts[sym] = None
-                        sl_reentry_used[sym] = False
-                    else:
-                        # 같은 방향: 재진입 1회만 허용
-                        if re_used:
-                            continue
-                        else:
-                            # 이번 한 번은 허용하고, 재진입 사용 처리
-                            sl_reentry_used[sym] = True
-
-                # entry 제한 체크 (기존 구조는 유지하되, 위 SL 로직이 메인)
+                # entry 제한 체크
                 if entry_restrict[sym] == "long_only" and side_signal != "long":
                     continue
                 if entry_restrict[sym] == "short_only" and side_signal != "short":
                     continue
 
+                bb_upper = float(curr["bb_upper"])
+                bb_lower = float(curr["bb_lower"])
                 tp_price = bb_upper * (1 - TP_OFFSET) if side_signal == "long" else bb_lower * (1 + TP_OFFSET)
 
                 stop_pct = abs(entry_price - stop_price)
@@ -486,7 +424,7 @@ def main():
 
                 # 주문
                 order_side = "buy" if side_signal == "long" else "sell"
-                sl_side_order = "sell" if side_signal == "long" else "buy"
+                sl_side = "sell" if side_signal == "long" else "buy"
 
                 exchange.create_order(
                     sym,
@@ -515,7 +453,7 @@ def main():
                     sl_order = exchange.create_order(
                         sym,
                         "market",
-                        sl_side_order,
+                        sl_side,
                         actual_size,
                         params={"tdMode": "cross", "reduceOnly": True, "stopLossPrice": stop_price},
                     )
