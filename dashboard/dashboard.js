@@ -2,18 +2,18 @@
 // 기본 설정
 // =====================
 
-const SYMBOLS = ["DOGE/USDT:USDT", "XRP/USDT:USDT", "SOL/USDT:USDT"];
+const SYMBOLS = ["DOGE/USDT:USDT", "XRP/USDT:USDT", "AVAX/USDT:USDT"];
 
 const CHART_IDS = {
     "DOGE/USDT:USDT": "chart-btc",
     "XRP/USDT:USDT": "chart-eth",
-    "SOL/USDT:USDT": "chat-sol",
+    "AVAX/USDT:USDT": "chat-sol",
 };
 
 const CCI_CHART_IDS = {
     "DOGE/USDT:USDT": "cci-btc",
     "XRP/USDT:USDT": "cci-eth",
-    "SOL/USDT:USDT": "cci-sol",
+    "AVAX/USDT:USDT": "cci-sol",
 };
 
 const charts = {};
