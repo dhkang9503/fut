@@ -2,18 +2,18 @@
 // 기본 설정
 // =====================
 
-const SYMBOLS = ["OKB/USDT:USDT", "XRP/USDT:USDT", "AVAX/USDT:USDT"];
+const SYMBOLS = ["ETH/USDT:USDT", "OKB/USDT:USDT", "XRP/USDT:USDT"];
 
 const CHART_IDS = {
-    "OKB/USDT:USDT": "chart-btc",
-    "XRP/USDT:USDT": "chart-eth",
-    "AVAX/USDT:USDT": "chat-sol",
+    "ETH/USDT:USDT": "chart-btc",
+    "OKB/USDT:USDT": "chart-eth",
+    "XRP/USDT:USDT": "chat-sol",
 };
 
 const CCI_CHART_IDS = {
-    "OKB/USDT:USDT": "cci-btc",
-    "XRP/USDT:USDT": "cci-eth",
-    "AVAX/USDT:USDT": "cci-sol",
+    "ETH/USDT:USDT": "cci-btc",
+    "OKB/USDT:USDT": "cci-eth",
+    "XRP/USDT:USDT": "cci-sol",
 };
 
 const charts = {};

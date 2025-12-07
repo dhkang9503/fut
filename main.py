@@ -16,9 +16,9 @@ API_SECRET = os.getenv("OKX_API_SECRET", "")
 API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "")
 
 SYMBOLS = [
+    "ETH/USDT:USDT",
     "OKB/USDT:USDT",
     "XRP/USDT:USDT",
-    "AVAX/USDT:USDT",
 ]
 
 TIMEFRAME = "1h"
