@@ -2,18 +2,18 @@
 // 기본 설정
 // =====================
 
-const SYMBOLS = ["ETH/USDT:USDT", "OKB/USDT:USDT", "XRP/USDT:USDT"];
+const SYMBOLS = ["ETH/USDT:USDT", "OKB/USDT:USDT", "SOL/USDT:USDT"];
 
 const CHART_IDS = {
     "ETH/USDT:USDT": "chart-btc",
     "OKB/USDT:USDT": "chart-eth",
-    "XRP/USDT:USDT": "chat-sol",
+    "SOL/USDT:USDT": "chat-sol",
 };
 
 const CCI_CHART_IDS = {
     "ETH/USDT:USDT": "cci-btc",
     "OKB/USDT:USDT": "cci-eth",
-    "XRP/USDT:USDT": "cci-sol",
+    "SOL/USDT:USDT": "cci-sol",
 };
 
 const charts = {};
