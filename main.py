@@ -328,7 +328,7 @@ def main():
                 pos_state[sym]["tp_price"] = bb_upper * (1 - TP_OFFSET) if side == "long" else bb_lower * (1 + TP_OFFSET)
 
                 # 실제 익절
-                if side == "long" and curr_price >= bb_upper:
+                if side == "long" and curr_price >= pos_state[sym]["tp_price"]:
                     # 롱 익절
                     if pos_state[sym]["stop_order_id"]:
                         try:
@@ -348,7 +348,7 @@ def main():
                         "entry_time": None,
                     }
 
-                elif side == "short" and curr_price <= bb_lower:
+                elif side == "short" and curr_price <= pos_state[sym]["tp_price"]:
                     # 숏 익절
                     if pos_state[sym]["stop_order_id"]:
                         try:
