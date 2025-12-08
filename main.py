@@ -34,7 +34,9 @@ BB_K       = 2.0
 SL_OFFSET  = 0.01  # 1%: 스톱로스 여유폭
 TP_OFFSET  = 0.0015 # 0.15%: 익절가 여유폭
 
-R_THRESHOLD = 1.1  # R >= 1.0 인 경우에만 진입
+R_THRESHOLD = 1.2  # R >= 1.0 인 경우에만 진입
+
+MIN_DELTA = 10.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -206,12 +208,14 @@ def detect_cci_signal(df):
 
     # ----- 꺾임 로직 -----
     # 롱 진입: 내려가다가(cci_prev2 > cci_prev1) 다시 위로 꺾임(cci_curr > cci_prev1)
-    if (cci_prev2 > cci_prev1) and (cci_curr > cci_prev1) and (cci_prev1 < -100):
+    # if (cci_prev2 > cci_prev1) and (cci_curr > cci_prev1) and (cci_prev1 < -100):
+    if (cci_prev1 < -100) and (cci_curr > cci_prev1) and (cci_curr - cci_prev1 >= MIN_DELTA):
         side = "long"
         stop_price = float(prev1["low"]) * (1 - SL_OFFSET)
 
     # 숏 진입: 올라가다가(cci_prev2 < cci_prev1) 다시 아래로 꺾임(cci_curr < cci_prev1)
-    elif (cci_prev2 < cci_prev1) and (cci_curr < cci_prev1) and (cci_prev1 > 100):
+    # elif (cci_prev2 < cci_prev1) and (cci_curr < cci_prev1) and (cci_prev1 > 100):
+    elif (cci_prev1 > 100) and (cci_curr < cci_prev1) and (cci_prev1 - cci_curr >= MIN_DELTA):
         side = "short"
         stop_price = float(prev1["high"]) * (1 + SL_OFFSET)
 
