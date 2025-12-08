@@ -32,7 +32,7 @@ BB_PERIOD  = 20
 BB_K       = 2.0
 
 SL_OFFSET  = 0.01  # 1%: 스톱로스 여유폭
-TP_OFFSET  = 0.002 # 0.15%: 익절가 여유폭
+TP_OFFSET  = 0.005 # 0.5%: 익절가 여유폭
 
 R_THRESHOLD = 1.2  # R >= 1.0 인 경우에만 진입
 
