@@ -38,10 +38,21 @@ function fmtNumber(value, digits = 4) {
     return Number(value).toFixed(digits);
 }
 
+function fmtPct(v) {
+    if (v === null || v === undefined || isNaN(v)) return "-";
+    return `${Number(v).toFixed(2)}%`;
+}
+
+function fmtSignedUSDT(v, digits = 3) {
+    if (v === null || v === undefined || isNaN(v)) return "-";
+    const num = Number(v);
+    const sign = num > 0 ? "+" : "";
+    return `${sign}${num.toFixed(digits)} USDT`;
+}
+
 function fmtDateTime(value) {
     if (!value) return "-";
 
-    // entry_time 은 ISO(UTC)로 들어오므로, Date로 파싱한 뒤 KST(+9h)로 변환
     const d = new Date(value);
     if (isNaN(d.getTime())) return "-";
 
@@ -54,10 +65,8 @@ function fmtDateTime(value) {
     const mm = String(kst.getMinutes()).padStart(2, "0");
     const ss = String(kst.getSeconds()).padStart(2, "0");
 
-    // 👉 2025/11/25 01:02:03 형태
     return `${yyyy}/${MM}/${DD} ${hh}:${mm}:${ss}`;
 }
-
 
 function renderEntryRestriction(entryRestrict) {
     if (!entryRestrictEl) return;
@@ -84,7 +93,6 @@ function renderPosition(posState) {
         return;
     }
 
-    // pos_state 에서 실제로 포지션이 있는 심볼만 추리기
     const rows = [];
     for (const sym of SYMBOLS) {
         const p = posState[sym];
@@ -99,6 +107,9 @@ function renderPosition(posState) {
             stop_price: p.stop_price,
             stop_order_id: p.stop_order_id,
             entry_time: p.entry_time,
+            leverage: p.leverage,
+            margin: p.margin,
+            notional: p.notional,
         });
     }
 
@@ -114,12 +125,14 @@ function renderPosition(posState) {
             <tr class="border-b border-gray-700 bg-gray-900/40">
               <th class="px-2 py-1 sm:px-3 sm:py-2">진입시간</th>
               <th class="px-2 py-1 sm:px-3 sm:py-2">심볼</th>
+              <th class="px-2 py-1 sm:px-3 sm:py-2 text-right">레버리지</th>
               <th class="px-2 py-1 sm:px-3 sm:py-2">방향</th>
-              <th class="px-2 py-1 sm:px-3 sm:py-2 text-right">사이즈</th>
+              <th class="px-2 py-1 sm:px-3 sm:py-2 text-right">증거금</th>
               <th class="px-2 py-1 sm:px-3 sm:py-2 text-right">진입가</th>
               <th class="px-2 py-1 sm:px-3 sm:py-2 text-right">익절가</th>
               <th class="px-2 py-1 sm:px-3 sm:py-2 text-right">손절가</th>
-              <th class="px-2 py-1 sm:px-3 sm:py-2">stop_order_id</th>
+              <th class="px-2 py-1 sm:px-3 sm:py-2 text-right">손익비</th>
+              <th class="px-2 py-1 sm:px-3 sm:py-2 text-center">SL</th>
             </tr>
           </thead>
           <tbody>
@@ -134,16 +147,86 @@ function renderPosition(posState) {
                 ? "text-red-400"
                 : "text-gray-300";
 
+        const displaySymbol = r.symbol ? r.symbol.split("/")[0] : "-";
+
+        const lev = r.leverage;
+        const levText =
+            lev !== null && lev !== undefined && !isNaN(Number(lev))
+                ? `${Number(lev).toFixed(2)}x`
+                : "-";
+
+        const margin =
+            r.margin !== null && r.margin !== undefined && !isNaN(Number(r.margin))
+                ? fmtUSDT(r.margin)
+                : "-";
+
+        const entry = Number(r.entry_price);
+        const tp = r.tp_price != null ? Number(r.tp_price) : NaN;
+        const sl = r.stop_price != null ? Number(r.stop_price) : NaN;
+        const notional = r.notional != null ? Number(r.notional) : NaN;
+
+        let tpRate = null, tpPnl = null;
+        let slRate = null, slPnl = null;
+
+        if (!isNaN(entry) && entry > 0 && !isNaN(tp) && !isNaN(notional) && notional > 0) {
+            const rawPct = (tp - entry) / entry * 100;
+            tpRate = (r.side === "short" ? -rawPct : rawPct);
+            tpPnl  = notional * tpRate / 100;
+        }
+
+        if (!isNaN(entry) && entry > 0 && !isNaN(sl) && !isNaN(notional) && notional > 0) {
+            const rawPct = (sl - entry) / entry * 100;
+            slRate = (r.side === "short" ? -rawPct : rawPct);
+            slPnl  = notional * slRate / 100;
+        }
+
+        let rr = null;
+        if (!isNaN(entry) && !isNaN(tp) && !isNaN(sl) && entry !== sl) {
+            const reward = Math.abs(tp - entry);
+            const risk   = Math.abs(sl - entry);
+            if (risk > 0) {
+                rr = reward / risk;
+            }
+        }
+
+        const tpPriceText = (!isNaN(tp) && tp > 0) ? fmtNumber(tp) : "-";
+        const slPriceText = (!isNaN(sl) && sl > 0) ? fmtNumber(sl) : "-";
+
+        const tpExtra = (tpRate != null && tpPnl != null)
+            ? `${fmtPct(tpRate)} / ${fmtSignedUSDT(tpPnl)}`
+            : "-";
+
+        const slExtra = (slRate != null && slPnl != null)
+            ? `${fmtPct(slRate)} / ${fmtSignedUSDT(slPnl)}`
+            : "-";
+
+        const rrText = rr != null && !isNaN(rr) ? `${rr.toFixed(2)} R` : "-";
+
+        const slFlag = r.stop_order_id ? "O" : "X";
+        const slTitle = r.stop_order_id || "";
+
         html += `
           <tr class="border-b border-gray-800 hover:bg-gray-900/40">
             <td class="px-2 py-1 sm:px-3 sm:py-2 whitespace-nowrap text-gray-300">${fmtDateTime(r.entry_time)}</td>
-            <td class="px-2 py-1 sm:px-3 sm:py-2 whitespace-nowrap text-gray-200">${r.symbol}</td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 whitespace-nowrap text-gray-200">${displaySymbol}</td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-gray-100">${levText}</td>
             <td class="px-2 py-1 sm:px-3 sm:py-2 whitespace-nowrap ${sideColor} font-semibold">${sideLabel}</td>
-            <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-gray-100">${fmtNumber(r.size, 0)}</td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-gray-100">${margin}</td>
             <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-gray-100">${fmtNumber(r.entry_price)}</td>
-            <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-teal-300">${r.tp_price != null ? fmtNumber(r.tp_price) : "-"}</td>
-            <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-red-300">${r.stop_price != null ? fmtNumber(r.stop_price) : "-"}</td>
-            <td class="px-2 py-1 sm:px-3 sm:py-2 text-gray-400 break-all">${r.stop_order_id || "-"}</td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-teal-300">
+              ${tpPriceText}<br/>
+              <span class="text-xs text-gray-300">${tpExtra}</span>
+            </td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-red-300">
+              ${slPriceText}<br/>
+              <span class="text-xs text-gray-300">${slExtra}</span>
+            </td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 text-right text-gray-100">
+              ${rrText}
+            </td>
+            <td class="px-2 py-1 sm:px-3 sm:py-2 text-center text-gray-200" title="${slTitle}">
+              ${slFlag}
+            </td>
           </tr>
         `;
     }
@@ -204,7 +287,6 @@ function initChart(symbol) {
         data: {
             datasets: [
                 {
-                    // 0: 캔들
                     label: symbol,
                     type: "candlestick",
                     data: [],
@@ -212,7 +294,6 @@ function initChart(symbol) {
                     barPercentage: 0.6,
                 },
                 {
-                    // 1: Entry (주황색)
                     label: "Entry",
                     type: "line",
                     data: [],
@@ -222,7 +303,6 @@ function initChart(symbol) {
                     pointRadius: 0,
                 },
                 {
-                    // 2: TP (노랑)
                     label: "TP",
                     type: "line",
                     data: [],
@@ -232,7 +312,6 @@ function initChart(symbol) {
                     pointRadius: 0,
                 },
                 {
-                    // 3: SL (빨강)
                     label: "SL",
                     type: "line",
                     data: [],
@@ -242,34 +321,30 @@ function initChart(symbol) {
                     pointRadius: 0,
                 },
                 {
-                    // 4: BB Upper
                     label: "BB Upper",
                     type: "line",
                     data: [],
                     borderWidth: 1,
                     pointRadius: 0,
-                    borderColor: "rgba(75,192,192,0.4)",   // #4BC0C0 + 투명
+                    borderColor: "rgba(75,192,192,0.4)",
                 },
                 {
-                    // 5: BB Lower
                     label: "BB Lower",
                     type: "line",
                     data: [],
                     borderWidth: 1,
                     pointRadius: 0,
-                    borderColor: "rgba(153,102,255,0.4)",  // #9966FF + 투명
+                    borderColor: "rgba(153,102,255,0.4)",
                 },
                 {
-                    // 6: BB Mid
                     label: "BB Mid",
                     type: "line",
                     data: [],
                     borderWidth: 1,
                     pointRadius: 0,
-                    borderColor: "rgba(228,229,231,0.4)",  // #E4E5E7 + 투명
+                    borderColor: "rgba(228,229,231,0.4)",
                 },
                 {
-                    // 7: 롱 진입 마커
                     label: "Long Entry Marker",
                     type: "scatter",
                     data: [],
@@ -280,7 +355,6 @@ function initChart(symbol) {
                     backgroundColor: "rgba(56, 189, 248, 0.5)",
                 },
                 {
-                    // 8: 숏 진입 마커
                     label: "Short Entry Marker",
                     type: "scatter",
                     data: [],
@@ -346,7 +420,6 @@ function updateChart(symbol, rawCandles, posStateForSymbol) {
     const firstX = hasCandles ? mapped[0].x : null;
     const lastX = hasCandles ? mapped[mapped.length - 1].x : null;
 
-    // Entry / TP / SL
     const hasPos = posStateForSymbol && posStateForSymbol.side && posStateForSymbol.size > 0;
     let entryLineData = [];
     let tpLineData = [];
@@ -381,7 +454,6 @@ function updateChart(symbol, rawCandles, posStateForSymbol) {
     if (chart.data.datasets[2]) chart.data.datasets[2].data = tpLineData;
     if (chart.data.datasets[3]) chart.data.datasets[3].data = slLineData;
 
-    // Bollinger
     const bbUpperData = [];
     const bbLowerData = [];
     const bbMidData = [];
@@ -403,7 +475,6 @@ function updateChart(symbol, rawCandles, posStateForSymbol) {
     if (chart.data.datasets[5]) chart.data.datasets[5].data = bbLowerData;
     if (chart.data.datasets[6]) chart.data.datasets[6].data = bbMidData;
 
-    // ===== 진입 마커 (롱/숏 삼각형) =====
     let longMarkers = [];
     let shortMarkers = [];
 
@@ -467,7 +538,7 @@ function updateChart(symbol, rawCandles, posStateForSymbol) {
 }
 
 // =====================
-// CCI 차트 (라벨 + 값 방식)
+// CCI 차트
 // =====================
 
 function initCciChart(symbol) {
@@ -486,16 +557,14 @@ function initCciChart(symbol) {
             labels: [],
             datasets: [
                 {
-                    // 0: 실제 CCI 값
                     label: "CCI",
                     data: [],
                     borderWidth: 1,
                     pointRadius: 0,
-                    borderColor: "rgba(250,204,21,0.7)",   // 밝은 노란색
+                    borderColor: "rgba(250,204,21,0.7)",
                     tension: 0.1,
                 },
                 {
-                    // 1: 0 라인
                     label: "Zero",
                     data: [],
                     borderWidth: 1,
@@ -504,7 +573,6 @@ function initCciChart(symbol) {
                     borderDash: [],
                 },
                 {
-                    // 2: +100 라인
                     label: "+100",
                     data: [],
                     borderWidth: 1,
@@ -513,7 +581,6 @@ function initCciChart(symbol) {
                     borderDash: [4, 4],
                 },
                 {
-                    // 3: -100 라인
                     label: "-100",
                     data: [],
                     borderWidth: 1,
