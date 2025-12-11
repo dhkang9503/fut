@@ -24,7 +24,7 @@ SYMBOLS = [
 TIMEFRAME = "1h"
 
 RISK_PER_TRADE = 0.033
-MAX_LEVERAGE   = 20
+MAX_LEVERAGE   = 10
 LOOP_INTERVAL  = 3
 
 CCI_PERIOD = 14
@@ -83,7 +83,6 @@ def init_exchange():
     exchange.load_markets()
 
     try:
-        # 기본값으로 MAX_LEVERAGE 한 번 세팅
         exchange.set_position_mode(hedged=False)
     except Exception:
         pass
@@ -113,7 +112,7 @@ def calculate_indicators(df):
     tp = (df["high"] + df["low"] + df["close"]) / 3  # hlc3
     sma_tp = tp.rolling(CCI_PERIOD).mean()
 
-    # mean deviation = sum(|x - mean(x)|)/length (TradingView ta.dev 스타일)
+    # mean deviation = sum(|x - mean(x)|)/length
     def _mean_dev(window):
         m = window.mean()
         return (window.sub(m).abs().sum()) / len(window)
@@ -178,7 +177,27 @@ def compute_order_size_equal_margin_and_risk(exchange, symbol, entry_price, equi
 
 
 def sync_positions(exchange, symbols):
-    result = {sym: {"has_position": False, "side": None, "size": 0, "entry_price": None} for sym in symbols}
+    """
+    OKX 포지션에서:
+      - size (contracts)
+      - entry_price
+      - leverage
+      - margin
+      - notional (entry_price * size * contract_size)
+    까지 뽑아서 대시보드로 넘길 수 있게 구성
+    """
+    result = {
+        sym: {
+            "has_position": False,
+            "side": None,
+            "size": 0,
+            "entry_price": None,
+            "leverage": None,
+            "margin": None,
+            "notional": None,
+        }
+        for sym in symbols
+    }
 
     try:
         positions = exchange.fetch_positions()
@@ -190,18 +209,52 @@ def sync_positions(exchange, symbols):
         if sym not in symbols:
             continue
 
-        contracts = float(p.get("contracts") or 0)
+        contracts = float(p.get("contracts") or p.get("positionAmt") or 0)
         if contracts == 0:
             continue
 
         side = p.get("side") or ("long" if contracts > 0 else "short")
-        entry_price = float(p.get("entryPrice") or 0)
+        entry_price = float(p.get("entryPrice") or p.get("avgPrice") or 0)
+
+        # 레버리지
+        lev_raw = p.get("leverage") or (p.get("info") or {}).get("lever") or None
+        try:
+            leverage = float(lev_raw) if lev_raw is not None else None
+        except Exception:
+            leverage = None
+
+        # 증거금 (가능한 필드에서 추출)
+        margin_raw = (
+            p.get("initialMargin")
+            or p.get("margin")
+            or (p.get("info") or {}).get("margin")
+            or None
+        )
+        try:
+            margin = float(margin_raw) if margin_raw is not None else None
+        except Exception:
+            margin = None
+
+        # 노션 = entry_price * size * contract_size
+        notional = None
+        try:
+            market = exchange.market(sym)
+            contract_size = market.get("contractSize") or float(
+                market["info"].get("ctVal", 1)
+            )
+            if entry_price > 0:
+                notional = abs(contracts) * contract_size * entry_price
+        except Exception:
+            notional = None
 
         result[sym] = {
             "has_position": True,
             "side": side,
             "size": abs(contracts),
             "entry_price": entry_price,
+            "leverage": leverage,
+            "margin": margin,
+            "notional": notional,
         }
     return result
 
@@ -220,7 +273,6 @@ def detect_cci_signal(df):
     cci_prev1 = float(prev1.get("cci", float("nan")))
     cci_prev2 = float(prev2.get("cci", float("nan")))
 
-    # CCI 계산 안 됐으면 스킵
     if any(math.isnan(x) for x in [cci_curr, cci_prev1, cci_prev2]):
         return None
 
@@ -231,13 +283,12 @@ def detect_cci_signal(df):
     side = None
     stop_price = None
 
-    # ----- 꺾임 로직 -----
-    # 롱 진입: 과매도 구간에서 위로 강하게 꺾임
+    # 롱 진입
     if (cci_prev1 < -100) and (cci_curr > cci_prev1) and (cci_curr - cci_prev1 >= MIN_DELTA):
         side = "long"
         stop_price = float(prev1["low"]) * (1 - SL_OFFSET)
 
-    # 숏 진입: 과매수 구간에서 아래로 강하게 꺾임
+    # 숏 진입
     elif (cci_prev1 > 100) and (cci_curr < cci_prev1) and (cci_prev1 - cci_curr >= MIN_DELTA):
         side = "short"
         stop_price = float(prev1["high"]) * (1 + SL_OFFSET)
@@ -254,9 +305,6 @@ def detect_cci_signal(df):
 
 
 def _safe_float(v):
-    """
-    NaN / inf / None 등을 JSON에 안 들어가게 None으로 치환
-    """
     try:
         f = float(v)
         if math.isnan(f) or math.isinf(f):
@@ -269,7 +317,7 @@ def _safe_float(v):
 # ============== 메인 루프 ============== #
 def main():
     exchange = init_exchange()
-    logging.info("CCI + Bollinger 자동매매 (동적 TP + 마커 표시 + BB/CCI 대시보드 + 균등 증거금/리스크) 시작")
+    logging.info("CCI + Bollinger 자동매매 (동적 TP + BB/CCI 대시보드 + 균등 증거금/리스크) 시작")
 
     pos_state = {
         sym: {
@@ -281,6 +329,9 @@ def main():
             "entry_candle_ts": None,
             "stop_order_id": None,
             "entry_time": None,
+            "leverage": None,
+            "margin": None,
+            "notional": None,
         }
         for sym in SYMBOLS
     }
@@ -311,9 +362,9 @@ def main():
             for sym in SYMBOLS:
                 if not exch_positions[sym]["has_position"]:
                     if pos_state[sym]["side"] == "long":
-                        entry_restrict[sym] = None  # "short_only"
+                        entry_restrict[sym] = None
                     elif pos_state[sym]["side"] == "short":
-                        entry_restrict[sym] = None  # "long_only"
+                        entry_restrict[sym] = None
 
                     pos_state[sym] = {
                         "side": None,
@@ -324,11 +375,17 @@ def main():
                         "entry_candle_ts": None,
                         "stop_order_id": None,
                         "entry_time": None,
+                        "leverage": None,
+                        "margin": None,
+                        "notional": None,
                     }
                 else:
                     pos_state[sym]["side"] = exch_positions[sym]["side"]
                     pos_state[sym]["size"] = exch_positions[sym]["size"]
                     pos_state[sym]["entry_price"] = exch_positions[sym]["entry_price"]
+                    pos_state[sym]["leverage"] = exch_positions[sym]["leverage"]
+                    pos_state[sym]["margin"] = exch_positions[sym]["margin"]
+                    pos_state[sym]["notional"] = exch_positions[sym]["notional"]
 
             # --- TP 관리 (동적) --- #
             for sym in SYMBOLS:
@@ -346,12 +403,11 @@ def main():
                 bb_lower = float(curr["bb_lower"])
                 curr_price = float(curr["close"])
 
-                # 대시보드용 tp_price = 현재 볼린저
-                pos_state[sym]["tp_price"] = bb_upper * (1 - TP_OFFSET) if side == "long" else bb_lower * (1 + TP_OFFSET)
+                pos_state[sym]["tp_price"] = (
+                    bb_upper * (1 - TP_OFFSET) if side == "long" else bb_lower * (1 + TP_OFFSET)
+                )
 
-                # 실제 익절
                 if side == "long" and curr_price >= pos_state[sym]["tp_price"]:
-                    # 롱 익절
                     if pos_state[sym]["stop_order_id"]:
                         try:
                             exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
@@ -360,18 +416,26 @@ def main():
 
                     exch_now = sync_positions(exchange, SYMBOLS)[sym]
                     if exch_now["has_position"]:
-                        exchange.create_order(sym, "market", "sell", exch_now["size"], params={"tdMode": "cross"})
+                        exchange.create_order(
+                            sym, "market", "sell", exch_now["size"], params={"tdMode": "cross"}
+                        )
 
-                    entry_restrict[sym] = None  # "short_only"
+                    entry_restrict[sym] = None
                     pos_state[sym] = {
-                        "side": None, "size": 0, "entry_price": None,
-                        "stop_price": None, "tp_price": None,
-                        "entry_candle_ts": None, "stop_order_id": None,
+                        "side": None,
+                        "size": 0,
+                        "entry_price": None,
+                        "stop_price": None,
+                        "tp_price": None,
+                        "entry_candle_ts": None,
+                        "stop_order_id": None,
                         "entry_time": None,
+                        "leverage": None,
+                        "margin": None,
+                        "notional": None,
                     }
 
                 elif side == "short" and curr_price <= pos_state[sym]["tp_price"]:
-                    # 숏 익절
                     if pos_state[sym]["stop_order_id"]:
                         try:
                             exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
@@ -380,14 +444,23 @@ def main():
 
                     exch_now = sync_positions(exchange, SYMBOLS)[sym]
                     if exch_now["has_position"]:
-                        exchange.create_order(sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"})
+                        exchange.create_order(
+                            sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"}
+                        )
 
-                    entry_restrict[sym] = None  # "long_only"
+                    entry_restrict[sym] = None
                     pos_state[sym] = {
-                        "side": None, "size": 0, "entry_price": None,
-                        "stop_price": None, "tp_price": None,
-                        "entry_candle_ts": None, "stop_order_id": None,
+                        "side": None,
+                        "size": 0,
+                        "entry_price": None,
+                        "stop_price": None,
+                        "tp_price": None,
+                        "entry_candle_ts": None,
+                        "stop_order_id": None,
                         "entry_time": None,
+                        "leverage": None,
+                        "margin": None,
+                        "notional": None,
                     }
 
             # --- 신규 진입 --- #
@@ -411,15 +484,13 @@ def main():
                 entry_price = signal["entry_price"]
                 stop_price = signal["stop_price"]
 
-                # --- 진입가 vs 손절가 유효성 검사 ---
                 if side_signal == "long":
                     if stop_price >= entry_price:
-                        continue   # 비정상 SL → 진입 금지
+                        continue
                 elif side_signal == "short":
                     if stop_price <= entry_price:
-                        continue   # 비정상 SL → 진입 금지
+                        continue
 
-                # entry 제한 체크
                 if entry_restrict[sym] == "long_only" and side_signal != "long":
                     continue
                 if entry_restrict[sym] == "short_only" and side_signal != "short":
@@ -427,12 +498,14 @@ def main():
 
                 bb_upper = float(curr["bb_upper"])
                 bb_lower = float(curr["bb_lower"])
-                tp_price = bb_upper * (1 - TP_OFFSET) if side_signal == "long" else bb_lower * (1 + TP_OFFSET)
+                tp_price = (
+                    bb_upper * (1 - TP_OFFSET)
+                    if side_signal == "long"
+                    else bb_lower * (1 + TP_OFFSET)
+                )
 
-                # R 계산 (가격 차이 기준)
                 stop_diff = abs(entry_price - stop_price)
                 tp_diff = abs(entry_price - tp_price)
-
                 if stop_diff <= 0:
                     continue
 
@@ -444,7 +517,6 @@ def main():
                 if total <= 0:
                     continue
 
-                # 손절까지 퍼센트 (레버리지/리스크 계산용)
                 stop_pct = stop_diff / entry_price
 
                 amount, leverage, eff_lev = compute_order_size_equal_margin_and_risk(
@@ -453,42 +525,35 @@ def main():
                 if amount <= 0:
                     continue
 
-                # 주문
                 order_side = "buy" if side_signal == "long" else "sell"
                 sl_side = "sell" if side_signal == "long" else "buy"
 
-                # 심볼별 레버리지 동적 설정
                 # 소수점 레버리지 그대로 사용
                 lev_float = max(1.0, min(round(float(leverage), 2), float(MAX_LEVERAGE)))
-
                 try:
                     exchange.set_leverage(lev_float, sym, params={"mgnMode": "cross"})
                 except Exception:
                     pass
 
                 exchange.create_order(
-                    sym,
-                    "market",
-                    order_side,
-                    amount,
-                    params={"tdMode": "cross"},
+                    sym, "market", order_side, amount, params={"tdMode": "cross"}
                 )
 
-                # 체결 확인
                 time.sleep(0.3)
                 after = sync_positions(exchange, SYMBOLS)[sym]
                 actual_entry = after["entry_price"] or entry_price
                 actual_size = after["size"]
 
-                # pos_state 업데이트
                 pos_state[sym]["side"] = side_signal
                 pos_state[sym]["size"] = actual_size
                 pos_state[sym]["entry_price"] = actual_entry
                 pos_state[sym]["stop_price"] = stop_price
                 pos_state[sym]["entry_time"] = datetime.now(timezone.utc)
-                pos_state[sym]["entry_candle_ts"] = curr_ts  # ★ 마커 표시용 저장
+                pos_state[sym]["entry_candle_ts"] = curr_ts
+                pos_state[sym]["leverage"] = after.get("leverage")
+                pos_state[sym]["margin"] = after.get("margin")
+                pos_state[sym]["notional"] = after.get("notional")
 
-                # SL 주문
                 try:
                     sl_order = exchange.create_order(
                         sym,
@@ -523,7 +588,6 @@ def main():
                         "high": float(row.high),
                         "low": float(row.low),
                         "close": float(row.close),
-                        # 인디케이터 값들 같이 전달
                         "bb_upper": _safe_float(getattr(row, "bb_upper", None)),
                         "bb_lower": _safe_float(getattr(row, "bb_lower", None)),
                         "bb_mid": _safe_float(getattr(row, "bb_mid", None)),
