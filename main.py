@@ -287,9 +287,9 @@ def main():
             for sym in SYMBOLS:
                 if not exch_positions[sym]["has_position"]:
                     if pos_state[sym]["side"] == "long":
-                        entry_restrict[sym] = "short_only"
+                        entry_restrict[sym] = None # "short_only"
                     elif pos_state[sym]["side"] == "short":
-                        entry_restrict[sym] = "long_only"
+                        entry_restrict[sym] = None # "long_only"
 
                     pos_state[sym] = {
                         "side": None,
