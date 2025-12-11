@@ -36,7 +36,7 @@ TP_OFFSET  = 0.004 # 0.4%: 익절가 여유폭
 
 R_THRESHOLD = 1.2  # R >= 1.0 인 경우에만 진입
 
-MIN_DELTA = 10.0
+MIN_DELTA = 15.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
