@@ -24,7 +24,7 @@ SYMBOLS = [
 TIMEFRAME = "1h"
 
 RISK_PER_TRADE = 0.033
-MAX_LEVERAGE   = 10
+MAX_LEVERAGE   = 20
 LOOP_INTERVAL  = 3
 
 CCI_PERIOD = 14
@@ -458,9 +458,11 @@ def main():
                 sl_side = "sell" if side_signal == "long" else "buy"
 
                 # 심볼별 레버리지 동적 설정
-                lev_int = max(1, min(int(round(leverage)), MAX_LEVERAGE))
+                # 소수점 레버리지 그대로 사용
+                lev_float = max(1.0, min(round(float(leverage), 2), float(MAX_LEVERAGE)))
+
                 try:
-                    exchange.set_leverage(lev_int, sym, params={"mgnMode": "cross"})
+                    exchange.set_leverage(lev_float, sym, params={"mgnMode": "cross"})
                 except Exception:
                     pass
 
