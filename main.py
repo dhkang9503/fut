@@ -140,11 +140,13 @@ def compute_order_size_equal_margin_and_risk(exchange, symbol, entry_price, equi
     - 포지션당 증거금: equity_total / MARGIN_DIVISOR (3.5분할)
     - 손절 도달 시 손실: equity_total * RISK_PER_TRADE
     - 손절 거리(stop_pct)에 맞춰 레버리지를 동적으로 조정
+    - 계약 단위(정수)로 내림한 뒤, 실제 노션 기준으로 레버리지를 다시 맞춰
+      실제 증거금이 margin_per_pos에 최대한 근접하도록 조정
     """
     if entry_price <= 0 or stop_pct <= 0 or equity_total <= 0:
         return 0, 0.0, 0.0
 
-    # 포지션당 사용할 증거금 (cross 기준 목표치)
+    # 포지션당 사용할 목표 증거금
     margin_per_pos = equity_total / MARGIN_DIVISOR
 
     # 손절 시 목표 손실 금액
@@ -153,27 +155,37 @@ def compute_order_size_equal_margin_and_risk(exchange, symbol, entry_price, equi
     # 손절 거리까지 갔을 때 risk_per_pos 만큼 잃으려면 필요한 노션
     target_notional_for_risk = risk_per_pos / stop_pct  # N_target
 
-    # 그 노션을 margin_per_pos로 만들기 위한 레버리지
-    raw_leverage = target_notional_for_risk / margin_per_pos
-    if raw_leverage < 1:
-        raw_leverage = 1.0
-    if raw_leverage > MAX_LEVERAGE:
-        raw_leverage = float(MAX_LEVERAGE)
+    # 레버리지 제한 고려한 노션 범위
+    min_notional = margin_per_pos * 1.0
+    max_notional = margin_per_pos * MAX_LEVERAGE
 
-    # 실제 사용할 노션 = margin * leverage
-    notional = margin_per_pos * raw_leverage
+    # 노션을 제한 범위 안으로 클램프
+    notional = max(min(target_notional_for_risk, max_notional), min_notional)
 
     # 심볼별 계약 단위
     market = exchange.market(symbol)
     contract_size = market.get("contractSize") or float(market["info"].get("ctVal", 1))
     notional_per_contract = entry_price * contract_size
 
+    # 계약 수량: 정수 계약 단위로 내림
     amount = math.floor(notional / notional_per_contract)
     if amount <= 0:
         return 0, 0.0, 0.0
 
-    effective_leverage = (amount * notional_per_contract) / equity_total
-    return amount, raw_leverage, effective_leverage
+    # 실제 체결 기준 노션
+    actual_notional = amount * notional_per_contract
+
+    # 이 노션과 margin_per_pos로부터 레버리지 재계산
+    actual_leverage = actual_notional / margin_per_pos
+    if actual_leverage < 1.0:
+        actual_leverage = 1.0
+    if actual_leverage > MAX_LEVERAGE:
+        actual_leverage = float(MAX_LEVERAGE)
+
+    # 전체 계좌 대비 실제 레버리지
+    effective_leverage = actual_notional / equity_total
+
+    return amount, actual_leverage, effective_leverage
 
 
 def sync_positions(exchange, symbols):
@@ -223,7 +235,7 @@ def sync_positions(exchange, symbols):
         except Exception:
             leverage = None
 
-        # 증거금 (가능한 필드에서 추출)
+        # 증거금
         margin_raw = (
             p.get("initialMargin")
             or p.get("margin")
@@ -264,10 +276,9 @@ def detect_cci_signal(df):
     if df is None or len(df) < CCI_PERIOD + 3:
         return None
 
-    # 최근 마감된 2개 + 그 이전 1개 (총 3개 캔들)
-    curr  = df.iloc[-1]  # 방금 마감된 캔들
-    prev1 = df.iloc[-2]  # 그 이전
-    prev2 = df.iloc[-3]  # 그 이전
+    curr  = df.iloc[-1]
+    prev1 = df.iloc[-2]
+    prev2 = df.iloc[-3]
 
     cci_curr  = float(curr.get("cci", float("nan")))
     cci_prev1 = float(prev1.get("cci", float("nan")))
@@ -283,12 +294,10 @@ def detect_cci_signal(df):
     side = None
     stop_price = None
 
-    # 롱 진입
     if (cci_prev1 < -100) and (cci_curr > cci_prev1) and (cci_curr - cci_prev1 >= MIN_DELTA):
         side = "long"
         stop_price = float(prev1["low"]) * (1 - SL_OFFSET)
 
-    # 숏 진입
     elif (cci_prev1 > 100) and (cci_curr < cci_prev1) and (cci_prev1 - cci_curr >= MIN_DELTA):
         side = "short"
         stop_price = float(prev1["high"]) * (1 + SL_OFFSET)
@@ -528,7 +537,6 @@ def main():
                 order_side = "buy" if side_signal == "long" else "sell"
                 sl_side = "sell" if side_signal == "long" else "buy"
 
-                # 소수점 레버리지 그대로 사용
                 lev_float = max(1.0, min(round(float(leverage), 2), float(MAX_LEVERAGE)))
                 try:
                     exchange.set_leverage(lev_float, sym, params={"mgnMode": "cross"})
