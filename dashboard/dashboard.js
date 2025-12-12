@@ -65,7 +65,7 @@ function fmtDateTime(value) {
     const mm = String(kst.getMinutes()).padStart(2, "0");
     const ss = String(kst.getSeconds()).padStart(2, "0");
 
-    return `${yyyy}/${MM}/${DD} ${hh}:${mm}:${ss}`;
+    return `${yyyy}/${MM}/${DD}<br/>${hh}:${mm}:${ss}`;
 }
 
 function renderEntryRestriction(entryRestrict) {
