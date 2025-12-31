@@ -48,6 +48,155 @@ BE_PCT  = 0.0011  # 수수료권(0.11%)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
+# ===== 포지션 히스토리 저장(JSONL) =====
+POSITION_HISTORY_PATH = "/app/position_history.jsonl"
+POSITION_HISTORY_LIMIT = 10
+
+
+def _tail_lines(path: str, n: int = 10, block_size: int = 8192):
+    """파일 끝에서 n줄을 효율적으로 읽는다(JSONL tail 용)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            if end == 0:
+                return []
+            data = b""
+            pos = end
+            lines = []
+            while pos > 0 and len(lines) <= n:
+                read_size = min(block_size, pos)
+                pos -= read_size
+                f.seek(pos)
+                data = f.read(read_size) + data
+                lines = data.splitlines()
+            return [ln.decode("utf-8", errors="ignore") for ln in lines[-n:]]
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+
+def load_position_history_cache(path: str, limit: int = POSITION_HISTORY_LIMIT):
+    """재시작 내성: 히스토리 파일의 마지막 limit줄만 읽어서 캐시에 로드."""
+    cache = []
+    for line in _tail_lines(path, n=limit):
+        line = (line or "").strip()
+        if not line:
+            continue
+        try:
+            cache.append(json.loads(line))
+        except Exception:
+            continue
+    # entry_time desc 정렬(안전)
+    try:
+        cache.sort(key=lambda r: r.get("entry_time") or "", reverse=True)
+    except Exception:
+        pass
+    return cache[:limit]
+
+
+def append_position_history(cache: list, record: dict, path: str = POSITION_HISTORY_PATH, limit: int = POSITION_HISTORY_LIMIT):
+    """파일에 1줄 append + 메모리 캐시에도 반영(최근 limit개 유지)."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+
+    line = json.dumps(record, ensure_ascii=False)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+    cache.append(record)
+    # entry_time desc 기준 최근 limit개 유지
+    try:
+        cache.sort(key=lambda r: r.get("entry_time") or "", reverse=True)
+    except Exception:
+        pass
+    del cache[limit:]
+    return cache
+
+
+def _get_contract_size(exchange, symbol: str) -> float:
+    try:
+        market = exchange.market(symbol)
+        return float(market.get("contractSize") or market["info"].get("ctVal", 1))
+    except Exception:
+        return 1.0
+
+
+def _iso(dt):
+    if dt is None:
+        return None
+    if isinstance(dt, datetime):
+        return dt.isoformat()
+    return str(dt)
+
+
+def _infer_exit_reason(p: dict) -> str:
+    """TP/SL/BE/MANUAL/UNKNOWN 중 추정."""
+    try:
+        if p.get("be_sl_applied"):
+            ep = p.get("entry_price")
+            sp = p.get("stop_price")
+            if ep and sp and ep > 0:
+                if abs(float(sp) - float(ep)) / float(ep) <= (BE_PCT * 1.5):
+                    return "BE"
+        if p.get("stop_order_id"):
+            return "SL"
+        return "MANUAL"
+    except Exception:
+        return "UNKNOWN"
+
+
+def _build_history_record(exchange, symbol: str, p: dict, close_price, close_time: datetime, exit_reason: str):
+    side = p.get("side")
+    entry_price = p.get("entry_price")
+    size = p.get("size") or 0
+    leverage = p.get("leverage")
+    entry_time = p.get("entry_time")
+    # '최종 손익비'는 최초 SL 기준이 더 직관적이라 init_stop_price를 우선 사용
+    init_stop_price = p.get("init_stop_price") if p.get("init_stop_price") is not None else p.get("stop_price")
+
+    cs = _get_contract_size(exchange, symbol)
+    pnl_usdt = None
+    final_rr = None
+    try:
+        if close_price is not None and entry_price is not None and size and side in ("long", "short"):
+            entry_price_f = float(entry_price)
+            close_price_f = float(close_price)
+            size_f = float(size)
+            if side == "long":
+                pnl_usdt = (close_price_f - entry_price_f) * size_f * cs
+            else:
+                pnl_usdt = (entry_price_f - close_price_f) * size_f * cs
+
+            if init_stop_price is not None:
+                risk = abs(entry_price_f - float(init_stop_price)) * size_f * cs
+                if risk > 0:
+                    final_rr = pnl_usdt / risk
+    except Exception:
+        pnl_usdt = None
+        final_rr = None
+
+    return {
+        "entry_time": _iso(entry_time),
+        "close_time": _iso(close_time),
+        "symbol": symbol,
+        "leverage": leverage,
+        "side": side,
+        "entry_price": entry_price,
+        "close_price": close_price,
+        "final_rr": final_rr,
+        "pnl_usdt": pnl_usdt,
+        "exit_reason": exit_reason,
+    }
+
+
+
 # ============== JSON 직렬화 ============== #
 def _serialize_pos_state(pos_state: dict):
     out = {}
@@ -62,13 +211,14 @@ def _serialize_pos_state(pos_state: dict):
     return out
 
 
-def save_state(pos_state, entry_restrict, last_signal, equity, ohlcv):
+def save_state(pos_state, entry_restrict, last_signal, equity, ohlcv, position_history=None):
     state = {
         "pos_state": _serialize_pos_state(pos_state),
         "entry_restrict": entry_restrict,
         "last_signal": last_signal,
         "equity": equity,
         "ohlcv": ohlcv,
+        "position_history": position_history or [],
         "timestamp": datetime.utcnow().isoformat(),
     }
     with open("/app/bot_state.json", "w") as f:
@@ -339,6 +489,7 @@ def main():
             "size": 0,
             "entry_price": None,
             "stop_price": None,
+            "init_stop_price": None,
             "tp_price": None,
             "entry_candle_ts": None,
             "stop_order_id": None,
@@ -353,6 +504,8 @@ def main():
 
     entry_restrict = {sym: None for sym in SYMBOLS}
     last_signal_candle_ts = {}
+    position_history_cache = load_position_history_cache(POSITION_HISTORY_PATH, POSITION_HISTORY_LIMIT)
+
 
     while True:
         try:
@@ -376,6 +529,18 @@ def main():
 
             for sym in SYMBOLS:
                 if not exch_positions[sym]["has_position"]:
+                    # (추가) 포지션이 사라진 경우(주로 SL/BE 또는 수동 청산) 히스토리 기록
+                    if pos_state[sym].get("side") is not None and (pos_state[sym].get("size") or 0) > 0:
+                        try:
+                            close_price = None
+                            if sym in data:
+                                close_price = float(data[sym][2]["close"])
+                            close_time = datetime.now(timezone.utc)
+                            exit_reason = _infer_exit_reason(pos_state[sym])
+                            rec = _build_history_record(exchange, sym, pos_state[sym], close_price, close_time, exit_reason)
+                            append_position_history(position_history_cache, rec)
+                        except Exception:
+                            pass
                     if pos_state[sym]["side"] == "long":
                         entry_restrict[sym] = None
                     elif pos_state[sym]["side"] == "short":
@@ -386,6 +551,7 @@ def main():
                         "size": 0,
                         "entry_price": None,
                         "stop_price": None,
+            "init_stop_price": None,
                         "tp_price": None,
                         "entry_candle_ts": None,
                         "stop_order_id": None,
@@ -486,10 +652,24 @@ def main():
                             pass
 
                     exch_now = sync_positions(exchange, SYMBOLS)[sym]
+                    close_order = {}
                     if exch_now["has_position"]:
-                        exchange.create_order(
+                        close_order = exchange.create_order(
                             sym, "market", "sell", exch_now["size"], params={"tdMode": "cross"}
                         )
+                    # (추가) TP 청산 히스토리 기록
+                    try:
+                        close_time = datetime.now(timezone.utc)
+                        _cp = None
+                        try:
+                            _cp = close_order.get("average") or close_order.get("price")
+                        except Exception:
+                            _cp = None
+                        close_price = float(_cp) if _cp is not None else curr_price
+                        rec = _build_history_record(exchange, sym, pos_state[sym], close_price, close_time, "TP")
+                        append_position_history(position_history_cache, rec)
+                    except Exception:
+                        pass
 
                     entry_restrict[sym] = None
                     pos_state[sym] = {
@@ -497,6 +677,7 @@ def main():
                         "size": 0,
                         "entry_price": None,
                         "stop_price": None,
+            "init_stop_price": None,
                         "tp_price": None,
                         "entry_candle_ts": None,
                         "stop_order_id": None,
@@ -515,10 +696,24 @@ def main():
                             pass
 
                     exch_now = sync_positions(exchange, SYMBOLS)[sym]
+                    close_order = {}
                     if exch_now["has_position"]:
-                        exchange.create_order(
+                        close_order = exchange.create_order(
                             sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"}
                         )
+                    # (추가) TP 청산 히스토리 기록
+                    try:
+                        close_time = datetime.now(timezone.utc)
+                        _cp = None
+                        try:
+                            _cp = close_order.get("average") or close_order.get("price")
+                        except Exception:
+                            _cp = None
+                        close_price = float(_cp) if _cp is not None else curr_price
+                        rec = _build_history_record(exchange, sym, pos_state[sym], close_price, close_time, "TP")
+                        append_position_history(position_history_cache, rec)
+                    except Exception:
+                        pass
 
                     entry_restrict[sym] = None
                     pos_state[sym] = {
@@ -526,6 +721,7 @@ def main():
                         "size": 0,
                         "entry_price": None,
                         "stop_price": None,
+            "init_stop_price": None,
                         "tp_price": None,
                         "entry_candle_ts": None,
                         "stop_order_id": None,
@@ -620,6 +816,7 @@ def main():
                 pos_state[sym]["size"] = actual_size
                 pos_state[sym]["entry_price"] = actual_entry
                 pos_state[sym]["stop_price"] = stop_price
+                pos_state[sym]["init_stop_price"] = stop_price
                 pos_state[sym]["entry_time"] = datetime.now(timezone.utc)
                 pos_state[sym]["entry_candle_ts"] = curr_ts
                 pos_state[sym]["leverage"] = after.get("leverage")
@@ -669,7 +866,7 @@ def main():
                 ohlcv_state[sym] = candles
 
             _, total = fetch_futures_equity(exchange)
-            save_state(pos_state, entry_restrict, last_signal_candle_ts, total, ohlcv_state)
+            save_state(pos_state, entry_restrict, last_signal_candle_ts, total, ohlcv_state, position_history_cache)
 
             time.sleep(LOOP_INTERVAL)
 
