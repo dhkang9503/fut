@@ -47,6 +47,7 @@ jobs:
             docker system prune -a -f || true;
             docker build -t fut-bot .;
             docker run -d --name fut-bot -p 8000:8000 \
+              -v ~/state:/app/state \
               -e OKX_API_KEY=${{ secrets.OKX_API_KEY }} \
               -e OKX_API_SECRET=${{ secrets.OKX_API_SECRET }} \
               -e OKX_API_PASSPHRASE=${{ secrets.OKX_API_PASSPHRASE }} \
@@ -55,4 +56,5 @@ jobs:
               -e BITGET_API_KEY=${{ secrets.BITGET_API_KEY }} \
               -e BITGET_API_SECRET=${{ secrets.BITGET_API_SECRET }} \
               -e BITGET_API_PASSPHRASE=${{ secrets.BITGET_API_PASSWORD }} \
-              fut-bot &
+              fut-bot &;
+            rm -rf ~/fut-bot;
