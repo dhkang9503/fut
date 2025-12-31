@@ -47,10 +47,124 @@ BE_PCT  = 0.0011  # 수수료권(0.11%)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# ===== 상태 파일(스냅샷) =====
+STATE_PATH = "/app/state/bot_state.json"
 
 # ===== 포지션 히스토리 저장(JSONL) =====
 POSITION_HISTORY_PATH = "/app/state/position_history.jsonl"
 POSITION_HISTORY_LIMIT = 10
+
+
+# =========================
+# 재시작 동기화 유틸
+# =========================
+def _parse_dt(s):
+    if not s:
+        return None
+    if isinstance(s, datetime):
+        return s
+    try:
+        dt = datetime.fromisoformat(str(s))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _default_pos_state():
+    """현재 코드의 pos_state 기본 구조를 그대로 반환."""
+    return {
+        sym: {
+            "side": None,
+            "size": 0,
+            "entry_price": None,
+            "stop_price": None,
+            "init_stop_price": None,
+            "tp_price": None,
+            "entry_candle_ts": None,
+            "stop_order_id": None,
+            "entry_time": None,
+            "leverage": None,
+            "margin": None,
+            "notional": None,
+            "be_sl_applied": False,  # BE SL 적용 여부
+        }
+        for sym in SYMBOLS
+    }
+
+
+def _hydrate_pos_state(saved_pos_state: dict):
+    """bot_state.json에 저장된 pos_state(직렬화된 dict)를 런타임 구조로 복원."""
+    pos_state = _default_pos_state()
+    if not isinstance(saved_pos_state, dict):
+        return pos_state
+
+    for sym in SYMBOLS:
+        s = saved_pos_state.get(sym)
+        if not isinstance(s, dict):
+            continue
+
+        for k in list(pos_state[sym].keys()):
+            if k in s:
+                pos_state[sym][k] = s.get(k)
+
+        pos_state[sym]["entry_time"] = _parse_dt(pos_state[sym].get("entry_time"))
+
+        try:
+            if pos_state[sym]["size"] is None:
+                pos_state[sym]["size"] = 0
+            else:
+                pos_state[sym]["size"] = float(pos_state[sym]["size"])
+        except Exception:
+            pos_state[sym]["size"] = 0
+
+    return pos_state
+
+
+def load_boot_state():
+    """
+    재시작 시 bot_state.json에서 다음 필드를 복구:
+      - pos_state
+      - position_history (최근 10개)
+      - entry_restrict
+      - last_signal (last_signal_candle_ts)
+    """
+    try:
+        if not os.path.exists(STATE_PATH):
+            return None
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            return None
+        state = json.loads(content)
+
+        boot = {}
+
+        boot["pos_state"] = _hydrate_pos_state(state.get("pos_state", {}))
+
+        ph = state.get("position_history", [])
+        boot["position_history"] = ph[:POSITION_HISTORY_LIMIT] if isinstance(ph, list) else []
+
+        er = state.get("entry_restrict", {})
+        boot["entry_restrict"] = {sym: er.get(sym) for sym in SYMBOLS} if isinstance(er, dict) else {sym: None for sym in SYMBOLS}
+
+        ls = state.get("last_signal", {})
+        if isinstance(ls, dict):
+            out = {}
+            for sym in SYMBOLS:
+                v = ls.get(sym)
+                try:
+                    out[sym] = int(v) if v is not None else None
+                except Exception:
+                    out[sym] = None
+            boot["last_signal"] = out
+        else:
+            boot["last_signal"] = {}
+
+        return boot
+    except Exception:
+        return None
 
 
 def _tail_lines(path: str, n: int = 10, block_size: int = 8192):
@@ -88,7 +202,6 @@ def load_position_history_cache(path: str, limit: int = POSITION_HISTORY_LIMIT):
             cache.append(json.loads(line))
         except Exception:
             continue
-    # entry_time desc 정렬(안전)
     try:
         cache.sort(key=lambda r: r.get("entry_time") or "", reverse=True)
     except Exception:
@@ -111,7 +224,6 @@ def append_position_history(cache: list, record: dict, path: str = POSITION_HIST
         pass
 
     cache.append(record)
-    # entry_time desc 기준 최근 limit개 유지
     try:
         cache.sort(key=lambda r: r.get("entry_time") or "", reverse=True)
     except Exception:
@@ -158,7 +270,6 @@ def _build_history_record(exchange, symbol: str, p: dict, close_price, close_tim
     size = p.get("size") or 0
     leverage = p.get("leverage")
     entry_time = p.get("entry_time")
-    # '최종 손익비'는 최초 SL 기준이 더 직관적이라 init_stop_price를 우선 사용
     init_stop_price = p.get("init_stop_price") if p.get("init_stop_price") is not None else p.get("stop_price")
 
     cs = _get_contract_size(exchange, symbol)
@@ -196,7 +307,6 @@ def _build_history_record(exchange, symbol: str, p: dict, close_price, close_tim
     }
 
 
-
 # ============== JSON 직렬화 ============== #
 def _serialize_pos_state(pos_state: dict):
     out = {}
@@ -221,7 +331,8 @@ def save_state(pos_state, entry_restrict, last_signal, equity, ohlcv, position_h
         "position_history": position_history or [],
         "timestamp": datetime.utcnow().isoformat(),
     }
-    with open("/app/state/bot_state.json", "w") as f:
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
@@ -267,7 +378,6 @@ def calculate_indicators(df):
     tp = (df["high"] + df["low"] + df["close"]) / 3  # hlc3
     sma_tp = tp.rolling(CCI_PERIOD).mean()
 
-    # mean deviation = sum(|x - mean(x)|)/length
     def _mean_dev(window):
         m = window.mean()
         return (window.sub(m).abs().sum()) / len(window)
@@ -275,7 +385,6 @@ def calculate_indicators(df):
     md = tp.rolling(CCI_PERIOD).apply(_mean_dev, raw=False)
     df["cci"] = (tp - sma_tp) / (0.015 * md)
 
-    # Bollinger Bands
     ma = df["close"].rolling(BB_PERIOD).mean()
     std = df["close"].rolling(BB_PERIOD).std(ddof=0)
     df["bb_mid"]   = ma
@@ -291,68 +400,37 @@ def fetch_futures_equity(exchange):
 
 
 def compute_order_size_equal_margin_and_risk(exchange, symbol, entry_price, equity_total, stop_pct):
-    """
-    - 포지션당 증거금: equity_total / MARGIN_DIVISOR (3.5분할)
-    - 손절 도달 시 손실: equity_total * RISK_PER_TRADE
-    - 손절 거리(stop_pct)에 맞춰 레버리지를 동적으로 조정
-    - 계약 단위(정수)로 내림한 뒤, 실제 노션 기준으로 레버리지를 다시 맞춰
-      실제 증거금이 margin_per_pos에 최대한 근접하도록 조정
-    """
     if entry_price <= 0 or stop_pct <= 0 or equity_total <= 0:
         return 0, 0.0, 0.0
 
-    # 포지션당 사용할 목표 증거금
     margin_per_pos = equity_total / MARGIN_DIVISOR
-
-    # 손절 시 목표 손실 금액
     risk_per_pos = equity_total * RISK_PER_TRADE
+    target_notional_for_risk = risk_per_pos / stop_pct
 
-    # 손절 거리까지 갔을 때 risk_per_pos 만큼 잃으려면 필요한 노션
-    target_notional_for_risk = risk_per_pos / stop_pct  # N_target
-
-    # 레버리지 제한 고려한 노션 범위
     min_notional = margin_per_pos * 1.0
     max_notional = margin_per_pos * MAX_LEVERAGE
-
-    # 노션을 제한 범위 안으로 클램프
     notional = max(min(target_notional_for_risk, max_notional), min_notional)
 
-    # 심볼별 계약 단위
     market = exchange.market(symbol)
     contract_size = market.get("contractSize") or float(market["info"].get("ctVal", 1))
     notional_per_contract = entry_price * contract_size
 
-    # 계약 수량: 정수 계약 단위로 내림
     amount = math.floor(notional / notional_per_contract)
     if amount <= 0:
         return 0, 0.0, 0.0
 
-    # 실제 체결 기준 노션
     actual_notional = amount * notional_per_contract
-
-    # 이 노션과 margin_per_pos로부터 레버리지 재계산
     actual_leverage = actual_notional / margin_per_pos
     if actual_leverage < 1.0:
         actual_leverage = 1.0
     if actual_leverage > MAX_LEVERAGE:
         actual_leverage = float(MAX_LEVERAGE)
 
-    # 전체 계좌 대비 실제 레버리지
     effective_leverage = actual_notional / equity_total
-
     return amount, actual_leverage, effective_leverage
 
 
 def sync_positions(exchange, symbols):
-    """
-    OKX 포지션에서:
-      - size (contracts)
-      - entry_price
-      - leverage
-      - margin
-      - notional (entry_price * size * contract_size)
-    까지 뽑아서 대시보드로 넘길 수 있게 구성
-    """
     result = {
         sym: {
             "has_position": False,
@@ -383,14 +461,12 @@ def sync_positions(exchange, symbols):
         side = p.get("side") or ("long" if contracts > 0 else "short")
         entry_price = float(p.get("entryPrice") or p.get("avgPrice") or 0)
 
-        # 레버리지
         lev_raw = p.get("leverage") or (p.get("info") or {}).get("lever") or None
         try:
             leverage = float(lev_raw) if lev_raw is not None else None
         except Exception:
             leverage = None
 
-        # 증거금
         margin_raw = (
             p.get("initialMargin")
             or p.get("margin")
@@ -402,13 +478,10 @@ def sync_positions(exchange, symbols):
         except Exception:
             margin = None
 
-        # 노션 = entry_price * size * contract_size
         notional = None
         try:
             market = exchange.market(sym)
-            contract_size = market.get("contractSize") or float(
-                market["info"].get("ctVal", 1)
-            )
+            contract_size = market.get("contractSize") or float(market["info"].get("ctVal", 1))
             if entry_price > 0:
                 notional = abs(contracts) * contract_size * entry_price
         except Exception:
@@ -426,7 +499,6 @@ def sync_positions(exchange, symbols):
     return result
 
 
-# ============== CCI 신호 ============== #
 def detect_cci_signal(df):
     if df is None or len(df) < CCI_PERIOD + 3:
         return None
@@ -452,7 +524,6 @@ def detect_cci_signal(df):
     if (cci_prev1 < -100) and (cci_curr > cci_prev1) and (cci_curr - cci_prev1 >= MIN_DELTA):
         side = "long"
         stop_price = float(prev1["low"]) * (1 - SL_OFFSET)
-
     elif (cci_prev1 > 100) and (cci_curr < cci_prev1) and (cci_prev1 - cci_curr >= MIN_DELTA):
         side = "short"
         stop_price = float(prev1["high"]) * (1 + SL_OFFSET)
@@ -460,12 +531,7 @@ def detect_cci_signal(df):
     if side is None or stop_price <= 0:
         return None
 
-    return {
-        "side": side,
-        "entry_price": entry_price,
-        "stop_price": stop_price,
-        "signal_ts": int(curr["ts"]),
-    }
+    return {"side": side, "entry_price": entry_price, "stop_price": stop_price, "signal_ts": int(curr["ts"])}
 
 
 def _safe_float(v):
@@ -478,38 +544,30 @@ def _safe_float(v):
         return None
 
 
-# ============== 메인 루프 ============== #
 def main():
     exchange = init_exchange()
     logging.info("CCI + Bollinger 자동매매 (동적 TP + BB/CCI 대시보드 + 균등 증거금/리스크) 시작")
 
-    pos_state = {
-        sym: {
-            "side": None,
-            "size": 0,
-            "entry_price": None,
-            "stop_price": None,
-            "init_stop_price": None,
-            "tp_price": None,
-            "entry_candle_ts": None,
-            "stop_order_id": None,
-            "entry_time": None,
-            "leverage": None,
-            "margin": None,
-            "notional": None,
-            "be_sl_applied": False,  # 추가: BE SL 적용 여부
-        }
-        for sym in SYMBOLS
-    }
-
+    pos_state = _default_pos_state()
     entry_restrict = {sym: None for sym in SYMBOLS}
     last_signal_candle_ts = {}
     position_history_cache = load_position_history_cache(POSITION_HISTORY_PATH, POSITION_HISTORY_LIMIT)
 
+    boot = load_boot_state()
+    if boot:
+        try:
+            pos_state = boot.get("pos_state", pos_state)
+            entry_restrict = boot.get("entry_restrict", entry_restrict)
+            last_signal_candle_ts = boot.get("last_signal", last_signal_candle_ts) or {}
+            ph = boot.get("position_history", [])
+            if isinstance(ph, list) and ph:
+                position_history_cache = ph[:POSITION_HISTORY_LIMIT]
+            logging.info("재시작 동기화 완료: pos_state/entry_restrict/last_signal/position_history 복구")
+        except Exception:
+            pass
 
     while True:
         try:
-            # --- OHLCV & 지표 --- #
             data = {}
             for sym in SYMBOLS:
                 df = fetch_ohlcv_df(exchange, sym, TIMEFRAME, 200)
@@ -524,12 +582,10 @@ def main():
                 time.sleep(LOOP_INTERVAL)
                 continue
 
-            # --- 포지션 동기화 --- #
             exch_positions = sync_positions(exchange, SYMBOLS)
 
             for sym in SYMBOLS:
                 if not exch_positions[sym]["has_position"]:
-                    # (추가) 포지션이 사라진 경우(주로 SL/BE 또는 수동 청산) 히스토리 기록
                     if pos_state[sym].get("side") is not None and (pos_state[sym].get("size") or 0) > 0:
                         try:
                             close_price = None
@@ -541,6 +597,7 @@ def main():
                             append_position_history(position_history_cache, rec)
                         except Exception:
                             pass
+
                     if pos_state[sym]["side"] == "long":
                         entry_restrict[sym] = None
                     elif pos_state[sym]["side"] == "short":
@@ -551,7 +608,7 @@ def main():
                         "size": 0,
                         "entry_price": None,
                         "stop_price": None,
-            "init_stop_price": None,
+                        "init_stop_price": None,
                         "tp_price": None,
                         "entry_candle_ts": None,
                         "stop_order_id": None,
@@ -569,7 +626,6 @@ def main():
                     pos_state[sym]["margin"] = exch_positions[sym]["margin"]
                     pos_state[sym]["notional"] = exch_positions[sym]["notional"]
 
-            # --- TP 관리 (동적) --- #
             for sym in SYMBOLS:
                 if sym not in data:
                     continue
@@ -585,11 +641,8 @@ def main():
                 bb_lower = float(curr["bb_lower"])
                 curr_price = float(curr["close"])
 
-                pos_state[sym]["tp_price"] = (
-                    bb_upper * (1 - TP_OFFSET) if side == "long" else bb_lower * (1 + TP_OFFSET)
-                )
+                pos_state[sym]["tp_price"] = (bb_upper * (1 - TP_OFFSET) if side == "long" else bb_lower * (1 + TP_OFFSET))
 
-                # ====== (추가) 조건부 BE SL: 기대손익비<=0.6 & 가격이 수수료(0.1%)~TP 사이 ====== #
                 try:
                     if not pos_state[sym].get("be_sl_applied", False):
                         entry_price = pos_state[sym].get("entry_price")
@@ -604,14 +657,14 @@ def main():
 
                                 if R_now <= BE_R_THRESHOLD:
                                     if side == "long":
-                                        fee_line = entry_price * (1 + FEE_PCT)   # +0.1%
-                                        be_sl    = entry_price * (1 + BE_PCT)    # +0.11%
+                                        fee_line = entry_price * (1 + FEE_PCT)
+                                        be_sl    = entry_price * (1 + BE_PCT)
                                         in_range = (fee_line <= curr_price <= tp_price)
                                         sl_side = "sell"
                                         better_than_current = (stop_price < be_sl)
                                     else:
-                                        fee_line = entry_price * (1 - FEE_PCT)   # -0.1%
-                                        be_sl    = entry_price * (1 - BE_PCT)    # -0.11%
+                                        fee_line = entry_price * (1 - FEE_PCT)
+                                        be_sl    = entry_price * (1 - BE_PCT)
                                         in_range = (tp_price <= curr_price <= fee_line)
                                         sl_side = "buy"
                                         better_than_current = (stop_price > be_sl)
@@ -625,15 +678,8 @@ def main():
 
                                         try:
                                             sl_order = exchange.create_order(
-                                                sym,
-                                                "market",
-                                                sl_side,
-                                                size,
-                                                params={
-                                                    "tdMode": "cross",
-                                                    "reduceOnly": True,
-                                                    "stopLossPrice": be_sl,
-                                                },
+                                                sym, "market", sl_side, size,
+                                                params={"tdMode": "cross", "reduceOnly": True, "stopLossPrice": be_sl},
                                             )
                                             pos_state[sym]["stop_order_id"] = sl_order.get("id")
                                             pos_state[sym]["stop_price"] = be_sl
@@ -642,7 +688,6 @@ def main():
                                             pass
                 except Exception:
                     pass
-                # ============================================================================== #
 
                 if side == "long" and curr_price >= pos_state[sym]["tp_price"]:
                     if pos_state[sym]["stop_order_id"]:
@@ -654,10 +699,8 @@ def main():
                     exch_now = sync_positions(exchange, SYMBOLS)[sym]
                     close_order = {}
                     if exch_now["has_position"]:
-                        close_order = exchange.create_order(
-                            sym, "market", "sell", exch_now["size"], params={"tdMode": "cross"}
-                        )
-                    # (추가) TP 청산 히스토리 기록
+                        close_order = exchange.create_order(sym, "market", "sell", exch_now["size"], params={"tdMode": "cross"})
+
                     try:
                         close_time = datetime.now(timezone.utc)
                         _cp = None
@@ -672,21 +715,7 @@ def main():
                         pass
 
                     entry_restrict[sym] = None
-                    pos_state[sym] = {
-                        "side": None,
-                        "size": 0,
-                        "entry_price": None,
-                        "stop_price": None,
-            "init_stop_price": None,
-                        "tp_price": None,
-                        "entry_candle_ts": None,
-                        "stop_order_id": None,
-                        "entry_time": None,
-                        "leverage": None,
-                        "margin": None,
-                        "notional": None,
-                        "be_sl_applied": False,
-                    }
+                    pos_state[sym] = _default_pos_state()[sym]
 
                 elif side == "short" and curr_price <= pos_state[sym]["tp_price"]:
                     if pos_state[sym]["stop_order_id"]:
@@ -698,10 +727,8 @@ def main():
                     exch_now = sync_positions(exchange, SYMBOLS)[sym]
                     close_order = {}
                     if exch_now["has_position"]:
-                        close_order = exchange.create_order(
-                            sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"}
-                        )
-                    # (추가) TP 청산 히스토리 기록
+                        close_order = exchange.create_order(sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"})
+
                     try:
                         close_time = datetime.now(timezone.utc)
                         _cp = None
@@ -716,23 +743,8 @@ def main():
                         pass
 
                     entry_restrict[sym] = None
-                    pos_state[sym] = {
-                        "side": None,
-                        "size": 0,
-                        "entry_price": None,
-                        "stop_price": None,
-            "init_stop_price": None,
-                        "tp_price": None,
-                        "entry_candle_ts": None,
-                        "stop_order_id": None,
-                        "entry_time": None,
-                        "leverage": None,
-                        "margin": None,
-                        "notional": None,
-                        "be_sl_applied": False,
-                    }
+                    pos_state[sym] = _default_pos_state()[sym]
 
-            # --- 신규 진입 --- #
             for sym in SYMBOLS:
                 if sym not in data:
                     continue
@@ -753,12 +765,10 @@ def main():
                 entry_price = signal["entry_price"]
                 stop_price = signal["stop_price"]
 
-                if side_signal == "long":
-                    if stop_price >= entry_price:
-                        continue
-                elif side_signal == "short":
-                    if stop_price <= entry_price:
-                        continue
+                if side_signal == "long" and stop_price >= entry_price:
+                    continue
+                if side_signal == "short" and stop_price <= entry_price:
+                    continue
 
                 if entry_restrict[sym] == "long_only" and side_signal != "long":
                     continue
@@ -767,11 +777,7 @@ def main():
 
                 bb_upper = float(curr["bb_upper"])
                 bb_lower = float(curr["bb_lower"])
-                tp_price = (
-                    bb_upper * (1 - TP_OFFSET)
-                    if side_signal == "long"
-                    else bb_lower * (1 + TP_OFFSET)
-                )
+                tp_price = (bb_upper * (1 - TP_OFFSET) if side_signal == "long" else bb_lower * (1 + TP_OFFSET))
 
                 stop_diff = abs(entry_price - stop_price)
                 tp_diff = abs(entry_price - tp_price)
@@ -782,15 +788,13 @@ def main():
                 if R < R_THRESHOLD:
                     continue
 
-                free, total = fetch_futures_equity(exchange)
+                _, total = fetch_futures_equity(exchange)
                 if total <= 0:
                     continue
 
                 stop_pct = stop_diff / entry_price
 
-                amount, leverage, eff_lev = compute_order_size_equal_margin_and_risk(
-                    exchange, sym, entry_price, total, stop_pct
-                )
+                amount, leverage, eff_lev = compute_order_size_equal_margin_and_risk(exchange, sym, entry_price, total, stop_pct)
                 if amount <= 0:
                     continue
 
@@ -803,9 +807,7 @@ def main():
                 except Exception:
                     pass
 
-                exchange.create_order(
-                    sym, "market", order_side, amount, params={"tdMode": "cross"}
-                )
+                exchange.create_order(sym, "market", order_side, amount, params={"tdMode": "cross"})
 
                 time.sleep(0.3)
                 after = sync_positions(exchange, SYMBOLS)[sym]
@@ -826,15 +828,8 @@ def main():
 
                 try:
                     sl_order = exchange.create_order(
-                        sym,
-                        "market",
-                        sl_side,
-                        actual_size,
-                        params={
-                            "tdMode": "cross",
-                            "reduceOnly": True,
-                            "stopLossPrice": stop_price,
-                        },
+                        sym, "market", sl_side, actual_size,
+                        params={"tdMode": "cross", "reduceOnly": True, "stopLossPrice": stop_price},
                     )
                     pos_state[sym]["stop_order_id"] = sl_order.get("id")
                 except Exception:
@@ -843,7 +838,6 @@ def main():
                 last_signal_candle_ts[sym] = curr_ts
                 entry_restrict[sym] = None
 
-            # --- 대시보드용 OHLCV + 인디케이터 저장 --- #
             ohlcv_state = {}
             for sym in SYMBOLS:
                 if sym not in data:
