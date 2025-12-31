@@ -56,5 +56,4 @@ jobs:
               -e BITGET_API_KEY=${{ secrets.BITGET_API_KEY }} \
               -e BITGET_API_SECRET=${{ secrets.BITGET_API_SECRET }} \
               -e BITGET_API_PASSPHRASE=${{ secrets.BITGET_API_PASSWORD }} \
-              fut-bot &;
-            rm -rf ~/fut-bot;
+              fut-bot &
