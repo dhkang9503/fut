@@ -49,7 +49,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 
 # ===== 포지션 히스토리 저장(JSONL) =====
-POSITION_HISTORY_PATH = "/app/position_history.jsonl"
+POSITION_HISTORY_PATH = "/app/state/position_history.jsonl"
 POSITION_HISTORY_LIMIT = 10
 
 
@@ -221,7 +221,7 @@ def save_state(pos_state, entry_restrict, last_signal, equity, ohlcv, position_h
         "position_history": position_history or [],
         "timestamp": datetime.utcnow().isoformat(),
     }
-    with open("/app/bot_state.json", "w") as f:
+    with open("/app/state/bot_state.json", "w") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
