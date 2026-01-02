@@ -35,7 +35,7 @@ SL_OFFSET  = 0.01  # 1%: 스톱로스 여유폭
 TP_OFFSET  = 0.004 # 0.4%: 익절가 여유폭
 
 R_THRESHOLD = 1.2  # R >= 1.0 인 경우에만 진입
-MIN_DELTA   = 16.0
+MIN_DELTA   = 20.0
 
 # 포지션당 사용할 증거금 비율: 전체 계좌를 3.5등분
 MARGIN_DIVISOR = 3.5
