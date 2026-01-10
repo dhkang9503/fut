@@ -33,7 +33,7 @@
       <h2 class="text-xl font-semibold mb-2">📊 실시간 캔들 차트 (1h, 심볼별)</h2>
       <div class="space-y-6">
         <div>
-          <div class="text-sm text-gray-300 mb-1">ETH/USDT:USDT</div>
+          <div class="text-sm text-gray-300 mb-1">AVAX/USDT:USDT</div>
           <div class="w-full h-[220px] bg-gray-900 rounded-md">
             <canvas id="chart-btc" class="w-full h-full"></canvas>
           </div>
@@ -51,7 +51,7 @@
           </div>
         </div>
         <div>
-          <div class="text-sm text-gray-300 mb-1">XRP/USDT:USDT</div>
+          <div class="text-sm text-gray-300 mb-1">SOL/USDT:USDT</div>
           <div class="w-full h-[220px] bg-gray-900 rounded-md">
             <canvas id="chat-sol" class="w-full h-full"></canvas>
           </div>
@@ -68,14 +68,14 @@
       <div id="position" class="text-xs sm:text-sm"></div>
     </div>
 
-    <!-- 최근 로그 -->
+    <!-- 포지션 히스토리 -->
     <div class="bg-gray-800 p-4 rounded-lg mb-4">
-      <h2 class="text-xl font-semibold mb-2">최근 로그</h2>
-      <pre id="logs" class="whitespace-pre-wrap text-xs sm:text-sm h-[160px] overflow-y-auto"></pre>
+      <h2 class="text-xl font-semibold mb-2">포지션 히스토리</h2>
+      <div id="logs" class="text-xs sm:text-sm h-[220px] overflow-y-auto overflow-x-auto"></div>
     </div>
   </div>
 
-  <script src="/static/dashboard.js"></script>
+  <script src="/static/dashboard.js?v=20251231_01"></script>
 
   <!-- 모바일에서 콘솔 보기용 -->
   <script src="https://cdn.jsdelivr.net/npm/eruda"></script>
