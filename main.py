@@ -723,7 +723,7 @@ def main():
                 except Exception:
                     pass
 
-                if (side == "long" and curr_price >= pos_state[sym]["tp_price"]) or (side == "long" and (curr_cci >= 110) and (prev_cci - curr_cci >= 15)):
+                if (side == "long" and curr_price >= pos_state[sym]["tp_price"]) or (side == "long" and (prev_cci >= 110) and (prev_cci - curr_cci >= 15)):
                     if pos_state[sym]["stop_order_id"]:
                         try:
                             exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
@@ -752,7 +752,7 @@ def main():
                     symbol_risk[sym] = BASE_RISK
                     pos_state[sym] = _default_pos_state()[sym]
 
-                elif (side == "short" and curr_price <= pos_state[sym]["tp_price"]) or (side == "short" and (curr_cci <= -110) and (curr_cci - prev_cci >= 15)):
+                elif (side == "short" and curr_price <= pos_state[sym]["tp_price"]) or (side == "short" and (prev_cci <= -110) and (curr_cci - prev_cci >= 15)):
                     if pos_state[sym]["stop_order_id"]:
                         try:
                             exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
