@@ -35,7 +35,7 @@ BB_PERIOD  = 20
 BB_K       = 2.0
 
 SL_OFFSET  = 0.01  # 1%: 스톱로스 여유폭
-TP_OFFSET  = 0.004 # 0.4%: 익절가 여유폭
+TP_OFFSET  = 0.005 # 0.4%: 익절가 여유폭
 
 R_THRESHOLD = 1.2  # R >= 1.0 인 경우에만 진입
 MIN_DELTA   = 20.0
@@ -672,6 +672,7 @@ def main():
                 bb_upper = float(curr["bb_upper"])
                 bb_lower = float(curr["bb_lower"])
                 curr_price = float(curr["close"])
+                curr_cci = float(curr["cci"])
 
                 pos_state[sym]["tp_price"] = (bb_upper * (1 - TP_OFFSET) if side == "long" else bb_lower * (1 + TP_OFFSET))
 
@@ -721,7 +722,7 @@ def main():
                 except Exception:
                     pass
 
-                if side == "long" and curr_price >= pos_state[sym]["tp_price"]:
+                if (side == "long" and curr_price >= pos_state[sym]["tp_price"]) or (side == "long" and curr_cci >= 100):
                     if pos_state[sym]["stop_order_id"]:
                         try:
                             exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
@@ -750,7 +751,7 @@ def main():
                     symbol_risk[sym] = BASE_RISK
                     pos_state[sym] = _default_pos_state()[sym]
 
-                elif side == "short" and curr_price <= pos_state[sym]["tp_price"]:
+                elif (side == "short" and curr_price <= pos_state[sym]["tp_price"]) or (side == "short" and curr_cci <= -100):
                     if pos_state[sym]["stop_order_id"]:
                         try:
                             exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
