@@ -77,7 +77,7 @@ function renderSymbolRisk(symbolRisk) {
     const lines = SYMBOLS.map(sym => {
         const risk = symbolRisk[sym];
         const riskPct = risk ? (Number(risk) * 100).toFixed(2) : "0.00";
-        return `${sym}:  ${riskPct}%`;
+        return `${sym.padEnd(16)}:  ${riskPct}%`;
     });
     entryRestrictEl.textContent = lines.join("\n");
 }
@@ -795,9 +795,6 @@ function connectWebSocket() {
 
 function handleStateUpdate(state) {
     if (!state) return;
-
-    console.log("State received:", state);
-    console.log("Symbol risk:", state.symbol_risk);
 
     if (equityEl) {
         equityEl.textContent = fmtUSDT(state.equity);
