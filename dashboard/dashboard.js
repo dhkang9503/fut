@@ -796,6 +796,9 @@ function connectWebSocket() {
 function handleStateUpdate(state) {
     if (!state) return;
 
+    console.log("State received:", state);
+    console.log("Symbol risk:", state.symbol_risk);
+
     if (equityEl) {
         equityEl.textContent = fmtUSDT(state.equity);
     }
