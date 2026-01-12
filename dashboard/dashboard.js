@@ -241,6 +241,7 @@ function renderPosition(posState) {
     posEl.innerHTML = html;
 }
 
+
 function renderPositionHistory(positionHistory) {
     if (!logsEl) return;
 
@@ -298,11 +299,12 @@ function renderPositionHistory(positionHistory) {
         const pnl = Number(r.pnl_usdt);
         const pnlText = fmtSignedUSDT(pnl);
 
+        // TP / SL 과 동일한 톤
         const pnlColor =
             pnl > 0
-                ? "text-green-400 font-semibold"
+                ? "text-teal-300"
                 : pnl < 0
-                ? "text-red-400 font-semibold"
+                ? "text-red-300"
                 : "text-gray-300";
 
         html += `
@@ -328,7 +330,6 @@ function renderPositionHistory(positionHistory) {
 
     logsEl.innerHTML = html;
 }
-
 
 // =====================
 // 캔들 매핑
