@@ -21,24 +21,27 @@ SYMBOLS = [
     "SOL/USDT:USDT",
 ]
 
-TIMEFRAME = "1h"
+# === 15m 전환 ===
+TIMEFRAME = "15m"
 
-BASE_RISK = 0.021
-REDUCED_RISK = 0.0105
+# === 15m용 리스크/필터 프리셋 ===
+BASE_RISK = 0.007
+REDUCED_RISK = 0.0035
 
 RISK_PER_TRADE = BASE_RISK
-MAX_LEVERAGE   = 13
+MAX_LEVERAGE   = 9
 LOOP_INTERVAL  = 3
 
 CCI_PERIOD = 14
 BB_PERIOD  = 20
 BB_K       = 2.0
 
-SL_OFFSET  = 0.01  # 1%: 스톱로스 여유폭
-TP_OFFSET  = 0.0045 # 0.4%: 익절가 여유폭
+# === 15m용 SL/TP 오프셋 ===
+SL_OFFSET  = 0.005   # 0.5%: 스톱로스 여유폭
+TP_OFFSET  = 0.003   # 0.3%: 익절가 여유폭
 
-R_THRESHOLD = 1.2  # R >= 1.0 인 경우에만 진입
-MIN_DELTA   = 20.0
+R_THRESHOLD = 1.6   # R >= 1.6 인 경우에만 진입
+MIN_DELTA   = 30.0
 
 # 포지션당 사용할 증거금 비율: 전체 계좌를 3.5등분
 MARGIN_DIVISOR = 3.5
@@ -524,12 +527,18 @@ def sync_positions(exchange, symbols):
 
 
 def detect_cci_signal(df):
-    if df is None or len(df) < CCI_PERIOD + 3:
+    """
+    15m 전환 핵심:
+    - 신호 판단은 '마감된 캔들' 기준으로만 수행
+    - 진행 중 캔들(df.iloc[-1])은 사용하지 않음
+    """
+    if df is None or len(df) < CCI_PERIOD + 4:
         return None
 
-    curr  = df.iloc[-1]
-    prev1 = df.iloc[-2]
-    prev2 = df.iloc[-3]
+    # 마감 캔들 기준
+    curr  = df.iloc[-2]  # closed candle
+    prev1 = df.iloc[-3]
+    prev2 = df.iloc[-4]
 
     cci_curr  = float(curr.get("cci", float("nan")))
     cci_prev1 = float(prev1.get("cci", float("nan")))
@@ -786,15 +795,16 @@ def main():
                     continue
 
                 df, prev, curr = data[sym]
-                curr_ts = int(curr["ts"])
-                if last_signal_candle_ts.get(sym) == curr_ts:
-                    continue
 
                 if pos_state[sym]["side"] is not None:
                     continue
 
                 signal = detect_cci_signal(df)
                 if not signal:
+                    continue
+
+                signal_ts = int(signal["signal_ts"])
+                if last_signal_candle_ts.get(sym) == signal_ts:
                     continue
 
                 side_signal = signal["side"]
@@ -825,7 +835,9 @@ def main():
 
                 stop_pct = stop_diff / entry_price
 
-                amount, leverage, eff_lev = compute_order_size_equal_margin_and_risk(exchange, sym, entry_price, total, stop_pct, symbol_risk[sym])
+                amount, leverage, eff_lev = compute_order_size_equal_margin_and_risk(
+                    exchange, sym, entry_price, total, stop_pct, symbol_risk[sym]
+                )
                 if amount <= 0:
                     continue
 
@@ -851,7 +863,10 @@ def main():
                 pos_state[sym]["stop_price"] = stop_price
                 pos_state[sym]["init_stop_price"] = stop_price
                 pos_state[sym]["entry_time"] = datetime.now(timezone.utc)
-                pos_state[sym]["entry_candle_ts"] = curr_ts
+
+                # === 15m 전환 핵심: 진입 근거가 된 '마감 캔들 ts'로 기록 ===
+                pos_state[sym]["entry_candle_ts"] = signal_ts
+
                 pos_state[sym]["leverage"] = after.get("leverage")
                 pos_state[sym]["margin"] = after.get("margin")
                 pos_state[sym]["notional"] = after.get("notional")
@@ -866,7 +881,8 @@ def main():
                 except Exception:
                     pos_state[sym]["stop_order_id"] = None
 
-                last_signal_candle_ts[sym] = curr_ts
+                # === 15m 전환 핵심: last_signal도 '마감 캔들 ts'로 저장 ===
+                last_signal_candle_ts[sym] = signal_ts
 
             ohlcv_state = {}
             for sym in SYMBOLS:
