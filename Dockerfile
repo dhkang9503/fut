@@ -20,4 +20,4 @@ EXPOSE 8000
 # 봇 + 대시보드 서버 둘 다 실행
 # - main.py : 자동매매 봇
 # - dashboard_server.py : FastAPI/uvicorn 서버 (포트 8000)
-CMD ["sh", "-c", "python main.py & uvicorn dashboard_server:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "python main.py"]
