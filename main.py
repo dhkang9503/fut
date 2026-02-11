@@ -1,918 +1,677 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+OKX USDT Perpetual (SWAP) bot
+Strategy (5m):
+- Universe: 24h quoteVolume TOP 50 (USDT-settled swap symbols)
+- Volatility contraction: BBW (Bollinger Band Width) on closed candle <= 30th percentile of last 100 closed candles
+- Trend filter: close above EMA20 => long-only; below EMA20 => short-only
+- Breakout trigger (closed candle):
+    Long: close > highest high of previous 20 closed candles AND volume >= 1.5 * avg(volume,20)
+    Short: close < lowest low of previous 20 closed candles AND volume >= 1.5 * avg(volume,20)
+- Pinbar filter: reject if (upper_wick + lower_wick) > 2 * body on breakout candle
+- Risk sizing: if SL hit, lose ~3% of total USDT equity (CROSS, leverage fixed 10x)
+- Execution: market entry + conditional stop-loss; TP is monitored and closed by market (reduceOnly)
+- Notifications: Telegram on entry / TP / SL-detected / errors
+
+Requirements:
+  pip install ccxt pandas numpy requests
+
+ENV:
+  OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+Optional:
+  OKX_SANDBOX=1   (use OKX sandbox)
+"""
+
 import os
 import time
 import math
+import json
 import logging
 from datetime import datetime, timezone
-import json
-import ccxt
-import pandas as pd
+from typing import Dict, Any, List, Optional, Tuple
 
-# ============== 설정값 ============== #
+import requests
+import numpy as np
+import pandas as pd
+import ccxt
+
+# =========================
+# Config
+# =========================
+TIMEFRAME = "5m"
+OHLCV_LIMIT = 220  # need >= 100 bbw history + buffers
+TOP_N = 50
+
+LEVERAGE = 10.0
+MARGIN_MODE = "cross"  # CROSS
+RISK_PCT_EQUITY = 0.03  # lose 3% equity if stop hit
+RR_TP = 1.5  # take profit at 1.5R
+
+EMA_LEN = 20
+BB_LEN = 20
+BB_K = 2.0
+BBW_LOOKBACK = 100
+BBW_PCTL = 30  # <= 30th percentile
+
+BOX_LEN = 20
+VOL_LEN = 20
+VOL_MULT = 1.5
+
+LOOP_INTERVAL_SEC = 6
+SCAN_EVERY_SEC = 30  # how often to refresh top-volume universe
+STATE_PATH = "./state_okx_breakout.json"
+
+# Safety caps (avoid oversized orders under cross)
+MAX_MARGIN_FRACTION = 0.95  # don't allocate more than 95% equity as margin across a single trade
+MIN_QUOTE_VOL_USDT = 1_000_000  # skip ultra-illiquid (optional)
+
+# Telegram
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# OKX API keys
 API_KEY = os.getenv("OKX_API_KEY", "")
 API_SECRET = os.getenv("OKX_API_SECRET", "")
 API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "")
 
-SYMBOLS = [
-    "AVAX/USDT:USDT",
-    "OKB/USDT:USDT",
-    "SOL/USDT:USDT",
-]
-
-# === 15m 전환 ===
-TIMEFRAME = "15m"
-
-# === 15m용 리스크/필터 프리셋 ===
-BASE_RISK = 0.02
-REDUCED_RISK = 0.02
-
-RISK_PER_TRADE = BASE_RISK
-MAX_LEVERAGE   = 9
-LOOP_INTERVAL  = 3
-
-CCI_PERIOD = 14
-BB_PERIOD  = 20
-BB_K       = 2.0
-
-# === 15m용 SL/TP 오프셋 ===
-SL_OFFSET  = 0.005   # 0.5%: 스톱로스 여유폭
-TP_OFFSET  = 0.003   # 0.3%: 익절가 여유폭
-
-R_THRESHOLD = 1.6   # R >= 1.6 인 경우에만 진입
-MIN_DELTA   = 30.0
-
-# 포지션당 사용할 증거금 비율: 전체 계좌를 3.5등분
-MARGIN_DIVISOR = 3.5
-
-# ===== BE SL(수수료권 SL 상향) 설정 =====
-BE_R_THRESHOLD = 0.6
-FEE_PCT = 0.001   # 수수료(0.1%)
-BE_PCT  = 0.0012  # 수수료권(0.11%)
-
+# =========================
+# Logging
+# =========================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ===== 상태 파일(스냅샷) =====
-STATE_PATH = "/app/state/bot_state.json"
-
-# ===== 포지션 히스토리 저장(JSONL) =====
-POSITION_HISTORY_PATH = "/app/state/position_history.jsonl"
-POSITION_HISTORY_LIMIT = 10
-
 
 # =========================
-# 재시작 동기화 유틸
+# Telegram
 # =========================
-def _parse_dt(s):
-    if not s:
-        return None
-    if isinstance(s, datetime):
-        return s
+def tg_send(text: str) -> None:
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
     try:
-        dt = datetime.fromisoformat(str(s))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        payload = {"chat_id": TG_CHAT_ID, "text": text}
+        requests.post(url, json=payload, timeout=10)
     except Exception:
-        return None
+        pass
 
 
-def _default_pos_state():
-    """현재 코드의 pos_state 기본 구조를 그대로 반환."""
-    return {
-        sym: {
-            "side": None,
-            "size": 0,
-            "entry_price": None,
-            "stop_price": None,
-            "init_stop_price": None,
-            "tp_price": None,
-            "entry_candle_ts": None,
-            "stop_order_id": None,
-            "entry_time": None,
-            "leverage": None,
-            "margin": None,
-            "notional": None,
-            "be_sl_applied": False,  # BE SL 적용 여부
-        }
-        for sym in SYMBOLS
-    }
-
-
-def _default_symbol_risk():
-    """심볼별 리스크 기본값 (모두 BASE_RISK로 초기화)."""
-    return {sym: BASE_RISK for sym in SYMBOLS}
-
-
-def _hydrate_pos_state(saved_pos_state: dict):
-    """bot_state.json에 저장된 pos_state(직렬화된 dict)를 런타임 구조로 복원."""
-    pos_state = _default_pos_state()
-    if not isinstance(saved_pos_state, dict):
-        return pos_state
-
-    for sym in SYMBOLS:
-        s = saved_pos_state.get(sym)
-        if not isinstance(s, dict):
-            continue
-
-        for k in list(pos_state[sym].keys()):
-            if k in s:
-                pos_state[sym][k] = s.get(k)
-
-        pos_state[sym]["entry_time"] = _parse_dt(pos_state[sym].get("entry_time"))
-
-        try:
-            if pos_state[sym]["size"] is None:
-                pos_state[sym]["size"] = 0
-            else:
-                pos_state[sym]["size"] = float(pos_state[sym]["size"])
-        except Exception:
-            pos_state[sym]["size"] = 0
-
-    return pos_state
-
-
-def _hydrate_symbol_risk(saved: dict):
-    """bot_state.json에 저장된 symbol_risk를 런타임 구조로 복원."""
-    risk = _default_symbol_risk()
-    if not isinstance(saved, dict):
-        return risk
-    for sym in SYMBOLS:
-        try:
-            v = saved.get(sym)
-            risk[sym] = float(v) if v is not None else BASE_RISK
-        except Exception:
-            risk[sym] = BASE_RISK
-    return risk
-
-
-def load_boot_state():
-    """
-    재시작 시 bot_state.json에서 다음 필드를 복구:
-      - pos_state
-      - position_history (최근 10개)
-      - last_signal (last_signal_candle_ts)
-      - symbol_risk (심볼별 리스크)
-    """
+# =========================
+# State
+# =========================
+def load_state() -> Dict[str, Any]:
+    if not os.path.exists(STATE_PATH):
+        return {"pos": {}, "last_signal_ts": {}, "universe": [], "universe_ts": 0}
     try:
-        if not os.path.exists(STATE_PATH):
-            return None
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-        if not content:
-            return None
-        state = json.loads(content)
-
-        boot = {}
-
-        boot["pos_state"] = _hydrate_pos_state(state.get("pos_state", {}))
-
-        ph = state.get("position_history", [])
-        boot["position_history"] = ph[:POSITION_HISTORY_LIMIT] if isinstance(ph, list) else []
-
-        ls = state.get("last_signal", {})
-        if isinstance(ls, dict):
-            out = {}
-            for sym in SYMBOLS:
-                v = ls.get(sym)
-                try:
-                    out[sym] = int(v) if v is not None else None
-                except Exception:
-                    out[sym] = None
-            boot["last_signal"] = out
-        else:
-            boot["last_signal"] = {}
-
-        boot["symbol_risk"] = _hydrate_symbol_risk(state.get("symbol_risk", {}))
-
-        return boot
+            return json.load(f)
     except Exception:
+        return {"pos": {}, "last_signal_ts": {}, "universe": [], "universe_ts": 0}
+
+
+def save_state(state: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# =========================
+# Exchange init
+# =========================
+def init_exchange() -> ccxt.okx:
+    ex = ccxt.okx(
+        {
+            "apiKey": API_KEY,
+            "secret": API_SECRET,
+            "password": API_PASSPHRASE,
+            "enableRateLimit": True,
+            "options": {"defaultType": "swap", "defaultSettle": "usdt"},
+        }
+    )
+    if os.getenv("OKX_SANDBOX", "").strip() == "1":
+        ex.set_sandbox_mode(True)
+        logging.warning("OKX_SANDBOX=1 enabled (sandbox mode).")
+    ex.load_markets()
+
+    # one-way mode (no hedge)
+    try:
+        ex.set_position_mode(hedged=False)
+    except Exception:
+        pass
+
+    return ex
+
+
+# =========================
+# Helpers
+# =========================
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def fetch_usdt_equity(ex: ccxt.Exchange) -> float:
+    bal = ex.fetch_balance()
+    usdt = bal.get("USDT", {}) or {}
+    total = usdt.get("total")
+    if total is None:
+        # fallback
+        total = usdt.get("free", 0)
+    return float(total or 0.0)
+
+
+def contract_size(ex: ccxt.Exchange, symbol: str) -> float:
+    try:
+        m = ex.market(symbol)
+        cs = m.get("contractSize")
+        if cs:
+            return float(cs)
+        info = m.get("info") or {}
+        if "ctVal" in info:
+            return float(info["ctVal"])
+    except Exception:
+        pass
+    return 1.0
+
+
+def round_down(x: float) -> int:
+    return int(math.floor(x))
+
+
+def fetch_ohlcv_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -> Optional[pd.DataFrame]:
+    o = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    if not o:
         return None
-
-
-def _tail_lines(path: str, n: int = 10, block_size: int = 8192):
-    """파일 끝에서 n줄을 효율적으로 읽는다(JSONL tail 용)."""
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            end = f.tell()
-            if end == 0:
-                return []
-            data = b""
-            pos = end
-            lines = []
-            while pos > 0 and len(lines) <= n:
-                read_size = min(block_size, pos)
-                pos -= read_size
-                f.seek(pos)
-                data = f.read(read_size) + data
-                lines = data.splitlines()
-            return [ln.decode("utf-8", errors="ignore") for ln in lines[-n:]]
-    except FileNotFoundError:
-        return []
-    except Exception:
-        return []
-
-
-def load_position_history_cache(path: str, limit: int = POSITION_HISTORY_LIMIT):
-    """재시작 내성: 히스토리 파일의 마지막 limit줄만 읽어서 캐시에 로드."""
-    cache = []
-    for line in _tail_lines(path, n=limit):
-        line = (line or "").strip()
-        if not line:
-            continue
-        try:
-            cache.append(json.loads(line))
-        except Exception:
-            continue
-    try:
-        cache.sort(key=lambda r: r.get("entry_time") or "", reverse=True)
-    except Exception:
-        pass
-    return cache[:limit]
-
-
-def append_position_history(cache: list, record: dict, path: str = POSITION_HISTORY_PATH, limit: int = POSITION_HISTORY_LIMIT):
-    """파일에 1줄 append + 메모리 캐시에도 반영(최근 limit개 유지)."""
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-    except Exception:
-        pass
-
-    line = json.dumps(record, ensure_ascii=False)
-    try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
-
-    cache.append(record)
-    try:
-        cache.sort(key=lambda r: r.get("entry_time") or "", reverse=True)
-    except Exception:
-        pass
-    del cache[limit:]
-    return cache
-
-
-def _get_contract_size(exchange, symbol: str) -> float:
-    try:
-        market = exchange.market(symbol)
-        return float(market.get("contractSize") or market["info"].get("ctVal", 1))
-    except Exception:
-        return 1.0
-
-
-def _iso(dt):
-    if dt is None:
-        return None
-    if isinstance(dt, datetime):
-        return dt.isoformat()
-    return str(dt)
-
-
-def _infer_exit_reason(p: dict) -> str:
-    """TP/SL/BE/MANUAL/UNKNOWN 중 추정."""
-    try:
-        if p.get("be_sl_applied"):
-            ep = p.get("entry_price")
-            sp = p.get("stop_price")
-            if ep and sp and ep > 0:
-                if abs(float(sp) - float(ep)) / float(ep) <= (BE_PCT * 1.5):
-                    return "BE"
-        if p.get("stop_order_id"):
-            return "SL"
-        return "MANUAL"
-    except Exception:
-        return "UNKNOWN"
-
-
-def _build_history_record(exchange, symbol: str, p: dict, close_price, close_time: datetime, exit_reason: str):
-    side = p.get("side")
-    entry_price = p.get("entry_price")
-    size = p.get("size") or 0
-    leverage = p.get("leverage")
-    entry_time = p.get("entry_time")
-    init_stop_price = p.get("init_stop_price") if p.get("init_stop_price") is not None else p.get("stop_price")
-
-    cs = _get_contract_size(exchange, symbol)
-    pnl_usdt = None
-    final_rr = None
-    try:
-        if close_price is not None and entry_price is not None and size and side in ("long", "short"):
-            entry_price_f = float(entry_price)
-            close_price_f = float(close_price)
-            size_f = float(size)
-            if side == "long":
-                pnl_usdt = (close_price_f - entry_price_f) * size_f * cs
-            else:
-                pnl_usdt = (entry_price_f - close_price_f) * size_f * cs
-
-            if init_stop_price is not None:
-                risk = abs(entry_price_f - float(init_stop_price)) * size_f * cs
-                if risk > 0:
-                    final_rr = pnl_usdt / risk
-    except Exception:
-        pnl_usdt = None
-        final_rr = None
-
-    return {
-        "entry_time": _iso(entry_time),
-        "close_time": _iso(close_time),
-        "symbol": symbol,
-        "leverage": leverage,
-        "side": side,
-        "entry_price": entry_price,
-        "close_price": close_price,
-        "final_rr": final_rr,
-        "pnl_usdt": pnl_usdt,
-        "exit_reason": exit_reason,
-    }
-
-
-# ============== JSON 직렬화 ============== #
-def _serialize_pos_state(pos_state: dict):
-    out = {}
-    for sym, s in pos_state.items():
-        if s is None:
-            out[sym] = None
-            continue
-        d = dict(s)
-        if isinstance(d.get("entry_time"), datetime):
-            d["entry_time"] = d["entry_time"].isoformat()
-        out[sym] = d
-    return out
-
-
-def save_state(pos_state, last_signal, equity, ohlcv, position_history=None, symbol_risk=None):
-    state = {
-        "pos_state": _serialize_pos_state(pos_state),
-        "last_signal": last_signal,
-        "equity": equity,
-        "ohlcv": ohlcv,
-        "position_history": position_history or [],
-        "symbol_risk": symbol_risk or _default_symbol_risk(),
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-
-# ============== OKX 초기화 ============== #
-def init_exchange():
-    exchange = ccxt.okx({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "password": API_PASSPHRASE,
-        "enableRateLimit": True,
-        "options": {"defaultType": "swap", "defaultSettle": "usdt"},
-    })
-    # exchange.set_sandbox_mode(True)
-    exchange.load_markets()
-
-    try:
-        exchange.set_position_mode(hedged=False)
-    except Exception:
-        pass
-
-    for sym in SYMBOLS:
-        try:
-            exchange.set_leverage(MAX_LEVERAGE, sym, params={"mgnMode": "cross"})
-        except Exception:
-            pass
-
-    return exchange
-
-
-# ============== 유틸 ============== #
-def fetch_ohlcv_df(exchange, symbol, timeframe, limit=200):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    if not ohlcv:
-        return None
-    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(o, columns=["ts", "open", "high", "low", "close", "volume"])
     df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df.set_index("dt", inplace=True)
     return df
 
 
-def calculate_indicators(df):
-    # ----- CCI (OKX TradingView 스타일) -----
-    tp = (df["high"] + df["low"] + df["close"]) / 3  # hlc3
-    sma_tp = tp.rolling(CCI_PERIOD).mean()
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
 
-    def _mean_dev(window):
-        m = window.mean()
-        return (window.sub(m).abs().sum()) / len(window)
+    # EMA
+    df["ema20"] = close.ewm(span=EMA_LEN, adjust=False).mean()
 
-    md = tp.rolling(CCI_PERIOD).apply(_mean_dev, raw=False)
-    df["cci"] = (tp - sma_tp) / (0.015 * md)
+    # BB + BBW
+    mid = close.rolling(BB_LEN).mean()
+    std = close.rolling(BB_LEN).std(ddof=0)
+    upper = mid + BB_K * std
+    lower = mid - BB_K * std
+    df["bb_mid"] = mid
+    df["bb_upper"] = upper
+    df["bb_lower"] = lower
+    df["bbw"] = (upper - lower) / mid.replace(0, np.nan)
 
-    ma = df["close"].rolling(BB_PERIOD).mean()
-    std = df["close"].rolling(BB_PERIOD).std(ddof=0)
-    df["bb_mid"]   = ma
-    df["bb_upper"] = ma + BB_K * std
-    df["bb_lower"] = ma - BB_K * std
     return df
 
 
-def fetch_futures_equity(exchange):
-    bal = exchange.fetch_balance()
-    usdt = bal.get("USDT", {})
-    return float(usdt.get("free", 0)), float(usdt.get("total", 0))
+def pinbar_reject(candle: pd.Series) -> bool:
+    o = float(candle["open"])
+    h = float(candle["high"])
+    l = float(candle["low"])
+    c = float(candle["close"])
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    # Reject if very wick-y vs body
+    return (upper_wick + lower_wick) > (2.0 * max(body, 1e-12))
 
 
-def compute_order_size_equal_margin_and_risk(exchange, symbol, entry_price, equity_total, stop_pct, risk_pct=None):
-    if entry_price <= 0 or stop_pct <= 0 or equity_total <= 0:
-        return 0, 0.0, 0.0
+def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """
+    Use CLOSED candle only: df.iloc[-2]
+    Need enough history for BBW lookback and box/volume windows.
+    """
+    if df is None or len(df) < max(BBW_LOOKBACK + BB_LEN + 5, BOX_LEN + 5, VOL_LEN + 5):
+        return None
 
-    if risk_pct is None:
-        risk_pct = RISK_PER_TRADE
+    closed = df.iloc[-2]  # signal candle
+    # reference window is also closed-only, so use up to -2 inclusive
+    hist = df.iloc[:-1]  # exclude the currently forming candle
 
-    margin_per_pos = equity_total / MARGIN_DIVISOR
-    risk_per_pos = equity_total * risk_pct
-    target_notional_for_risk = risk_per_pos / stop_pct
+    # Volatility contraction (BBW <= 30th percentile of last 100 closed)
+    bbw_hist = hist["bbw"].tail(BBW_LOOKBACK).dropna().values
+    if len(bbw_hist) < int(BBW_LOOKBACK * 0.8):
+        return None
+    bbw_th = np.nanpercentile(bbw_hist, BBW_PCTL)
+    if float(closed["bbw"]) > float(bbw_th):
+        return None
 
-    min_notional = margin_per_pos * 1.0
-    max_notional = margin_per_pos * MAX_LEVERAGE
-    notional = max(min(target_notional_for_risk, max_notional), min_notional)
+    # Trend filter
+    close_price = float(closed["close"])
+    ema20 = float(closed["ema20"])
+    if not (close_price > 0 and ema20 > 0):
+        return None
+    trend = "long" if close_price >= ema20 else "short"
 
-    market = exchange.market(symbol)
-    contract_size = market.get("contractSize") or float(market["info"].get("ctVal", 1))
-    notional_per_contract = entry_price * contract_size
+    # Breakout box (previous 20 closed candles, excluding the signal candle itself)
+    prev20 = hist.iloc[-(BOX_LEN + 1):-1]  # 20 candles before closed
+    if len(prev20) < BOX_LEN:
+        return None
+    box_high = float(prev20["high"].max())
+    box_low = float(prev20["low"].min())
 
-    amount = math.floor(notional / notional_per_contract)
-    if amount <= 0:
-        return 0, 0.0, 0.0
+    # Volume filter (avg volume of previous 20 closed, excluding signal candle)
+    vprev = hist.iloc[-(VOL_LEN + 1):-1]
+    if len(vprev) < VOL_LEN:
+        return None
+    v_avg = float(vprev["volume"].mean())
+    v_now = float(closed["volume"])
+    if v_avg <= 0 or v_now < (VOL_MULT * v_avg):
+        return None
 
-    actual_notional = amount * notional_per_contract
-    actual_leverage = actual_notional / margin_per_pos
-    if actual_leverage < 1.0:
-        actual_leverage = 1.0
-    if actual_leverage > MAX_LEVERAGE:
-        actual_leverage = float(MAX_LEVERAGE)
+    # Pinbar reject on breakout candle
+    if pinbar_reject(closed):
+        return None
 
-    effective_leverage = actual_notional / equity_total
-    return amount, actual_leverage, effective_leverage
+    # Trigger
+    side = None
+    if trend == "long" and close_price > box_high:
+        side = "long"
+        stop_price = box_low
+    elif trend == "short" and close_price < box_low:
+        side = "short"
+        stop_price = box_high
+    else:
+        return None
 
+    if stop_price <= 0:
+        return None
+    if side == "long" and stop_price >= close_price:
+        return None
+    if side == "short" and stop_price <= close_price:
+        return None
 
-def sync_positions(exchange, symbols):
-    result = {
-        sym: {
-            "has_position": False,
-            "side": None,
-            "size": 0,
-            "entry_price": None,
-            "leverage": None,
-            "margin": None,
-            "notional": None,
-        }
-        for sym in symbols
+    # TP by R multiple
+    r = abs(close_price - stop_price)
+    tp_price = close_price + (RR_TP * r) if side == "long" else close_price - (RR_TP * r)
+
+    return {
+        "side": side,
+        "entry_price": close_price,         # reference price (close of closed candle)
+        "stop_price": float(stop_price),
+        "tp_price": float(tp_price),
+        "signal_ts": int(closed["ts"]),
+        "box_high": box_high,
+        "box_low": box_low,
+        "bbw": float(closed["bbw"]),
+        "bbw_th": float(bbw_th),
+        "vol": v_now,
+        "vol_avg": v_avg,
+        "ema20": ema20,
     }
 
-    try:
-        positions = exchange.fetch_positions()
-    except Exception:
-        return result
 
-    for p in positions:
+def get_universe_usdt_swaps_top_volume(ex: ccxt.Exchange) -> List[str]:
+    """
+    Build USDT-settled swap universe, then pick top-N by quoteVolume (24h).
+    """
+    # Collect candidate symbols
+    syms = []
+    for s, m in ex.markets.items():
+        try:
+            if not m.get("swap"):
+                continue
+            if (m.get("settle") or "").lower() != "usdt":
+                continue
+            # ccxt okx uses symbols like "BTC/USDT:USDT"
+            if not s.endswith(":USDT"):
+                continue
+            if "/USDT" not in s:
+                continue
+            if not m.get("active", True):
+                continue
+            syms.append(s)
+        except Exception:
+            continue
+
+    if not syms:
+        return []
+
+    # Fetch tickers for candidates (may be heavy, but OKX is usually fine; enableRateLimit helps)
+    # If fetch_tickers fails, fallback to sequential fetch_ticker for a smaller subset.
+    tickers = {}
+    try:
+        tickers = ex.fetch_tickers(syms)
+    except Exception:
+        tickers = {}
+        # fallback: sample first 300 to avoid rate-limit explosion
+        for s in syms[:300]:
+            try:
+                tickers[s] = ex.fetch_ticker(s)
+                time.sleep(0.03)
+            except Exception:
+                continue
+
+    scored = []
+    for s, t in (tickers or {}).items():
+        try:
+            qv = t.get("quoteVolume")
+            if qv is None:
+                # OKX info fallback
+                info = t.get("info") or {}
+                # on OKX, quote volume can appear as volCcy24h
+                qv = info.get("volCcy24h") or info.get("quoteVol") or info.get("volCcy")
+            qv = float(qv or 0.0)
+            if qv < MIN_QUOTE_VOL_USDT:
+                continue
+            scored.append((s, qv))
+        except Exception:
+            continue
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in scored[:TOP_N]]
+
+
+def sync_positions(ex: ccxt.Exchange, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    out = {s: {"has": False, "side": None, "contracts": 0.0, "entry": None} for s in symbols}
+    try:
+        poss = ex.fetch_positions()
+    except Exception:
+        return out
+
+    for p in poss:
         sym = p.get("symbol")
-        if sym not in symbols:
+        if sym not in out:
             continue
-
-        contracts = float(p.get("contracts") or p.get("positionAmt") or 0)
-        if contracts == 0:
+        contracts = float(p.get("contracts") or p.get("positionAmt") or 0.0)
+        if contracts == 0.0:
             continue
-
-        side = p.get("side") or ("long" if contracts > 0 else "short")
-        entry_price = float(p.get("entryPrice") or p.get("avgPrice") or 0)
-
-        lev_raw = p.get("leverage") or (p.get("info") or {}).get("lever") or None
-        try:
-            leverage = float(lev_raw) if lev_raw is not None else None
-        except Exception:
-            leverage = None
-
-        margin_raw = (
-            p.get("initialMargin")
-            or p.get("margin")
-            or (p.get("info") or {}).get("margin")
-            or None
-        )
-        try:
-            margin = float(margin_raw) if margin_raw is not None else None
-        except Exception:
-            margin = None
-
-        notional = None
-        try:
-            market = exchange.market(sym)
-            contract_size = market.get("contractSize") or float(market["info"].get("ctVal", 1))
-            if entry_price > 0:
-                notional = abs(contracts) * contract_size * entry_price
-        except Exception:
-            notional = None
-
-        result[sym] = {
-            "has_position": True,
-            "side": side,
-            "size": abs(contracts),
-            "entry_price": entry_price,
-            "leverage": leverage,
-            "margin": margin,
-            "notional": notional,
-        }
-    return result
+        side = p.get("side")
+        if not side:
+            side = "long" if contracts > 0 else "short"
+        entry = float(p.get("entryPrice") or p.get("avgPrice") or 0.0) or None
+        out[sym] = {"has": True, "side": side, "contracts": abs(contracts), "entry": entry}
+    return out
 
 
-def detect_cci_signal(df):
+def calc_contracts_for_risk(
+    ex: ccxt.Exchange,
+    symbol: str,
+    equity_usdt: float,
+    entry_price: float,
+    stop_price: float,
+) -> Tuple[int, float, float]:
     """
-    15m 전환 핵심:
-    - 신호 판단은 '마감된 캔들' 기준으로만 수행
-    - 진행 중 캔들(df.iloc[-1])은 사용하지 않음
+    Returns (contracts, notional_usdt, margin_usdt_est)
+    risk = equity * 0.03
+    stop_pct = |entry-stop|/entry
+    notional = risk / stop_pct
+    margin_est = notional / leverage
     """
-    if df is None or len(df) < CCI_PERIOD + 4:
-        return None
+    if equity_usdt <= 0 or entry_price <= 0 or stop_price <= 0:
+        return 0, 0.0, 0.0
 
-    # 마감 캔들 기준
-    curr  = df.iloc[-2]  # closed candle
-    prev1 = df.iloc[-3]
-    prev2 = df.iloc[-4]
+    stop_pct = abs(entry_price - stop_price) / entry_price
+    if stop_pct <= 0:
+        return 0, 0.0, 0.0
 
-    cci_curr  = float(curr.get("cci", float("nan")))
-    cci_prev1 = float(prev1.get("cci", float("nan")))
-    cci_prev2 = float(prev2.get("cci", float("nan")))
+    risk_usdt = equity_usdt * RISK_PCT_EQUITY
+    target_notional = risk_usdt / stop_pct
 
-    if any(math.isnan(x) for x in [cci_curr, cci_prev1, cci_prev2]):
-        return None
+    # cap by available margin fraction (cross)
+    max_notional = equity_usdt * MAX_MARGIN_FRACTION * LEVERAGE
+    notional = min(target_notional, max_notional)
 
-    entry_price = float(curr["close"])
-    if entry_price <= 0:
-        return None
+    cs = contract_size(ex, symbol)
+    notional_per_contract = entry_price * cs
+    if notional_per_contract <= 0:
+        return 0, 0.0, 0.0
 
-    side = None
-    stop_price = None
+    contracts = round_down(notional / notional_per_contract)
+    if contracts <= 0:
+        return 0, 0.0, 0.0
 
-    if (cci_prev1 < -100) and (cci_curr > cci_prev1) and (cci_curr - cci_prev1 >= MIN_DELTA):
-        side = "long"
-        stop_price = float(prev1["low"]) * (1 - SL_OFFSET)
-    elif (cci_prev1 > 100) and (cci_curr < cci_prev1) and (cci_prev1 - cci_curr >= MIN_DELTA):
-        side = "short"
-        stop_price = float(prev1["high"]) * (1 + SL_OFFSET)
-
-    if side is None or stop_price <= 0:
-        return None
-
-    return {"side": side, "entry_price": entry_price, "stop_price": stop_price, "signal_ts": int(curr["ts"])}
+    actual_notional = contracts * notional_per_contract
+    margin_est = actual_notional / LEVERAGE
+    return contracts, actual_notional, margin_est
 
 
-def _safe_float(v):
+def place_entry_with_stop(
+    ex: ccxt.Exchange,
+    symbol: str,
+    side: str,
+    contracts: int,
+    stop_price: float,
+) -> Dict[str, Any]:
+    """
+    Market entry + conditional stop-loss (reduceOnly)
+    Returns a dict with entry_order_id, stop_order_id (if created)
+    """
+    assert side in ("long", "short")
+    order_side = "buy" if side == "long" else "sell"
+    sl_side = "sell" if side == "long" else "buy"
+
+    # set leverage fixed 10, cross
     try:
-        f = float(v)
-        if math.isnan(f) or math.isinf(f):
-            return None
-        return f
+        ex.set_leverage(LEVERAGE, symbol, params={"mgnMode": MARGIN_MODE})
     except Exception:
-        return None
+        pass
+
+    entry_order = ex.create_order(symbol, "market", order_side, contracts, params={"tdMode": MARGIN_MODE})
+
+    # short delay then place stop-loss
+    time.sleep(0.25)
+
+    stop_order_id = None
+    try:
+        sl_order = ex.create_order(
+            symbol,
+            "market",
+            sl_side,
+            contracts,
+            params={
+                "tdMode": MARGIN_MODE,
+                "reduceOnly": True,
+                "stopLossPrice": float(stop_price),
+            },
+        )
+        stop_order_id = sl_order.get("id")
+    except Exception:
+        stop_order_id = None
+
+    return {"entry_order_id": entry_order.get("id"), "stop_order_id": stop_order_id}
 
 
+def close_position_market(ex: ccxt.Exchange, symbol: str, side: str, contracts: float) -> None:
+    if contracts <= 0:
+        return
+    close_side = "sell" if side == "long" else "buy"
+    ex.create_order(symbol, "market", close_side, contracts, params={"tdMode": MARGIN_MODE, "reduceOnly": True})
+
+
+# =========================
+# Main
+# =========================
 def main():
-    exchange = init_exchange()
-    logging.info("CCI + Bollinger 자동매매 (동적 TP + BB/CCI 대시보드 + 균등 증거금/리스크) 시작")
+    ex = init_exchange()
+    state = load_state()
 
-    pos_state = _default_pos_state()
-    last_signal_candle_ts = {}
-    position_history_cache = load_position_history_cache(POSITION_HISTORY_PATH, POSITION_HISTORY_LIMIT)
+    tg_send("OKX 5m VolContraction Breakout bot started.")
 
-    symbol_risk = _default_symbol_risk()
+    universe: List[str] = state.get("universe") or []
+    universe_ts: float = float(state.get("universe_ts") or 0)
 
-    boot = load_boot_state()
-    if boot:
-        try:
-            pos_state = boot.get("pos_state", pos_state)
-            last_signal_candle_ts = boot.get("last_signal", last_signal_candle_ts) or {}
-            ph = boot.get("position_history", [])
-            if isinstance(ph, list) and ph:
-                position_history_cache = ph[:POSITION_HISTORY_LIMIT]
+    # pos state per symbol:
+    # {
+    #   symbol: { side, entry, stop, tp, stop_order_id, entry_time_iso }
+    # }
+    pos_state: Dict[str, Dict[str, Any]] = state.get("pos") or {}
+    last_signal_ts: Dict[str, int] = state.get("last_signal_ts") or {}
 
-            sr = boot.get("symbol_risk")
-            if isinstance(sr, dict):
-                symbol_risk = sr
-
-            logging.info("재시작 동기화 완료: pos_state/last_signal/position_history/symbol_risk 복구")
-        except Exception:
-            pass
+    last_universe_refresh = 0.0
 
     while True:
         try:
-            data = {}
-            for sym in SYMBOLS:
-                df = fetch_ohlcv_df(exchange, sym, TIMEFRAME, 200)
-                if df is None:
-                    continue
-                df = calculate_indicators(df)
-                if len(df) < BB_PERIOD + 3:
-                    continue
-                data[sym] = (df, df.iloc[-2], df.iloc[-1])
+            now = time.time()
 
-            if not data:
-                time.sleep(LOOP_INTERVAL)
+            # refresh universe periodically
+            if (not universe) or (now - universe_ts >= SCAN_EVERY_SEC) or (now - last_universe_refresh >= SCAN_EVERY_SEC):
+                universe = get_universe_usdt_swaps_top_volume(ex)
+                universe_ts = now
+                last_universe_refresh = now
+                logging.info(f"Universe refreshed: {len(universe)} symbols (top {TOP_N} by quoteVolume).")
+
+            if not universe:
+                time.sleep(LOOP_INTERVAL_SEC)
                 continue
 
-            exch_positions = sync_positions(exchange, SYMBOLS)
+            # sync exchange positions for universe
+            exch_pos = sync_positions(ex, universe)
 
-            for sym in SYMBOLS:
-                if not exch_positions[sym]["has_position"]:
-                    # 포지션이 사라진 경우(주로 SL/BE 또는 수동 청산) 히스토리 기록 + 리스크 조정
-                    if pos_state[sym].get("side") is not None and (pos_state[sym].get("size") or 0) > 0:
-                        try:
-                            close_price = None
-                            if sym in data:
-                                close_price = float(data[sym][2]["close"])
-                            close_time = datetime.now(timezone.utc)
-                            exit_reason = _infer_exit_reason(pos_state[sym])
-
-                            # 손절이면 리스크를 REDUCED_RISK로 변경, 익절이면 BASE_RISK로 복원
-                            if exit_reason == "SL":
-                                symbol_risk[sym] = REDUCED_RISK
-                            elif exit_reason == "TP":
-                                symbol_risk[sym] = BASE_RISK
-
-                            rec = _build_history_record(exchange, sym, pos_state[sym], close_price, close_time, exit_reason)
-                            append_position_history(position_history_cache, rec)
-                        except Exception:
-                            pass
-
-                    pos_state[sym] = {
-                        "side": None,
-                        "size": 0,
-                        "entry_price": None,
-                        "stop_price": None,
-                        "init_stop_price": None,
-                        "tp_price": None,
-                        "entry_candle_ts": None,
-                        "stop_order_id": None,
-                        "entry_time": None,
-                        "leverage": None,
-                        "margin": None,
-                        "notional": None,
-                        "be_sl_applied": False,
-                    }
-                else:
-                    pos_state[sym]["side"] = exch_positions[sym]["side"]
-                    pos_state[sym]["size"] = exch_positions[sym]["size"]
-                    pos_state[sym]["entry_price"] = exch_positions[sym]["entry_price"]
-                    pos_state[sym]["leverage"] = exch_positions[sym]["leverage"]
-                    pos_state[sym]["margin"] = exch_positions[sym]["margin"]
-                    pos_state[sym]["notional"] = exch_positions[sym]["notional"]
-
-            for sym in SYMBOLS:
-                if sym not in data:
+            # detect positions disappeared (likely SL/manual) and clean local state
+            for sym in list(pos_state.keys()):
+                if sym not in exch_pos:
                     continue
-                df, prev, curr = data[sym]
+                if pos_state.get(sym) and not exch_pos[sym]["has"]:
+                    # position gone
+                    s = pos_state[sym]
+                    msg = f"[EXIT DETECTED] {sym} side={s.get('side')} (position is now 0). Possible SL/manual."
+                    logging.info(msg)
+                    tg_send(msg)
+                    pos_state.pop(sym, None)
 
-                side = pos_state[sym]["side"]
-                size = pos_state[sym]["size"]
-                if side is None or size <= 0:
-                    pos_state[sym]["tp_price"] = None
+            # manage open positions: TP monitoring + SL detection via position disappearance
+            for sym in universe:
+                if sym not in pos_state:
+                    continue
+                p = pos_state[sym]
+                if not exch_pos[sym]["has"]:
                     continue
 
-                bb_upper = float(curr["bb_upper"])
-                bb_lower = float(curr["bb_lower"])
-                curr_price = float(curr["close"])
-                curr_cci = float(curr["cci"])
-                prev_cci = float(prev["cci"])
-
-                pos_state[sym]["tp_price"] = (bb_upper * (1 - TP_OFFSET) if side == "long" else bb_lower * (1 + TP_OFFSET))
-
+                side = p["side"]
+                tp = float(p["tp"])
+                # use ticker last price
                 try:
-                    if not pos_state[sym].get("be_sl_applied", False):
-                        entry_price = pos_state[sym].get("entry_price")
-                        stop_price = pos_state[sym].get("stop_price")
-                        tp_price = pos_state[sym].get("tp_price")
-
-                        if entry_price and stop_price and tp_price:
-                            stop_diff = abs(entry_price - stop_price)
-                            tp_diff = abs(tp_price - entry_price)
-                            if stop_diff > 0:
-                                R_now = tp_diff / stop_diff
-
-                                if R_now <= BE_R_THRESHOLD:
-                                    if side == "long":
-                                        fee_line = entry_price * (1 + FEE_PCT)
-                                        be_sl    = entry_price * (1 + BE_PCT)
-                                        in_range = (fee_line <= curr_price <= tp_price)
-                                        sl_side = "sell"
-                                        better_than_current = (stop_price < be_sl)
-                                    else:
-                                        fee_line = entry_price * (1 - FEE_PCT)
-                                        be_sl    = entry_price * (1 - BE_PCT)
-                                        in_range = (tp_price <= curr_price <= fee_line)
-                                        sl_side = "buy"
-                                        better_than_current = (stop_price > be_sl)
-
-                                    if in_range and better_than_current:
-                                        if pos_state[sym]["stop_order_id"]:
-                                            try:
-                                                exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
-                                            except Exception:
-                                                pass
-
-                                        try:
-                                            sl_order = exchange.create_order(
-                                                sym, "market", sl_side, size,
-                                                params={"tdMode": "cross", "reduceOnly": True, "stopLossPrice": be_sl},
-                                            )
-                                            pos_state[sym]["stop_order_id"] = sl_order.get("id")
-                                            pos_state[sym]["stop_price"] = be_sl
-                                            pos_state[sym]["be_sl_applied"] = True
-                                        except Exception:
-                                            pass
+                    t = ex.fetch_ticker(sym)
+                    last = float(t.get("last") or 0.0)
                 except Exception:
-                    pass
+                    last = 0.0
+                if last <= 0:
+                    continue
 
-                if (side == "long" and curr_price >= pos_state[sym]["tp_price"]) or (side == "long" and (prev_cci >= 110) and (prev_cci - curr_cci >= 15)):
-                    if pos_state[sym]["stop_order_id"]:
+                hit_tp = (side == "long" and last >= tp) or (side == "short" and last <= tp)
+                if hit_tp:
+                    # cancel stop order if possible
+                    soid = p.get("stop_order_id")
+                    if soid:
                         try:
-                            exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
+                            ex.cancel_order(soid, sym)
                         except Exception:
                             pass
 
-                    exch_now = sync_positions(exchange, SYMBOLS)[sym]
-                    close_order = {}
-                    if exch_now["has_position"]:
-                        close_order = exchange.create_order(sym, "market", "sell", exch_now["size"], params={"tdMode": "cross"})
+                    # close by market reduceOnly
+                    close_position_market(ex, sym, side, float(exch_pos[sym]["contracts"]))
+                    msg = f"[TP] {sym} {side.upper()} hit TP. last={last:.6g} tp={tp:.6g}"
+                    logging.info(msg)
+                    tg_send(msg)
+                    pos_state.pop(sym, None)
 
-                    try:
-                        close_time = datetime.now(timezone.utc)
-                        _cp = None
-                        try:
-                            _cp = close_order.get("average") or close_order.get("price")
-                        except Exception:
-                            _cp = None
-                        close_price = float(_cp) if _cp is not None else curr_price
+            # entry scan: only for symbols with no position
+            equity = fetch_usdt_equity(ex)
+            if equity <= 0:
+                time.sleep(LOOP_INTERVAL_SEC)
+                continue
 
-                        rec = _build_history_record(exchange, sym, pos_state[sym], close_price, close_time, "TP")
-                        append_position_history(position_history_cache, rec)
-                    except Exception:
-                        pass
-
-                    symbol_risk[sym] = BASE_RISK
-                    pos_state[sym] = _default_pos_state()[sym]
-
-                elif (side == "short" and curr_price <= pos_state[sym]["tp_price"]) or (side == "short" and (prev_cci <= -110) and (curr_cci - prev_cci >= 15)):
-                    if pos_state[sym]["stop_order_id"]:
-                        try:
-                            exchange.cancel_order(pos_state[sym]["stop_order_id"], sym)
-                        except Exception:
-                            pass
-
-                    exch_now = sync_positions(exchange, SYMBOLS)[sym]
-                    close_order = {}
-                    if exch_now["has_position"]:
-                        close_order = exchange.create_order(sym, "market", "buy", exch_now["size"], params={"tdMode": "cross"})
-
-                    try:
-                        close_time = datetime.now(timezone.utc)
-                        _cp = None
-                        try:
-                            _cp = close_order.get("average") or close_order.get("price")
-                        except Exception:
-                            _cp = None
-                        close_price = float(_cp) if _cp is not None else curr_price
-
-                        rec = _build_history_record(exchange, sym, pos_state[sym], close_price, close_time, "TP")
-                        append_position_history(position_history_cache, rec)
-                    except Exception:
-                        pass
-
-                    symbol_risk[sym] = BASE_RISK
-                    pos_state[sym] = _default_pos_state()[sym]
-
-            for sym in SYMBOLS:
-                if sym not in data:
+            for sym in universe:
+                if exch_pos[sym]["has"]:
+                    continue
+                if sym in pos_state:
                     continue
 
-                df, prev, curr = data[sym]
+                # fetch chart + compute signal
+                df = fetch_ohlcv_df(ex, sym, TIMEFRAME, OHLCV_LIMIT)
+                if df is None:
+                    continue
+                df = add_indicators(df)
 
-                if pos_state[sym]["side"] is not None:
+                sig = compute_signal(df)
+                if not sig:
                     continue
 
-                signal = detect_cci_signal(df)
-                if not signal:
+                sig_ts = int(sig["signal_ts"])
+                if last_signal_ts.get(sym) == sig_ts:
                     continue
 
-                signal_ts = int(signal["signal_ts"])
-                if last_signal_candle_ts.get(sym) == signal_ts:
+                side = sig["side"]
+                entry_ref = float(sig["entry_price"])
+                stop = float(sig["stop_price"])
+                tp = float(sig["tp_price"])
+
+                # size by risk
+                contracts, notional, margin_est = calc_contracts_for_risk(ex, sym, equity, entry_ref, stop)
+                if contracts <= 0:
+                    last_signal_ts[sym] = sig_ts
                     continue
 
-                side_signal = signal["side"]
-                entry_price = signal["entry_price"]
-                stop_price = signal["stop_price"]
+                # place orders
+                orders = place_entry_with_stop(ex, sym, side, contracts, stop)
 
-                if side_signal == "long" and stop_price >= entry_price:
-                    continue
-                if side_signal == "short" and stop_price <= entry_price:
-                    continue
+                # sync actual entry after placing
+                time.sleep(0.35)
+                pnow = sync_positions(ex, [sym]).get(sym, {})
+                actual_entry = pnow.get("entry") or entry_ref
 
-                bb_upper = float(curr["bb_upper"])
-                bb_lower = float(curr["bb_lower"])
-                tp_price = (bb_upper * (1 - TP_OFFSET) if side_signal == "long" else bb_lower * (1 + TP_OFFSET))
+                pos_state[sym] = {
+                    "side": side,
+                    "entry": float(actual_entry),
+                    "stop": stop,
+                    "tp": tp,
+                    "stop_order_id": orders.get("stop_order_id"),
+                    "entry_time": now_utc().isoformat(),
+                    "contracts": float(contracts),
+                    "notional_est": float(notional),
+                    "margin_est": float(margin_est),
+                    "meta": {
+                        "box_high": float(sig["box_high"]),
+                        "box_low": float(sig["box_low"]),
+                        "bbw": float(sig["bbw"]),
+                        "bbw_th": float(sig["bbw_th"]),
+                        "vol": float(sig["vol"]),
+                        "vol_avg": float(sig["vol_avg"]),
+                        "ema20": float(sig["ema20"]),
+                    },
+                }
+                last_signal_ts[sym] = sig_ts
 
-                stop_diff = abs(entry_price - stop_price)
-                tp_diff = abs(entry_price - tp_price)
-                if stop_diff <= 0:
-                    continue
-
-                R = tp_diff / stop_diff
-                if R < R_THRESHOLD:
-                    continue
-
-                _, total = fetch_futures_equity(exchange)
-                if total <= 0:
-                    continue
-
-                stop_pct = stop_diff / entry_price
-
-                amount, leverage, eff_lev = compute_order_size_equal_margin_and_risk(
-                    exchange, sym, entry_price, total, stop_pct, symbol_risk[sym]
+                msg = (
+                    f"[ENTRY] {sym} {side.upper()} lev={LEVERAGE:.0f}x CROSS\n"
+                    f"entry≈{float(actual_entry):.6g} stop={stop:.6g} tp={tp:.6g} (RR={RR_TP})\n"
+                    f"contracts={contracts} notional≈{notional:.2f} margin≈{margin_est:.2f}\n"
+                    f"BBW={sig['bbw']:.6g} (<= p{BBW_PCTL}:{sig['bbw_th']:.6g}), "
+                    f"Vol={sig['vol']:.3g} (>= {VOL_MULT}x avg:{sig['vol_avg']:.3g})"
                 )
-                if amount <= 0:
-                    continue
+                logging.info(msg)
+                tg_send(msg)
 
-                order_side = "buy" if side_signal == "long" else "sell"
-                sl_side = "sell" if side_signal == "long" else "buy"
+                # small pause to be gentle to OKX rate limits after an entry
+                time.sleep(0.5)
 
-                lev_float = max(1.0, min(round(float(leverage), 2), float(MAX_LEVERAGE)))
-                try:
-                    exchange.set_leverage(lev_float, sym, params={"mgnMode": "cross"})
-                except Exception:
-                    pass
+            # persist
+            state["pos"] = pos_state
+            state["last_signal_ts"] = last_signal_ts
+            state["universe"] = universe
+            state["universe_ts"] = universe_ts
+            state["timestamp"] = now_utc().isoformat()
+            save_state(state)
 
-                exchange.create_order(sym, "market", order_side, amount, params={"tdMode": "cross"})
+            time.sleep(LOOP_INTERVAL_SEC)
 
-                time.sleep(0.3)
-                after = sync_positions(exchange, SYMBOLS)[sym]
-                actual_entry = after["entry_price"] or entry_price
-                actual_size = after["size"]
-
-                pos_state[sym]["side"] = side_signal
-                pos_state[sym]["size"] = actual_size
-                pos_state[sym]["entry_price"] = actual_entry
-                pos_state[sym]["stop_price"] = stop_price
-                pos_state[sym]["init_stop_price"] = stop_price
-                pos_state[sym]["entry_time"] = datetime.now(timezone.utc)
-
-                # === 15m 전환 핵심: 진입 근거가 된 '마감 캔들 ts'로 기록 ===
-                pos_state[sym]["entry_candle_ts"] = signal_ts
-
-                pos_state[sym]["leverage"] = after.get("leverage")
-                pos_state[sym]["margin"] = after.get("margin")
-                pos_state[sym]["notional"] = after.get("notional")
-                pos_state[sym]["be_sl_applied"] = False
-
-                try:
-                    sl_order = exchange.create_order(
-                        sym, "market", sl_side, actual_size,
-                        params={"tdMode": "cross", "reduceOnly": True, "stopLossPrice": stop_price},
-                    )
-                    pos_state[sym]["stop_order_id"] = sl_order.get("id")
-                except Exception:
-                    pos_state[sym]["stop_order_id"] = None
-
-                # === 15m 전환 핵심: last_signal도 '마감 캔들 ts'로 저장 ===
-                last_signal_candle_ts[sym] = signal_ts
-
-            ohlcv_state = {}
-            for sym in SYMBOLS:
-                if sym not in data:
-                    continue
-                df, _, _ = data[sym]
-                tail = df.tail(100)
-                candles = []
-                for row in tail.itertuples():
-                    candles.append({
-                        "time": int(row.ts // 1000),
-                        "open": float(row.open),
-                        "high": float(row.high),
-                        "low": float(row.low),
-                        "close": float(row.close),
-                        "bb_upper": _safe_float(getattr(row, "bb_upper", None)),
-                        "bb_lower": _safe_float(getattr(row, "bb_lower", None)),
-                        "bb_mid": _safe_float(getattr(row, "bb_mid", None)),
-                        "cci": _safe_float(getattr(row, "cci", None)),
-                    })
-                ohlcv_state[sym] = candles
-
-            _, total = fetch_futures_equity(exchange)
-            save_state(pos_state, last_signal_candle_ts, total, ohlcv_state, position_history_cache, symbol_risk)
-
-            time.sleep(LOOP_INTERVAL)
-
+        except ccxt.BaseError as e:
+            logging.warning(f"CCXT error: {e}")
+            tg_send(f"[ERROR] CCXT: {e}")
+            time.sleep(LOOP_INTERVAL_SEC)
         except Exception as e:
-            logging.warning(f"메인 루프 에러: {e}")
-            time.sleep(LOOP_INTERVAL)
+            logging.warning(f"Loop error: {e}")
+            tg_send(f"[ERROR] Loop: {e}")
+            time.sleep(LOOP_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
