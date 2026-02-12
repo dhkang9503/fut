@@ -60,7 +60,7 @@ BOX_LEN = 20
 VOL_LEN = 20
 VOL_MULT = 1.5
 
-LOOP_INTERVAL_SEC = 6
+LOOP_INTERVAL_SEC = 3
 SCAN_EVERY_SEC = 30  # how often to refresh top-volume universe
 STATE_PATH = "./state_okx_breakout.json"
 
@@ -517,7 +517,7 @@ def main():
                 universe = get_universe_usdt_swaps_top_volume(ex)
                 universe_ts = now
                 last_universe_refresh = now
-                logging.info(f"Universe refreshed: {len(universe)} symbols (top {TOP_N} by quoteVolume).")
+                # logging.info(f"Universe refreshed: {len(universe)} symbols (top {TOP_N} by quoteVolume).")
 
             if not universe:
                 time.sleep(LOOP_INTERVAL_SEC)
