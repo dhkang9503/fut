@@ -270,6 +270,10 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if v_avg <= 0 or v_now < (VOL_MULT * v_avg):
         return None
 
+    vol_ratio = v_now / v_avg
+    if vol_ratio <= 2.0:
+        return None
+
     if pinbar_reject(closed):
         return None
 
@@ -305,6 +309,7 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         "bbw_th": float(bbw_th),
         "vol": v_now,
         "vol_avg": v_avg,
+        "vol_ratio": vol_ratio,
         "ema20": ema20,
     }
 
