@@ -237,46 +237,77 @@ def pinbar_reject(candle: pd.Series) -> bool:
 
 
 def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    if df is None or len(df) < max(BBW_LOOKBACK + BB_LEN + 5, BOX_LEN + 5, VOL_LEN + 5):
+    if df is None or len(df) < max(BBW_LOOKBACK + BB_LEN + 25, BOX_LEN + 5, VOL_LEN + 5):
         return None
 
     closed = df.iloc[-2]
     hist = df.iloc[:-1]
 
+    # =========================
+    # 1. Volatility Contraction (기존)
+    # =========================
     bbw_hist = hist["bbw"].tail(BBW_LOOKBACK).dropna().values
     if len(bbw_hist) < int(BBW_LOOKBACK * 0.8):
         return None
+
     bbw_th = np.nanpercentile(bbw_hist, BBW_PCTL)
     if float(closed["bbw"]) > float(bbw_th):
         return None
 
+    # =========================
+    # 2. Trend
+    # =========================
     close_price = float(closed["close"])
     ema20 = float(closed["ema20"])
     if not (close_price > 0 and ema20 > 0):
         return None
+
     trend = "long" if close_price >= ema20 else "short"
 
+    # =========================
+    # 3. Box
+    # =========================
     prev20 = hist.iloc[-(BOX_LEN + 1):-1]
     if len(prev20) < BOX_LEN:
         return None
+
     box_high = float(prev20["high"].max())
     box_low = float(prev20["low"].min())
+    box_range_pct = (box_high - box_low) / close_price
 
+    # 🔥 박스 중간 구간만 허용 (최근 100개 기준)
+    box_hist = (
+        (hist["high"].rolling(BOX_LEN).max() - hist["low"].rolling(BOX_LEN).min())
+        / hist["close"]
+    ).dropna().tail(100)
+
+    if len(box_hist) > 20:
+        q_low = np.nanpercentile(box_hist, 30)
+        q_high = np.nanpercentile(box_hist, 70)
+        if not (q_low <= box_range_pct <= q_high):
+            return None
+
+    # =========================
+    # 4. Volume
+    # =========================
     vprev = hist.iloc[-(VOL_LEN + 1):-1]
     if len(vprev) < VOL_LEN:
         return None
+
     v_avg = float(vprev["volume"].mean())
     v_now = float(closed["volume"])
-    if v_avg <= 0 or v_now < (VOL_MULT * v_avg):
+    if v_avg <= 0:
         return None
 
     vol_ratio = v_now / v_avg
-    if vol_ratio <= 2.0:
+
+    # 🔥 거래량 레짐 범위
+    if not (2.0 <= vol_ratio <= 3.5):
         return None
 
-    if pinbar_reject(closed):
-        return None
-
+    # =========================
+    # 5. Breakout
+    # =========================
     side = None
     if trend == "long" and close_price > box_high:
         side = "long"
@@ -285,6 +316,36 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         side = "short"
         stop_price = box_high
     else:
+        return None
+
+    # =========================
+    # 6. Momentum Regime Filter 🔥 핵심
+    # =========================
+    def ret_n(n):
+        if len(hist) >= n + 1:
+            p0 = hist["close"].iloc[-1]
+            pN = hist["close"].iloc[-(n + 1)]
+            if pN > 0:
+                return (p0 - pN) / pN
+        return 0.0
+
+    ret_5 = ret_n(5)
+    ret_20 = ret_n(20)
+
+    ema20_prev = hist["ema20"].iloc[-6] if len(hist) >= 6 else ema20
+    ema20_slope_pct = (ema20 - ema20_prev) / ema20_prev if ema20_prev > 0 else 0.0
+
+    if side == "long":
+        if not (ret_5 > 0 and ret_20 > 0 and ema20_slope_pct > 0):
+            return None
+    else:
+        if not (ret_5 < 0 and ret_20 < 0 and ema20_slope_pct < 0):
+            return None
+
+    # =========================
+    # 7. Pinbar reject
+    # =========================
+    if pinbar_reject(closed):
         return None
 
     if stop_price <= 0:
@@ -311,6 +372,9 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         "vol_avg": v_avg,
         "vol_ratio": vol_ratio,
         "ema20": ema20,
+        "ret_5": ret_5,
+        "ret_20": ret_20,
+        "ema20_slope_pct": ema20_slope_pct,
     }
 
 
