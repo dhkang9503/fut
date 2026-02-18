@@ -50,7 +50,7 @@ TOP_N = 50
 
 LEVERAGE = 10.0
 MARGIN_MODE = "cross"  # CROSS
-RISK_PCT_EQUITY = 0.03  # lose 3% equity if stop hit
+RISK_PCT_EQUITY = 0.04  # lose 3% equity if stop hit
 RR_TP = 1.5  # take profit at 1.5R
 
 EMA_LEN = 20
