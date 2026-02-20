@@ -46,7 +46,7 @@ import ccxt
 # =========================
 TIMEFRAME = "5m"
 OHLCV_LIMIT = 220  # need >= 100 bbw history + buffers
-TOP_N = 50
+TOP_N = 150
 
 LEVERAGE = 10.0
 MARGIN_MODE = "cross"  # CROSS
