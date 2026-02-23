@@ -6,26 +6,14 @@ OKX USDT Perpetual (SWAP) bot
 + Feature logging for XGB (JSONL)
 Label: 1 = TP hit, 0 = SL or manual/other exit
 
-Strategy (5m):
-- Universe: 24h quoteVolume TOP 50 (USDT-settled swap symbols)
-- Volatility contraction: BBW (Bollinger Band Width) on closed candle <= 30th percentile of last 100 closed candles
-- Trend filter: close above EMA20 => long-only; below EMA20 => short-only
-- Breakout trigger (closed candle):
-    Long: close > highest high of previous 20 closed candles AND volume >= 1.5 * avg(volume,20)
-    Short: close < lowest low of previous 20 closed candles AND volume >= 1.5 * avg(volume,20)
-- Pinbar filter: reject if (upper_wick + lower_wick) > 2 * body on breakout candle
-- Risk sizing: if SL hit, lose ~3% of total USDT equity (CROSS, leverage fixed 10x)
-- Execution: market entry + conditional stop-loss; TP is monitored and closed by market (reduceOnly)
-- Notifications: Telegram on entry / TP / SL-detected / errors
-
-Requirements:
-  pip install ccxt pandas numpy requests
-
-ENV:
-  OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-Optional:
-  OKX_SANDBOX=1   (use OKX sandbox)
+Updated behavior:
+- Entry: market
+- SL: exchange-side conditional (reduceOnly)
+- TP: exchange-side conditional (reduceOnly)
+- Bot no longer “monitors TP and closes by market”.
+  Instead, it detects position disappearance and classifies exit via:
+  1) order status (TP/SL order) if available
+  2) fallback to last price vs tp/stop (best-effort)
 """
 
 import os
@@ -50,7 +38,7 @@ TOP_N = 150
 
 LEVERAGE = 10.0
 MARGIN_MODE = "cross"  # CROSS
-RISK_PCT_EQUITY = 0.04  # lose 3% equity if stop hit
+RISK_PCT_EQUITY = 0.04  # lose ~4% equity if stop hit
 RR_TP = 1.5  # take profit at 1.5R
 
 EMA_LEN = 20
@@ -214,11 +202,14 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # ATR (14, 100)
     prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low).abs(),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
     df["atr14"] = tr.rolling(14).mean()
     df["atr100"] = tr.rolling(100).mean()
 
@@ -243,9 +234,7 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     closed = df.iloc[-2]
     hist = df.iloc[:-1]
 
-    # =========================
-    # 1. Volatility Contraction (기존)
-    # =========================
+    # 1) Volatility contraction
     bbw_hist = hist["bbw"].tail(BBW_LOOKBACK).dropna().values
     if len(bbw_hist) < int(BBW_LOOKBACK * 0.8):
         return None
@@ -254,9 +243,7 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if float(closed["bbw"]) > float(bbw_th):
         return None
 
-    # =========================
-    # 2. Trend
-    # =========================
+    # 2) Trend
     close_price = float(closed["close"])
     ema20 = float(closed["ema20"])
     if not (close_price > 0 and ema20 > 0):
@@ -264,10 +251,8 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     trend = "long" if close_price >= ema20 else "short"
 
-    # =========================
-    # 3. Box
-    # =========================
-    prev20 = hist.iloc[-(BOX_LEN + 1):-1]
+    # 3) Box
+    prev20 = hist.iloc[-(BOX_LEN + 1) : -1]
     if len(prev20) < BOX_LEN:
         return None
 
@@ -275,10 +260,9 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     box_low = float(prev20["low"].min())
     box_range_pct = (box_high - box_low) / close_price
 
-    # 🔥 박스 중간 구간만 허용 (최근 100개 기준)
+    # allow only mid box regime (30~70 percentile)
     box_hist = (
-        (hist["high"].rolling(BOX_LEN).max() - hist["low"].rolling(BOX_LEN).min())
-        / hist["close"]
+        (hist["high"].rolling(BOX_LEN).max() - hist["low"].rolling(BOX_LEN).min()) / hist["close"]
     ).dropna().tail(100)
 
     if len(box_hist) > 20:
@@ -287,10 +271,8 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if not (q_low <= box_range_pct <= q_high):
             return None
 
-    # =========================
-    # 4. Volume
-    # =========================
-    vprev = hist.iloc[-(VOL_LEN + 1):-1]
+    # 4) Volume
+    vprev = hist.iloc[-(VOL_LEN + 1) : -1]
     if len(vprev) < VOL_LEN:
         return None
 
@@ -300,14 +282,10 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         return None
 
     vol_ratio = v_now / v_avg
-
-    # 🔥 거래량 레짐 범위
     if not (2.0 <= vol_ratio <= 3.5):
         return None
 
-    # =========================
-    # 5. Breakout
-    # =========================
+    # 5) Breakout
     side = None
     if trend == "long" and close_price > box_high:
         side = "long"
@@ -318,9 +296,7 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     else:
         return None
 
-    # =========================
-    # 6. Momentum Regime Filter 🔥 핵심
-    # =========================
+    # 6) Momentum regime filter
     def ret_n(n):
         if len(hist) >= n + 1:
             p0 = hist["close"].iloc[-1]
@@ -342,9 +318,7 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if not (ret_5 < 0 and ret_20 < 0 and ema20_slope_pct < 0):
             return None
 
-    # =========================
-    # 7. Pinbar reject
-    # =========================
+    # 7) Pinbar reject
     if pinbar_reject(closed):
         return None
 
@@ -399,7 +373,6 @@ def get_universe_usdt_swaps_top_volume(ex: ccxt.Exchange) -> List[str]:
     if not syms:
         return []
 
-    tickers = {}
     try:
         tickers = ex.fetch_tickers(syms)
     except Exception:
@@ -485,16 +458,106 @@ def calc_contracts_for_risk(
     return contracts, actual_notional, margin_est
 
 
-def place_entry_with_stop(
+# =========================
+# Orders: Entry + SL + TP
+# =========================
+def _place_reduceonly_trigger_order_best_effort(
+    ex: ccxt.Exchange,
+    symbol: str,
+    side: str,
+    contracts: int,
+    trigger_price: float,
+    kind: str,  # "sl" or "tp"
+) -> Optional[str]:
+    """
+    Best-effort to place exchange-side conditional reduceOnly order.
+
+    Primary attempt uses ccxt unified params:
+      - stopLossPrice / takeProfitPrice inside a market order payload
+    Fallback: try OKX algo endpoint if available.
+
+    Returns order/algo id if known, else None.
+    """
+    assert kind in ("sl", "tp")
+    assert side in ("long", "short")
+
+    # To CLOSE a long -> SELL ; to CLOSE a short -> BUY
+    close_side = "sell" if side == "long" else "buy"
+
+    # 1) Unified attempt
+    params = {"tdMode": MARGIN_MODE, "reduceOnly": True}
+    if kind == "sl":
+        params["stopLossPrice"] = float(trigger_price)
+    else:
+        params["takeProfitPrice"] = float(trigger_price)
+
+    try:
+        o = ex.create_order(symbol, "market", close_side, contracts, params=params)
+        oid = (o or {}).get("id")
+        return oid
+    except Exception:
+        pass
+
+    # 2) OKX algo endpoint fallback (ccxt exposes raw endpoints on okx instance)
+    #    We'll try a minimal order-algo placement.
+    try:
+        m = ex.market(symbol)
+        inst_id = (m.get("info") or {}).get("instId") or m.get("id") or symbol
+
+        # OKX expects close order side:
+        okx_side = "sell" if side == "long" else "buy"
+        # ordType: "conditional"
+        # triggerPx: trigger price
+        # orderPx: "-1" market
+        body = {
+            "instId": inst_id,
+            "tdMode": MARGIN_MODE,
+            "side": okx_side,
+            "ordType": "conditional",
+            "sz": str(int(contracts)),
+            "reduceOnly": "true",
+            "triggerPx": str(float(trigger_price)),
+            "orderPx": "-1",
+        }
+
+        # OKX distinguishes TP/SL with "tpTriggerPx" / "slTriggerPx" in some modes.
+        # We'll add hint fields to improve compatibility:
+        if kind == "sl":
+            body["slTriggerPx"] = body["triggerPx"]
+            body["slOrdPx"] = "-1"
+        else:
+            body["tpTriggerPx"] = body["triggerPx"]
+            body["tpOrdPx"] = "-1"
+
+        resp = ex.privatePostTradeOrderAlgo(body)
+        # Response shape varies; try to find algoId
+        if isinstance(resp, dict):
+            data = resp.get("data") or []
+            if isinstance(data, list) and data:
+                algo_id = data[0].get("algoId") or data[0].get("id")
+                if algo_id:
+                    return str(algo_id)
+        return None
+    except Exception:
+        return None
+
+
+def place_entry_with_sl_tp(
     ex: ccxt.Exchange,
     symbol: str,
     side: str,
     contracts: int,
     stop_price: float,
+    tp_price: float,
 ) -> Dict[str, Any]:
+    """
+    Entry: market
+    Then place:
+      - SL reduceOnly trigger order
+      - TP reduceOnly trigger order
+    """
     assert side in ("long", "short")
     order_side = "buy" if side == "long" else "sell"
-    sl_side = "sell" if side == "long" else "buy"
 
     try:
         ex.set_leverage(LEVERAGE, symbol, params={"mgnMode": MARGIN_MODE})
@@ -502,34 +565,94 @@ def place_entry_with_stop(
         pass
 
     entry_order = ex.create_order(symbol, "market", order_side, contracts, params={"tdMode": MARGIN_MODE})
-
     time.sleep(0.25)
 
-    stop_order_id = None
-    try:
-        sl_order = ex.create_order(
-            symbol,
-            "market",
-            sl_side,
-            contracts,
-            params={
-                "tdMode": MARGIN_MODE,
-                "reduceOnly": True,
-                "stopLossPrice": float(stop_price),
-            },
-        )
-        stop_order_id = sl_order.get("id")
-    except Exception:
-        stop_order_id = None
+    sl_id = _place_reduceonly_trigger_order_best_effort(ex, symbol, side, contracts, stop_price, kind="sl")
+    time.sleep(0.15)
+    tp_id = _place_reduceonly_trigger_order_best_effort(ex, symbol, side, contracts, tp_price, kind="tp")
 
-    return {"entry_order_id": entry_order.get("id"), "stop_order_id": stop_order_id}
+    return {
+        "entry_order_id": (entry_order or {}).get("id"),
+        "stop_order_id": sl_id,
+        "tp_order_id": tp_id,
+    }
 
 
-def close_position_market(ex: ccxt.Exchange, symbol: str, side: str, contracts: float) -> None:
-    if contracts <= 0:
+def safe_cancel_order(ex: ccxt.Exchange, order_id: Optional[str], symbol: str) -> None:
+    if not order_id:
         return
-    close_side = "sell" if side == "long" else "buy"
-    ex.create_order(symbol, "market", close_side, contracts, params={"tdMode": MARGIN_MODE, "reduceOnly": True})
+    try:
+        ex.cancel_order(order_id, symbol)
+    except Exception:
+        # could be algo order or already filled/canceled
+        pass
+
+
+def fetch_last_price(ex: ccxt.Exchange, symbol: str) -> float:
+    try:
+        t = ex.fetch_ticker(symbol)
+        return float(t.get("last") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def try_fetch_order_status(ex: ccxt.Exchange, order_id: Optional[str], symbol: str) -> Optional[str]:
+    """
+    Try to get order status by id.
+    Returns: "closed" / "open" / "canceled" / None (unknown)
+    """
+    if not order_id:
+        return None
+    try:
+        o = ex.fetch_order(order_id, symbol)
+        st = (o or {}).get("status")
+        if st:
+            return str(st)
+    except Exception:
+        return None
+    return None
+
+
+def classify_exit_label_best_effort(
+    ex: ccxt.Exchange,
+    symbol: str,
+    pos_rec: Dict[str, Any],
+) -> int:
+    """
+    When position disappeared, decide label:
+    - Prefer order status: if TP order is closed => 1; if SL order closed => 0
+    - Else fallback using last price relative to tp/stop (best-effort)
+    - Default to 0
+    """
+    tp_id = pos_rec.get("tp_order_id")
+    sl_id = pos_rec.get("stop_order_id")
+    tp = float(pos_rec.get("tp") or 0.0)
+    sl = float(pos_rec.get("stop") or 0.0)
+    side = pos_rec.get("side")
+
+    tp_status = try_fetch_order_status(ex, tp_id, symbol)
+    sl_status = try_fetch_order_status(ex, sl_id, symbol)
+
+    if tp_status == "closed":
+        return 1
+    if sl_status == "closed":
+        return 0
+
+    # If both unknown or not closed: fallback
+    last = fetch_last_price(ex, symbol)
+    if last > 0 and tp > 0 and sl > 0 and side in ("long", "short"):
+        if side == "long":
+            if last >= tp:
+                return 1
+            if last <= sl:
+                return 0
+        else:
+            if last <= tp:
+                return 1
+            if last >= sl:
+                return 0
+
+    return 0
 
 
 # =========================
@@ -563,10 +686,7 @@ def compute_features(df: pd.DataFrame, sig: Dict[str, Any]) -> Dict[str, float]:
 
     bbw = float(c["bbw"])
     bbw_hist = hist["bbw"].tail(BBW_LOOKBACK).dropna().values
-    if len(bbw_hist) > 0:
-        bbw_percentile = float((bbw_hist <= bbw).mean())
-    else:
-        bbw_percentile = 0.0
+    bbw_percentile = float((bbw_hist <= bbw).mean()) if len(bbw_hist) > 0 else 0.0
 
     atr14 = float(c.get("atr14") or np.nan)
     atr100 = float(c.get("atr100") or np.nan)
@@ -578,7 +698,6 @@ def compute_features(df: pd.DataFrame, sig: Dict[str, Any]) -> Dict[str, float]:
     ema20_n = hist["ema20"].iloc[-6] if len(hist) >= 6 else ema20
     ema20_slope_pct = (ema20 - ema20_n) / ema20_n if ema20_n > 0 else 0.0
 
-    # returns
     def ret_n(n):
         if len(hist) >= n + 1:
             p0 = hist["close"].iloc[-1]
@@ -598,8 +717,10 @@ def compute_features(df: pd.DataFrame, sig: Dict[str, Any]) -> Dict[str, float]:
     vol_ratio = (vol_now / vol_avg_20) if vol_avg_20 > 0 else 0.0
     vol_z_20 = ((vol_now - vol_avg_20) / vol_std_20) if vol_std_20 > 0 else 0.0
 
-    # candle shape
-    o = float(c["open"]); h = float(c["high"]); l = float(c["low"]); cl = float(c["close"])
+    o = float(c["open"])
+    h = float(c["high"])
+    l = float(c["low"])
+    cl = float(c["close"])
     body = abs(cl - o)
     rng = max(h - l, 1e-12)
     upper_wick = h - max(o, cl)
@@ -608,7 +729,7 @@ def compute_features(df: pd.DataFrame, sig: Dict[str, Any]) -> Dict[str, float]:
     wick_ratio = (upper_wick + lower_wick) / max(body, 1e-12)
     range_pct = rng / entry if entry > 0 else 0.0
 
-    features = {
+    return {
         "side": side,
         "rr": rr,
         "stop_dist_pct": stop_dist_pct,
@@ -630,14 +751,12 @@ def compute_features(df: pd.DataFrame, sig: Dict[str, Any]) -> Dict[str, float]:
         "wick_ratio": wick_ratio,
         "range_pct": range_pct,
     }
-    return features
 
 
 def append_feature_record(features: Dict[str, float], label: int, meta: Dict[str, Any]) -> None:
     rec = {}
     rec.update(features)
     rec["label"] = int(label)
-    # minimal meta (optional, can drop later)
     rec["symbol"] = meta.get("symbol")
     rec["side_str"] = meta.get("side")
     rec["entry_time"] = meta.get("entry_time")
@@ -657,7 +776,7 @@ def main():
     ex = init_exchange()
     state = load_state()
 
-    tg_send("OKX 5m VolContraction Breakout bot started.")
+    tg_send("OKX 5m VolContraction Breakout bot started. (TP+SL on exchange)")
 
     universe: List[str] = state.get("universe") or []
     universe_ts: float = float(state.get("universe_ts") or 0)
@@ -671,6 +790,7 @@ def main():
         try:
             now = time.time()
 
+            # refresh universe
             if (not universe) or (now - universe_ts >= SCAN_EVERY_SEC) or (now - last_universe_refresh >= SCAN_EVERY_SEC):
                 universe = get_universe_usdt_swaps_top_volume(ex)
                 universe_ts = now
@@ -682,18 +802,20 @@ def main():
 
             exch_pos = sync_positions(ex, universe)
 
-            # detect positions disappeared (SL or manual) => label=0
+            # detect positions disappeared => classify TP/SL/manual and log
             for sym in list(pos_state.keys()):
                 if sym not in exch_pos:
                     continue
                 if pos_state.get(sym) and not exch_pos[sym]["has"]:
                     s = pos_state[sym]
-                    # log features with label 0
+
+                    label = classify_exit_label_best_effort(ex, sym, s)
+
                     feats = s.get("features")
                     if feats:
                         append_feature_record(
                             feats,
-                            label=0,
+                            label=label,
                             meta={
                                 "symbol": sym,
                                 "side": s.get("side"),
@@ -701,55 +823,13 @@ def main():
                                 "exit_time": now_utc().isoformat(),
                             },
                         )
-                    msg = f"[EXIT DETECTED] {sym} side={s.get('side')} (position is now 0). SL/manual assumed."
-                    logging.info(msg)
-                    tg_send(msg)
-                    pos_state.pop(sym, None)
 
-            # manage open positions: TP monitoring
-            for sym in universe:
-                if sym not in pos_state:
-                    continue
-                p = pos_state[sym]
-                if not exch_pos[sym]["has"]:
-                    continue
+                    # cancel the other protection order best-effort (might already be filled/canceled)
+                    safe_cancel_order(ex, s.get("tp_order_id"), sym)
+                    safe_cancel_order(ex, s.get("stop_order_id"), sym)
 
-                side = p["side"]
-                tp = float(p["tp"])
-                try:
-                    t = ex.fetch_ticker(sym)
-                    last = float(t.get("last") or 0.0)
-                except Exception:
-                    last = 0.0
-                if last <= 0:
-                    continue
-
-                hit_tp = (side == "long" and last >= tp) or (side == "short" and last <= tp)
-                if hit_tp:
-                    soid = p.get("stop_order_id")
-                    if soid:
-                        try:
-                            ex.cancel_order(soid, sym)
-                        except Exception:
-                            pass
-
-                    close_position_market(ex, sym, side, float(exch_pos[sym]["contracts"]))
-
-                    # log features with label=1
-                    feats = p.get("features")
-                    if feats:
-                        append_feature_record(
-                            feats,
-                            label=1,
-                            meta={
-                                "symbol": sym,
-                                "side": side,
-                                "entry_time": p.get("entry_time"),
-                                "exit_time": now_utc().isoformat(),
-                            },
-                        )
-
-                    msg = f"[TP] {sym} {side.upper()} hit TP. last={last:.6g} tp={tp:.6g}"
+                    tag = "TP" if label == 1 else "SL/MANUAL"
+                    msg = f"[EXIT DETECTED] {sym} side={s.get('side')} => label={label} ({tag})"
                     logging.info(msg)
                     tg_send(msg)
                     pos_state.pop(sym, None)
@@ -789,7 +869,7 @@ def main():
                     last_signal_ts[sym] = sig_ts
                     continue
 
-                orders = place_entry_with_stop(ex, sym, side, contracts, stop)
+                orders = place_entry_with_sl_tp(ex, sym, side, contracts, stop, tp)
 
                 time.sleep(0.35)
                 pnow = sync_positions(ex, [sym]).get(sym, {})
@@ -804,18 +884,21 @@ def main():
                     "stop": stop,
                     "tp": tp,
                     "stop_order_id": orders.get("stop_order_id"),
+                    "tp_order_id": orders.get("tp_order_id"),
+                    "entry_order_id": orders.get("entry_order_id"),
                     "entry_time": now_utc().isoformat(),
                     "contracts": float(contracts),
                     "notional_est": float(notional),
                     "margin_est": float(margin_est),
-                    "features": features,  # <-- store features snapshot
+                    "features": features,
                 }
                 last_signal_ts[sym] = sig_ts
 
                 msg = (
                     f"[ENTRY] {sym} {side.upper()} lev={LEVERAGE:.0f}x CROSS\n"
                     f"entry≈{float(actual_entry):.6g} stop={stop:.6g} tp={tp:.6g} (RR={RR_TP})\n"
-                    f"contracts={contracts} notional≈{notional:.2f} margin≈{margin_est:.2f}"
+                    f"contracts={contracts} notional≈{notional:.2f} margin≈{margin_est:.2f}\n"
+                    f"SL_id={orders.get('stop_order_id')} TP_id={orders.get('tp_order_id')}"
                 )
                 logging.info(msg)
                 tg_send(msg)
