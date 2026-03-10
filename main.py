@@ -14,6 +14,16 @@ Updated behavior:
   Instead, it detects position disappearance and classifies exit via:
   1) order status (TP/SL order) if available
   2) fallback to last price vs tp/stop (best-effort)
+
+Strategy tweaks applied:
+- Stronger squeeze filter: BBW <= 20th percentile
+- Candle quality filter:
+    * body_ratio >= 0.6
+    * wick_ratio <= 0.5
+
+Risk protections applied:
+- Max concurrent positions
+- Cooldown after consecutive SL/manual exits
 """
 
 import os
@@ -45,7 +55,7 @@ EMA_LEN = 20
 BB_LEN = 20
 BB_K = 2.0
 BBW_LOOKBACK = 100
-BBW_PCTL = 30  # <= 30th percentile
+BBW_PCTL = 20  # tightened from 30 -> 20
 
 BOX_LEN = 20
 VOL_LEN = 20
@@ -59,6 +69,11 @@ FEATURES_PATH = "/app/state/features_xgb.jsonl"  # <-- JSONL output
 # Safety caps (avoid oversized orders under cross)
 MAX_MARGIN_FRACTION = 0.95  # don't allocate more than 95% equity as margin across a single trade
 MIN_QUOTE_VOL_USDT = 1_000_000  # skip ultra-illiquid (optional)
+
+# Risk protections
+MAX_POSITIONS = 3
+SL_STREAK_COOLDOWN_TRADES = 3
+SL_STREAK_COOLDOWN_SEC = 7200  # 2 hours
 
 # Telegram
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -93,13 +108,25 @@ def tg_send(text: str) -> None:
 # State
 # =========================
 def load_state() -> Dict[str, Any]:
+    default_state = {
+        "pos": {},
+        "last_signal_ts": {},
+        "universe": [],
+        "universe_ts": 0,
+        "sl_streak": 0,
+        "cooldown_until": 0.0,
+    }
     if not os.path.exists(STATE_PATH):
-        return {"pos": {}, "last_signal_ts": {}, "universe": [], "universe_ts": 0}
+        return default_state
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            state = json.load(f)
+        for k, v in default_state.items():
+            if k not in state:
+                state[k] = v
+        return state
     except Exception:
-        return {"pos": {}, "last_signal_ts": {}, "universe": [], "universe_ts": 0}
+        return default_state
 
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -252,7 +279,7 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     trend = "long" if close_price >= ema20 else "short"
 
     # 3) Box
-    prev20 = hist.iloc[-(BOX_LEN + 1) : -1]
+    prev20 = hist.iloc[-(BOX_LEN + 1): -1]
     if len(prev20) < BOX_LEN:
         return None
 
@@ -272,7 +299,7 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             return None
 
     # 4) Volume
-    vprev = hist.iloc[-(VOL_LEN + 1) : -1]
+    vprev = hist.iloc[-(VOL_LEN + 1): -1]
     if len(vprev) < VOL_LEN:
         return None
 
@@ -320,6 +347,26 @@ def compute_signal(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     # 7) Pinbar reject
     if pinbar_reject(closed):
+        return None
+
+    # 8) Candle quality filter (NEW)
+    o = float(closed["open"])
+    h = float(closed["high"])
+    l = float(closed["low"])
+    c = float(closed["close"])
+
+    body = abs(c - o)
+    rng = max(h - l, 1e-12)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    body_ratio = body / rng
+    wick_ratio = (upper_wick + lower_wick) / max(body, 1e-12)
+
+    if body_ratio < 0.6:
+        return None
+
+    if wick_ratio > 0.5:
         return None
 
     if stop_price <= 0:
@@ -498,17 +545,12 @@ def _place_reduceonly_trigger_order_best_effort(
     except Exception:
         pass
 
-    # 2) OKX algo endpoint fallback (ccxt exposes raw endpoints on okx instance)
-    #    We'll try a minimal order-algo placement.
+    # 2) OKX algo endpoint fallback
     try:
         m = ex.market(symbol)
         inst_id = (m.get("info") or {}).get("instId") or m.get("id") or symbol
 
-        # OKX expects close order side:
         okx_side = "sell" if side == "long" else "buy"
-        # ordType: "conditional"
-        # triggerPx: trigger price
-        # orderPx: "-1" market
         body = {
             "instId": inst_id,
             "tdMode": MARGIN_MODE,
@@ -520,8 +562,6 @@ def _place_reduceonly_trigger_order_best_effort(
             "orderPx": "-1",
         }
 
-        # OKX distinguishes TP/SL with "tpTriggerPx" / "slTriggerPx" in some modes.
-        # We'll add hint fields to improve compatibility:
         if kind == "sl":
             body["slTriggerPx"] = body["triggerPx"]
             body["slOrdPx"] = "-1"
@@ -530,7 +570,6 @@ def _place_reduceonly_trigger_order_best_effort(
             body["tpOrdPx"] = "-1"
 
         resp = ex.privatePostTradeOrderAlgo(body)
-        # Response shape varies; try to find algoId
         if isinstance(resp, dict):
             data = resp.get("data") or []
             if isinstance(data, list) and data:
@@ -584,7 +623,6 @@ def safe_cancel_order(ex: ccxt.Exchange, order_id: Optional[str], symbol: str) -
     try:
         ex.cancel_order(order_id, symbol)
     except Exception:
-        # could be algo order or already filled/canceled
         pass
 
 
@@ -638,7 +676,6 @@ def classify_exit_label_best_effort(
     if sl_status == "closed":
         return 0
 
-    # If both unknown or not closed: fallback
     last = fetch_last_price(ex, symbol)
     if last > 0 and tp > 0 and sl > 0 and side in ("long", "short"):
         if side == "long":
@@ -776,15 +813,18 @@ def main():
     ex = init_exchange()
     state = load_state()
 
-    tg_send("OKX 5m VolContraction Breakout bot started. (TP+SL on exchange)")
+    tg_send("OKX 5m VolContraction Breakout bot started. (TP+SL on exchange, strategy filters + max_positions + cooldown)")
 
     universe: List[str] = state.get("universe") or []
     universe_ts: float = float(state.get("universe_ts") or 0)
 
     pos_state: Dict[str, Dict[str, Any]] = state.get("pos") or {}
     last_signal_ts: Dict[str, int] = state.get("last_signal_ts") or {}
+    sl_streak: int = int(state.get("sl_streak") or 0)
+    cooldown_until: float = float(state.get("cooldown_until") or 0.0)
 
     last_universe_refresh = 0.0
+    cooldown_notice_sent = False
 
     while True:
         try:
@@ -828,6 +868,22 @@ def main():
                     safe_cancel_order(ex, s.get("tp_order_id"), sym)
                     safe_cancel_order(ex, s.get("stop_order_id"), sym)
 
+                    # cooldown logic: TP resets streak, non-TP increments streak
+                    if label == 1:
+                        sl_streak = 0
+                    else:
+                        sl_streak += 1
+                        if sl_streak >= SL_STREAK_COOLDOWN_TRADES:
+                            cooldown_until = time.time() + SL_STREAK_COOLDOWN_SEC
+                            sl_streak = 0
+                            cooldown_notice_sent = False
+                            cool_msg = (
+                                f"[COOLDOWN ON] {SL_STREAK_COOLDOWN_TRADES} consecutive SL/manual exits detected. "
+                                f"Pause entries for {SL_STREAK_COOLDOWN_SEC // 60} min."
+                            )
+                            logging.warning(cool_msg)
+                            tg_send(cool_msg)
+
                     tag = "TP" if label == 1 else "SL/MANUAL"
                     msg = f"[EXIT DETECTED] {sym} side={s.get('side')} => label={label} ({tag})"
                     logging.info(msg)
@@ -840,7 +896,35 @@ def main():
                 time.sleep(LOOP_INTERVAL_SEC)
                 continue
 
+            # cooldown check
+            now = time.time()
+            if now < cooldown_until:
+                remaining = int(cooldown_until - now)
+                if not cooldown_notice_sent:
+                    msg = f"[COOLDOWN ACTIVE] entries paused for {remaining}s"
+                    logging.info(msg)
+                    tg_send(msg)
+                    cooldown_notice_sent = True
+
+                state["pos"] = pos_state
+                state["last_signal_ts"] = last_signal_ts
+                state["universe"] = universe
+                state["universe_ts"] = universe_ts
+                state["sl_streak"] = sl_streak
+                state["cooldown_until"] = cooldown_until
+                state["timestamp"] = now_utc().isoformat()
+                save_state(state)
+
+                time.sleep(LOOP_INTERVAL_SEC)
+                continue
+            else:
+                cooldown_notice_sent = False
+
             for sym in universe:
+                # max positions check
+                if len(pos_state) >= MAX_POSITIONS:
+                    break
+
                 if exch_pos[sym]["has"]:
                     continue
                 if sym in pos_state:
@@ -898,6 +982,7 @@ def main():
                     f"[ENTRY] {sym} {side.upper()} lev={LEVERAGE:.0f}x CROSS\n"
                     f"entry≈{float(actual_entry):.6g} stop={stop:.6g} tp={tp:.6g} (RR={RR_TP})\n"
                     f"contracts={contracts} notional≈{notional:.2f} margin≈{margin_est:.2f}\n"
+                    f"open_positions={len(pos_state)}/{MAX_POSITIONS}\n"
                     f"SL_id={orders.get('stop_order_id')} TP_id={orders.get('tp_order_id')}"
                 )
                 logging.info(msg)
@@ -909,6 +994,8 @@ def main():
             state["last_signal_ts"] = last_signal_ts
             state["universe"] = universe
             state["universe_ts"] = universe_ts
+            state["sl_streak"] = sl_streak
+            state["cooldown_until"] = cooldown_until
             state["timestamp"] = now_utc().isoformat()
             save_state(state)
 
